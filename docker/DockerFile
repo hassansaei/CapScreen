@@ -1,0 +1,67 @@
+# Use a specific Miniforge3 version for reproducibility
+FROM condaforge/miniforge3:24.11.3-0
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive \
+    CONDA_AUTO_UPDATE_CONDA=FALSE \
+    PATH=/opt/conda/envs/capscreen/bin:/opt/conda/envs/capscreen/bin:/opt/tools:$PATH \
+    DEFAULT_INPUT_DIR=/opt/capscreen/input/ \
+    DEFAULT_OUTPUT_DIR=/opt/capscreen/output/ \
+    DEFAULT_REFERENCE_DIR=/opt/capscreen/reference/
+
+# Update and install necessary system packages in a single RUN command to reduce layers
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        git \
+        wget \
+        unzip \
+        zip \
+        curl \
+        samtools \
+        && rm -rf /var/lib/apt/lists/*
+
+# Install mamba for faster conda package installation
+RUN conda install -y mamba -n base -c conda-forge
+
+# Create tools directory and install fastp
+RUN mkdir -p /opt/tools && \
+    cd /opt/tools && \
+    wget http://opengene.org/fastp/fastp && \
+    chmod a+x ./fastp
+
+# Copy conda environment file first
+COPY conda/capscreen.yml /tmp/capscreen.yml
+
+# Create and install conda environments
+RUN mamba env create -f /tmp/capscreen.yml && \
+    conda clean -afy && \
+    rm /tmp/capscreen.yml 
+
+# Copy capscreen package
+COPY . /opt/capscreen/
+
+# Set up default input, output, and reference directories
+RUN mkdir -p $DEFAULT_INPUT_DIR $DEFAULT_OUTPUT_DIR $DEFAULT_REFERENCE_DIR
+
+# Install capscreen package
+WORKDIR /opt/capscreen
+RUN pip install -e .
+
+# Allow dynamic UID and GID as build arguments
+ARG USERNAME=appuser
+ARG USER_UID=1001
+ARG USER_GID=1001
+
+# Create a group and user with the specified UID and GID
+RUN groupadd --gid $USER_GID $USERNAME && \
+    useradd --uid $USER_UID --gid $USER_GID --shell /bin/bash --create-home $USERNAME
+
+# Set ownership of directories and app to appuser
+RUN chown -R $USERNAME:$USERNAME $DEFAULT_INPUT_DIR $DEFAULT_OUTPUT_DIR /opt/capscreen/ /opt
+
+# Switch to a non-root user
+USER $USERNAME
+
+# Set the entry point to bash
+ENTRYPOINT ["capscreen"]

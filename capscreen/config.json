@@ -1,0 +1,44 @@
+{
+    "config_path": "/opt/capscreen/capscreen/config.json",
+    "threads": 4,
+    "log_level": "INFO",
+    "reference": {
+        "genome": "/opt/capscreen/reference/reference_aav2",
+        "index_basename": "/opt/capscreen/reference/reference_aav2"
+    },
+    "fastp": {
+        "compression": 6,
+        "length_required": 50,
+        "dup_calc_accuracy": 3,
+        "html_report": true,
+        "json_report": true,
+        "output_prefix": "fastp"
+    },
+    "pear": {
+        "min_overlap": 10,
+        "max_assembly_length": 1000,
+        "min_assembly_length": 50,
+        "quality_threshold": 15,
+        "p_value": 0.01,
+        "output_prefix": "pear"
+    },
+    "bowtie2": {
+        "mode": "end-to-end",
+        "sensitivity": "very-sensitive",
+        "np": 0,
+        "n_ceil": "L,0,0.8",
+        "xeq": true,
+        "N": 1,
+        "reorder": true,
+        "score_min": "L,-0.6,-0.6",
+        "output_prefix": "aligned"
+    },
+    "samtools": {
+        "sort_memory": "16G",
+        "compression_level": 6
+    },
+    "output": {
+        "create_subdirectories": true,
+        "prefix": "processed_"
+    }
+}
