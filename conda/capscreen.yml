@@ -45,6 +45,8 @@ dependencies:
   - pigz=2.6=h27cfd23_0
   - pip=22.3.1=py37h06a4308_0
   - python=3.7.13=h12debd9_0
+  - pandas
+  - biopython
   - readline=8.1.2=h7f8727e_1
   - setuptools=65.6.3=py37h06a4308_0
   - sqlite=3.38.2=hc218d9a_0
@@ -56,3 +58,4 @@ dependencies:
   - xopen=0.8.4=py37_0
   - xz=5.2.5=h7f8727e_1
   - zlib=1.2.11=h7f8727e_4
+
