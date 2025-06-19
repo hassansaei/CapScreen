@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 import importlib.resources as pkg_resources
 from capscreen.version import __version__
+from capscreen import count as count_module
 
 # Global Logger
 logger = logging.getLogger("FastQProcessor")
@@ -434,106 +435,112 @@ def run_bowtie2_and_samtools(assembled_fastq: Path, sample_dir: Path, config: Di
         logger.error(f"Error in Bowtie2/Samtools pipeline: {e}", exc_info=True)
         return False
 
-def process_fastq_files(fastq1: Path, fastq2: Path, output_dir: Path, sample_name: str, config: Dict[str, Any], threads: int) -> bool:
+def run_qc_and_alignment(fastq1, fastq2, output_dir, sample_name, config, threads):
     """
-    Process the FASTQ files with the given parameters.
-    
-    Args:
-        fastq1 (Path): Path to the first FASTQ file
-        fastq2 (Path): Path to the second FASTQ file
-        output_dir (Path): Base output directory
-        sample_name (str): Name of the sample
-        config (Dict): Configuration dictionary
-        threads (int): Number of threads to use
-        
-    Returns:
-        bool: True if processing was successful, False otherwise
+    Run QC and alignment steps (FASTP, PEAR, Bowtie2/Samtools).
+    Returns the path to the sorted SAM file if successful, else None.
     """
-    try:
-        # Validate configuration
-        if not validate_config(config):
-            return False
-        
-        # Validate paths
-        if not validate_paths(fastq1, fastq2, output_dir):
-            return False
-        
-        # Validate and adjust thread count
-        threads = validate_threads(threads)
-        
-        # Create sample-specific directory
-        sample_dir = output_dir / sample_name
-        sample_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Set up logging for this sample
-        log_file = sample_dir / f"{sample_name}.log"
-        setup_logging(logger, level_str=config.get('log_level', 'INFO'), log_file=log_file)
-        
-        logger.info(f"Processing sample: {sample_name}")
-        logger.info(f"Output directory: {sample_dir}")
-        logger.info(f"Using {threads} threads")
-        
-        # Step 1: Run FASTP
-        logger.info("Step 1: Running FASTP")
-        r1_trimmed, r2_trimmed = run_fastp(fastq1, fastq2, sample_dir, config, threads)
-        if not r1_trimmed or not r2_trimmed:
-            return False
-        
-        # Step 2: Run PEAR
-        logger.info("Step 2: Running PEAR")
-        if not run_pear(r1_trimmed, r2_trimmed, sample_dir, config, threads):
-            return False
-        
-        # Step 3: Run Bowtie2 and Samtools
-        logger.info("Step 3: Running Bowtie2 and Samtools")
-        if not run_bowtie2_and_samtools(r1_trimmed, sample_dir, config, threads):
-            return False
-        
-        logger.info("All processing steps completed successfully")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error processing FASTQ files: {e}", exc_info=True)
-        return False
+    if not validate_config(config):
+        return None
+    if not validate_paths(fastq1, fastq2, output_dir):
+        return None
+    threads = validate_threads(threads)
+    sample_dir = output_dir / sample_name
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    log_file = sample_dir / f"{sample_name}.log"
+    setup_logging(logger, level_str=config.get('log_level', 'INFO'), log_file=log_file)
+    logger.info(f"Processing sample: {sample_name}")
+    logger.info(f"Output directory: {sample_dir}")
+    logger.info(f"Using {threads} threads")
+    logger.info("Step 1: Running FASTP")
+    r1_trimmed, r2_trimmed = run_fastp(fastq1, fastq2, sample_dir, config, threads)
+    if not r1_trimmed or not r2_trimmed:
+        return None
+    logger.info("Step 2: Running PEAR")
+    assembled_fastq = run_pear(r1_trimmed, r2_trimmed, sample_dir, config, threads)
+    if not assembled_fastq:
+        return None
+    logger.info("Step 3: Running Bowtie2 and Samtools")
+    if not run_bowtie2_and_samtools(assembled_fastq, sample_dir, config, threads):
+        return None
+    # Return path to sorted SAM file
+    prefix = config['bowtie2']['output_prefix']
+    sorted_sam = sample_dir / f"{prefix}.sorted.sam"
+    return sorted_sam
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Process FASTQ files with FASTP, PEAR, and Bowtie2",
+        description="CapScreen: QC, alignment, and variant counting pipeline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    
-    # Version argument
-    parser.add_argument("--version", action="version",
-                        version=f"CapScreen v{__version__}")
-    
-    # Required arguments
-    parser.add_argument("--fastq1", type=Path, required=True, help="Path to first FASTQ file")
-    parser.add_argument("--fastq2", type=Path, required=True, help="Path to second FASTQ file")
-    parser.add_argument("--output-dir", type=Path, required=True, help="Base output directory")
-    parser.add_argument("--sample-name", required=True, help="Name of the sample")
-    
-    # Optional arguments
-    parser.add_argument("--threads", type=int, help="Number of threads to use")
-    parser.add_argument("--config", type=Path, default=Path("config.json"), help="Path to configuration file")
-    parser.add_argument("--log-level", default="INFO", 
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-                        help="Set the logging level")
-    
-    # Parse all arguments
+    parser.add_argument("--version", action="version", version=f"CapScreen v{__version__}")
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Subcommand to run")
+
+    # Parent parser for shared arguments
+    parent_parser = argparse.ArgumentParser(add_help=False)
+    parent_parser.add_argument("--output-dir", type=Path, required=True, help="Base output directory")
+    parent_parser.add_argument("--sample-name", required=True, help="Name of the sample")
+    parent_parser.add_argument("--config", type=Path, default=Path("config.json"), help="Path to configuration file")
+    parent_parser.add_argument("--threads", type=int, help="Number of threads to use")
+    parent_parser.add_argument("--log-level", default="INFO", 
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set the logging level")
+
+    # pipeline: full pipeline (QC, align, count)
+    pipeline_parser = subparsers.add_parser("pipeline", parents=[parent_parser], help="Run full pipeline: QC, alignment, and count")
+    pipeline_parser.add_argument("--fastq1", type=Path, required=True, help="Path to first FASTQ file")
+    pipeline_parser.add_argument("--fastq2", type=Path, required=True, help="Path to second FASTQ file")
+    pipeline_parser.add_argument("--reference-file", type=Path, required=True, help="Path to reference library file (CSV)")
+
+    # align: only QC and alignment
+    align_parser = subparsers.add_parser("align", parents=[parent_parser], help="Run QC and alignment only")
+    align_parser.add_argument("--fastq1", type=Path, required=True, help="Path to first FASTQ file")
+    align_parser.add_argument("--fastq2", type=Path, required=True, help="Path to second FASTQ file")
+
+    # count: only counting
+    count_parser = subparsers.add_parser("count", parents=[parent_parser], help="Run variant counting only")
+    count_parser.add_argument("--sam-file", type=Path, required=True, help="Path to sorted SAM file")
+    count_parser.add_argument("--reference-file", type=Path, required=True, help="Path to reference library file (CSV)")
+    count_parser.add_argument("--output", type=Path, help="Path to output file (TSV)")
+
     args = parser.parse_args()
-    
-    # Load configuration from JSON
     json_config = load_config(args.config)
-    
-    # Set up logging
     setup_logging(logger, args.log_level)
-    
-    # Process FASTQ files
-    if process_fastq_files(args.fastq1, args.fastq2, args.output_dir, args.sample_name, json_config, args.threads):
-        logger.info("FASTQ processing completed successfully")
+
+    if args.command == "pipeline":
+        # Run QC and alignment
+        sorted_sam = run_qc_and_alignment(args.fastq1, args.fastq2, args.output_dir, args.sample_name, json_config, args.threads)
+        if not sorted_sam:
+            logger.error("QC/Alignment failed. Pipeline aborted.")
+            sys.exit(1)
+        # Run counting
+        output_file = args.output_dir / args.sample_name / f"{args.sample_name}.counts.tsv"
+        try:
+            count_module.main(sorted_sam, args.reference_file, json_config, output_file)
+        except Exception as e:
+            logger.error(f"Counting failed: {e}")
+            sys.exit(1)
+        logger.info("Pipeline completed successfully.")
+        sys.exit(0)
+    elif args.command == "align":
+        sorted_sam = run_qc_and_alignment(args.fastq1, args.fastq2, args.output_dir, args.sample_name, json_config, args.threads)
+        if not sorted_sam:
+            logger.error("QC/Alignment failed.")
+            sys.exit(1)
+        logger.info(f"QC and alignment completed successfully. Sorted SAM: {sorted_sam}")
+        sys.exit(0)
+    elif args.command == "count":
+        # Use provided output file or default
+        output_file = args.output if args.output else args.sam_file.parent / f"{args.sam_file.stem}.counts.tsv"
+        try:
+            count_module.main(args.sam_file, args.reference_file, json_config, output_file)
+        except Exception as e:
+            logger.error(f"Counting failed: {e}")
+            sys.exit(1)
+        logger.info("Counting completed successfully.")
         sys.exit(0)
     else:
-        logger.error("FASTQ processing failed")
+        parser.print_help()
         sys.exit(1)
 
 if __name__ == "__main__":
