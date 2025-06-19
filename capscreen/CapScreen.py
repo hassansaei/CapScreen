@@ -447,8 +447,7 @@ def run_qc_and_alignment(fastq1, fastq2, output_dir, sample_name, config, thread
     threads = validate_threads(threads)
     sample_dir = output_dir / sample_name
     sample_dir.mkdir(parents=True, exist_ok=True)
-    log_file = sample_dir / f"{sample_name}.log"
-    setup_logging(logger, level_str=config.get('log_level', 'INFO'), log_file=log_file)
+    # Logging is already set up in main()
     logger.info(f"Processing sample: {sample_name}")
     logger.info(f"Output directory: {sample_dir}")
     logger.info(f"Using {threads} threads")
@@ -505,7 +504,10 @@ def main():
 
     args = parser.parse_args()
     json_config = load_config(args.config)
-    setup_logging(logger, args.log_level)
+
+    # Set up unified log file path
+    log_file = args.output_dir / args.sample_name / f"{args.sample_name}.pipeline.log"
+    setup_logging(logger, args.log_level, log_file=log_file)
 
     if args.command == "pipeline":
         # Run QC and alignment
@@ -513,10 +515,10 @@ def main():
         if not sorted_sam:
             logger.error("QC/Alignment failed. Pipeline aborted.")
             sys.exit(1)
-        # Run counting
+        # Run counting, pass log_file to count.py
         output_file = args.output_dir / args.sample_name / f"{args.sample_name}.counts.tsv"
         try:
-            count_module.main(sorted_sam, args.reference_file, json_config, output_file)
+            count_module.main(sorted_sam, args.reference_file, json_config, output_file, log_file=log_file)
         except Exception as e:
             logger.error(f"Counting failed: {e}")
             sys.exit(1)
@@ -533,7 +535,7 @@ def main():
         # Use provided output file or default
         output_file = args.output if args.output else args.sam_file.parent / f"{args.sam_file.stem}.counts.tsv"
         try:
-            count_module.main(args.sam_file, args.reference_file, json_config, output_file)
+            count_module.main(args.sam_file, args.reference_file, json_config, output_file, log_file=log_file)
         except Exception as e:
             logger.error(f"Counting failed: {e}")
             sys.exit(1)

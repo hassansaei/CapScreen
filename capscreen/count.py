@@ -6,41 +6,38 @@ from Bio.Seq import Seq
 from typing import Dict, Tuple
 import sys
 
-def setup_logging(output_dir: Path, sample_name: str) -> logging.Logger:
+def setup_logging(output_dir: Path = None, sample_name: str = None, log_file: Path = None) -> logging.Logger:
     """
-    Set up logging configuration.
-    
-    Args:
-        output_dir (Path): Directory to save log file
-        sample_name (str): Name of the sample being processed
-        
-    Returns:
-        logging.Logger: Configured logger
+    Set up logging configuration. If log_file is provided, use it. Otherwise, use output_dir/sample_name.count.log.
     """
-    # Create logger
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
-    
-    # Create log file path
-    log_file = output_dir / f"{sample_name}.count.log"
-    
-    # Create file handler
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(logging.INFO)
-    
-    # Create console handler
+
+    # Remove all handlers if already set (to avoid duplicate logs)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    if log_file is None:
+        if output_dir is not None and sample_name is not None:
+            log_file = output_dir / f"{sample_name}.count.log"
+        else:
+            log_file = None
+
+    # Create file handler if log_file is provided
+    if log_file is not None:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    # Always add console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
-    
-    # Create formatter
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
-    
-    # Add handlers to logger
-    logger.addHandler(file_handler)
     logger.addHandler(console_handler)
-    
+
     return logger
 
 def extract_variable_region(seq: str, flank_5p: str, flank_3p: str) -> str:
@@ -247,21 +244,16 @@ def calculate_counts(df: pd.DataFrame, total_reads: int) -> Tuple[pd.DataFrame, 
     }
     return df_out, stats
 
-def main(sam_file: Path, reference_file: Path, config: Dict, output_file: Path) -> None:
+def main(sam_file: Path, reference_file: Path, config: Dict, output_file: Path, log_file: Path = None) -> None:
     """
     Main function to process SAM file and generate counts.
-    
-    Args:
-        sam_file (Path): Path to SAM file
-        reference_file (Path): Path to reference library file
-        config (Dict): Configuration dictionary
-        output_file (Path): Path to save results
+    Accepts an optional log_file argument for unified logging.
     """
     try:
         # Set up logging
         output_dir = output_file.parent
         sample_name = sam_file.stem.split('.')[0]  # Get sample name from SAM file
-        logger = setup_logging(output_dir, sample_name)
+        logger = setup_logging(output_dir, sample_name, log_file=log_file)
         
         logger.info(f"Starting variant counting for sample: {sample_name}")
         logger.info(f"Input SAM file: {sam_file}")
