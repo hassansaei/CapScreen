@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="capscreen",
-    version="1.0.0-alpha.2",
+    version="1.0.0-alpha.3",
     packages=find_packages(),
     package_data={
         "capscreen": [
@@ -15,7 +15,7 @@ setup(
     ],
     entry_points={
         'console_scripts': [
-            'capscreen=capscreen.CapScreen:main',
+            'capscreen=capscreen.cli:main',
         ],
     },
     author="Hassan Saei",

@@ -345,4 +345,4 @@ if __name__ == "__main__":
     if not args.output:
         args.output = args.sam_file.parent / f"{args.sam_file.stem}.counts.tsv"
     
-    main(args.sam_file, args.reference_file, config, args.output) 
+    main(args.sam_file, args.reference_file, config, args.output)

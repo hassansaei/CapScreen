@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 import importlib.resources as pkg_resources
 from capscreen.version import __version__
-from capscreen import count as count_module
+from capscreen.scripts import count as count_module
 
 # Global Logger
 logger = logging.getLogger("FastQProcessor")

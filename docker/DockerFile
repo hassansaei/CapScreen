@@ -63,5 +63,5 @@ RUN chown -R $USERNAME:$USERNAME $DEFAULT_INPUT_DIR $DEFAULT_OUTPUT_DIR /opt/cap
 # Switch to a non-root user
 USER $USERNAME
 
-# Set the entry point to bash
+# Set the entry point to the CapScreen CLI
 ENTRYPOINT ["capscreen"]
