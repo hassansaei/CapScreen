@@ -224,44 +224,28 @@ def merge_with_reference(df: pd.DataFrame, reference_file: Path) -> Tuple[pd.Dat
     
     return df_merged, stats
 
-def calculate_counts(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    """
-    Calculate counts for each variant.
-    
-    Args:
-        df (pd.DataFrame): DataFrame with merged data
-        
-    Returns:
-        Tuple[pd.DataFrame, Dict[str, int]]: 
-            - DataFrame with counts
-            - Dictionary with count statistics
-    """
-    # Drop processing columns that shouldn't be in final output
-    columns_to_drop = ['full_seq', 'cigar_stats']
-    df = df.drop(columns=[col for col in columns_to_drop if col in df.columns])
-    
-    # Group by peptide, variable_seq and ID_WLG and count occurrences
-    counts = df.groupby(['peptide', 'variable_seq', 'ID_WLG']).size().reset_index(name='count')
-    
-    # Calculate statistics
-    total = counts['count'].sum()
-    assigned = counts[counts['ID_WLG'].notna()]['count'].sum()
-    unassigned = counts[counts['ID_WLG'].isna()]['count'].sum()
-    unique_variants = len(counts)
-    
+def calculate_counts(df: pd.DataFrame, total_reads: int) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    # Calculate peptide abundance (how many times each peptide appears)
+    peptide_counts = df['peptide'].value_counts()
+    df['count'] = df['peptide'].map(peptide_counts)
+    df['RPM'] = df['count'] / total_reads * 1_000_000
+
+    # Reorder columns as desired
+    df_out = df[['ID_WLG', 'peptide', 'variable_seq', 'count', 'RPM', 'insertions', 'deletions', 'matches']].copy()
+
+    # Stats (optional, can be adjusted)
+    assigned = df_out[df_out['ID_WLG'].notna()]['count'].sum()
+    unassigned = df_out[df_out['ID_WLG'].isna()]['count'].sum()
     stats = {
-        'total': total,
+        'total': len(df_out),
         'assigned': assigned,
         'unassigned': unassigned,
-        'assigned_percent': assigned / total if total > 0 else 0,
-        'unassigned_percent': unassigned / total if total > 0 else 0,
-        'unique_variants': unique_variants,
-        'max_reads_per_variant': counts['count'].max(),
-        'min_reads_per_variant': counts['count'].min(),
-        'mean_reads_per_variant': counts['count'].mean()
+        'unique_variants': df_out['peptide'].nunique(),
+        'max_reads_per_variant': df_out['count'].max(),
+        'min_reads_per_variant': df_out['count'].min(),
+        'mean_reads_per_variant': df_out['count'].mean()
     }
-    
-    return counts, stats
+    return df_out, stats
 
 def main(sam_file: Path, reference_file: Path, config: Dict, output_file: Path) -> None:
     """
@@ -297,6 +281,9 @@ def main(sam_file: Path, reference_file: Path, config: Dict, output_file: Path) 
         
         # Merge with reference
         df_merged, merge_stats = merge_with_reference(df, reference_file)
+
+        # Ensure all unassigned ID_WLG are labeled as 'Unassigned'
+        df_merged['ID_WLG'] = df_merged['ID_WLG'].fillna('Unassigned')
         
         # Calculate variant statistics for unassigned reads only
         unassigned_df = df_merged[df_merged['ID_WLG'].isna()]
@@ -322,13 +309,13 @@ def main(sam_file: Path, reference_file: Path, config: Dict, output_file: Path) 
         logger.info(f"Peptides only in reads: {merge_stats['peptides_only_in_reads']:,}")
         
         # Calculate counts
-        df_final, count_stats = calculate_counts(df_merged)
-        
-        # Calculate correct percentages based on total reads with flanking sequences
-        total_sequences = sam_stats['reads_with_flanks']
-        assigned_sequences = count_stats['assigned']
-        unassigned_sequences = total_sequences - assigned_sequences  # Calculate unassigned as the difference
-        
+        df_final, count_stats = calculate_counts(df_merged, sam_stats['total_reads'])
+
+        # Calculate correct assigned/unassigned read counts and percentages
+        total_sequences = len(df_final)
+        assigned_sequences = df_final[df_final['ID_WLG'].notna() & (df_final['ID_WLG'] != 'Unassigned')].shape[0]
+        unassigned_sequences = df_final[(df_final['ID_WLG'].isna()) | (df_final['ID_WLG'] == 'Unassigned')].shape[0]
+
         # Log count statistics with correct percentages
         logger.info("\nVariant Count Statistics:")
         logger.info(f"Total sequences: {total_sequences:,}")
