@@ -4,7 +4,8 @@
     "log_level": "INFO",
     "reference": {
         "genome": "/opt/capscreen/reference/reference_aav2",
-        "index_basename": "/opt/capscreen/reference/reference_aav2"
+        "index_basename": "/opt/capscreen/reference/reference_aav2",
+        "library": "/opt/capscreen/reference/library.csv"
     },
     "fastp": {
         "compression": 6,
@@ -36,6 +37,11 @@
     "samtools": {
         "sort_memory": "16G",
         "compression_level": 6
+    },
+    "flanking_sequences": {
+        "flank_5p": "TTGAAAAGGTCATGATTACA",
+        "flank_3p": "CAAGCAGCTACCGCAGATGT",
+        "description": "Flanking sequences for variable region extraction"
     },
     "output": {
         "create_subdirectories": true,

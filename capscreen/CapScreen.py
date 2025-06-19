@@ -9,7 +9,7 @@ import shlex
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 import importlib.resources as pkg_resources
-from capscreen.version import __version__, __author__, __email__
+from capscreen.version import __version__
 
 # Global Logger
 logger = logging.getLogger("FastQProcessor")
@@ -504,7 +504,7 @@ def main():
     
     # Version argument
     parser.add_argument("--version", action="version",
-                        version=f"CapScreen v{__version__}\nAuthor: {__author__}\nEmail: {__email__}")
+                        version=f"CapScreen v{__version__}")
     
     # Required arguments
     parser.add_argument("--fastq1", type=Path, required=True, help="Path to first FASTQ file")
