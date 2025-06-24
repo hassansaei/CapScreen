@@ -5,7 +5,7 @@ version_variable = [
 ]
 version_toml = ["pyproject.toml:tool.poetry.version"]
 branch = "master"
-upload_to_pypi = true
+upload_to_pypi = false
 build_command = "python setup.py sdist bdist_wheel"
 
 [tool.semantic_release.commit_parser_options]
