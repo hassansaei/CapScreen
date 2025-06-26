@@ -1,0 +1,102 @@
+<html>
+<head>
+    <title>CapScreen Report</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; }
+        h1, h2 { color: #2c3e50; }
+        table { border-collapse: collapse; width: 100%; margin-bottom: 30px; }
+        th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        pre { background: #f8f8f8; padding: 10px; border-radius: 4px; }
+        details { margin-top: 20px; }
+        summary { font-weight: bold; cursor: pointer; }
+    </style>
+    <!-- DataTables CSS -->
+    <link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css"/>
+</head>
+<body>
+    <h1>CapScreen Pipeline Report</h1>
+    <p><strong>CapScreen version:</strong> {{ tool_version }}</p>
+    <h2>Sample: {{ sample_name }}</h2>
+
+    <table>
+        <tr><th colspan="2">PEAR Merging</th></tr>
+        <tr><td>Assembled reads</td><td>{{ pear.assembled_reads }}</td></tr>
+        <tr><td>Discarded reads</td><td>{{ pear.discarded_reads }}</td></tr>
+        <tr><td>Not assembled reads</td><td>{{ pear.not_assembled_reads }}</td></tr>
+
+        <tr><th colspan="2">FASTP (Before Filtering)</th></tr>
+        {% for k, v in fastp.before_filtering.items() %}
+        <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+        {% endfor %}
+        <tr><th colspan="2">FASTP (After Filtering)</th></tr>
+        {% for k, v in fastp.after_filtering.items() %}
+        <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+        {% endfor %}
+        <tr><th colspan="2">FASTP (Filtering Result)</th></tr>
+        {% for k, v in fastp.filtering_result.items() %}
+        <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+        {% endfor %}
+        <tr><th>FASTP Duplication Rate</th><td>{{ fastp.duplication.rate }}</td></tr>
+
+        <tr><th colspan="2">SAM File Processing Statistics</th></tr>
+        {% for k, v in pipeline.stats.items() %}
+        <tr><td>{{ k.replace('_', ' ').capitalize() }}</td><td>{{ v }}</td></tr>
+        {% endfor %}
+
+        <tr><th colspan="2">Reference capsid Library Statistics</th></tr>
+        {% for k, v in pipeline.merging_stats.items() %}
+        <tr>
+            <td>
+                {% if k == 'unique_peptides_in_reads' %}Unique peptides in input
+                {% elif k == 'peptides_only_in_reads' %}Peptides only in input
+                {% else %}{{ k.replace('_', ' ').capitalize() }}{% endif %}
+            </td>
+            <td>{{ v }}</td>
+        </tr>
+        {% endfor %}
+
+        <tr><th colspan="2">Variant Count Statistics</th></tr>
+        {% for k, v in pipeline.variant_stats.items() %}
+        <tr>
+            <td>
+                {% if k == 'assigned_sequences' %}Assigned sequences to valid peptides
+                {% elif k == 'unassigned_sequences' %}Unassigned sequences to valid peptides
+                {% elif k == 'unique_variants_found' %}Unique variants found in input
+                {% else %}{{ k.replace('_', ' ').capitalize() }}{% endif %}
+            </td>
+            <td>{{ v }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+
+    {% if count_matrix_html %}
+    <h2>Count Matrix (Unique ID_WLG)</h2>
+    <div style="overflow-x:auto;">
+        {{ count_matrix_html | safe }}
+    </div>
+    <!-- DataTables JS and jQuery -->
+    <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+    <script>
+    const allRows = {{ count_matrix_json | safe }};
+    $(document).ready(function() {
+        var table = $('#count-matrix-table').DataTable({
+            data: allRows,
+            columns: Object.keys(allRows[0] || {}).map(function(col) { return { data: col, title: col }; }),
+            pageLength: 10,
+            lengthMenu: [10, 25, 50, 100],
+            searching: true,
+            ordering: true,
+            destroy: true
+        });
+    });
+    </script>
+    {% endif %}
+
+    <details>
+      <summary>Show full pipeline log</summary>
+      <pre>{{ pipeline_log_contents }}</pre>
+    </details>
+</body>
+</html> 

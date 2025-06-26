@@ -58,4 +58,5 @@ dependencies:
   - xopen=0.8.4=py37_0
   - xz=5.2.5=h7f8727e_1
   - zlib=1.2.11=h7f8727e_4
+  - jinja2
 

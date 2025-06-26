@@ -11,6 +11,7 @@ from typing import Optional, Dict, Any, Tuple
 import importlib.resources as pkg_resources
 from capscreen.version import __version__
 from capscreen.scripts import count as count_module
+from capscreen.scripts import generate_report as generate_report_module
 
 # Global Logger
 logger = logging.getLogger("FastQProcessor")
@@ -490,6 +491,7 @@ def main():
     pipeline_parser.add_argument("--fastq1", type=Path, required=True, help="Path to first FASTQ file")
     pipeline_parser.add_argument("--fastq2", type=Path, required=True, help="Path to second FASTQ file")
     pipeline_parser.add_argument("--reference-file", type=Path, required=True, help="Path to reference library file (CSV)")
+    pipeline_parser.add_argument("--keep_intermediate", action="store_true", help="Keep intermediate FASTQ files (default: remove)")
 
     # align: only QC and alignment
     align_parser = subparsers.add_parser("align", parents=[parent_parser], help="Run QC and alignment only")
@@ -523,6 +525,37 @@ def main():
             logger.error(f"Counting failed: {e}")
             sys.exit(1)
         logger.info("Pipeline completed successfully.")
+        # Generate HTML report at the end of the pipeline
+        try:
+            logger.info("Generating HTML report...")
+            generate_report_module.generate_report(
+                str(args.output_dir / args.sample_name),
+                output="report.html"
+            )
+            logger.info("HTML report generated.")
+        except Exception as e:
+            logger.error(f"Report generation failed: {e}")
+        # Remove intermediate files if not keeping them
+        keep_intermediate = getattr(args, 'keep_intermediate', False)
+        if not keep_intermediate:
+            # Try to get config value if not set on CLI
+            keep_intermediate = json_config.get('keep_intermediate', False)
+        if not keep_intermediate:
+            sample_dir = args.output_dir / args.sample_name
+            files_to_remove = [
+                sample_dir / 'fastp_R1.fastq.gz',
+                sample_dir / 'fastp_R2.fastq.gz',
+                sample_dir / 'pear.discarded.fastq.gz',
+                sample_dir / 'pear.unassembled.forward.fastq.gz',
+                sample_dir / 'pear.unassembled.reverse.fastq.gz'
+            ]
+            for f in files_to_remove:
+                try:
+                    if f.exists():
+                        f.unlink()
+                        logger.info(f"Removed intermediate file: {f}")
+                except Exception as e:
+                    logger.warning(f"Could not remove {f}: {e}")
         sys.exit(0)
     elif args.command == "align":
         sorted_sam = run_qc_and_alignment(args.fastq1, args.fastq2, args.output_dir, args.sample_name, json_config, args.threads)

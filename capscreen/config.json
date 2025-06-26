@@ -46,5 +46,8 @@
     "output": {
         "create_subdirectories": true,
         "prefix": "processed_"
-    }
+    },
+    "html_template": "capscreen/templates/template_report.html",
+    "show_count_matrix": true,
+    "keep_intermediate": false
 }

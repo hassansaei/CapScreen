@@ -36,7 +36,7 @@ The CapScreen pipeline consists of the following steps:
 5. **Variant Extraction and Counting**
    - Extracts the variable region between flanking sequences, translates to peptides, and counts each variant's abundance.
 6. **Reporting**
-   - Outputs a TSV file with variant counts and detailed logs.
+   - Outputs a HTML report file, TSV file with variant counts and detailed logs.
 
 
 ## Usage
