@@ -2,6 +2,36 @@
 
 
 
+## v0.1.0 (2025-06-26)
+
+### Feature
+
+* feat: Add HTML reporting with interactive tables, and config-driven options
+
+- New script of generate_report.py and template_report.html for advanced reporting
+- Added config options:
+  - show_count_matrix: Show deduplicated count matrix table (default: true)
+  - keep_intermediate: Control retention of intermediate files (default: false)
+  - html_template: Path to HTML template
+- HTML report now includes:
+  - Tool version at the top
+  - PEAR, FASTP, pipeline, and reference stats in a summary table
+  - Interactive, searchable, paginated count matrix (DataTables.js)
+  - Collapsible full pipeline log
+- Table and plot options are controlled via config.json
+- Added --keep_intermediate flag to pipeline CLI; cleans up intermediate files unless set
+- Improved parsing and deduplication of count matrix (removes Unnamed: 0, insertions, deletions, matches)
+- All new features are backward compatible and configurable ([`6b5c1ab`](https://github.com/hassansaei/CapScreen/commit/6b5c1abff76275c4930fa8c98e49a696694b5266))
+
+### Unknown
+
+* Update README: clarify aim, usage, input/output, and add user-specific notes and license ([`ca70e9a`](https://github.com/hassansaei/CapScreen/commit/ca70e9a59444a1c0c3ce5c41d7debf3fbc544b77))
+
+* Merge branch &#39;master&#39; of https://github.com/hassansaei/CapScreen ([`d654bbe`](https://github.com/hassansaei/CapScreen/commit/d654bbe66eb8be5262b1d05247f8cff5f8db91c1))
+
+* Update README: clarify aim, usage, input/output, and add user-specific notes and license ([`64008cd`](https://github.com/hassansaei/CapScreen/commit/64008cd7092b7c7a76cebcabe8c9f1edee91c573))
+
+
 ## v0.0.1 (2025-06-24)
 
 ### Ci
