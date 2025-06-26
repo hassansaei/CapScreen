@@ -1,6 +1,6 @@
 # CapScreen
 
-**CapScreen** is a pipeline designed for high-throughput screening of amplicon sequencing (NGS) results from AAV (Adeno-Associated Virus) library screens targeting specific receptors. The pipeline is suitable for both *binding* and *transduction* screening experiments, providing robust quality control, alignment, and variant counting functionalities. More option will be added overtime.
+**CapScreen** is a pipeline designed for high-throughput screening of amplicon sequencing (NGS) results from AAV (Adeno-Associated Virus) library screens targeting specific receptors. The pipeline is suitable for both *binding* and *transduction* screening experiments, providing robust quality control, alignment, and variant counting functionalities. More options will be added overtime.
 
 
 ## Aim
@@ -126,7 +126,7 @@ Coming soon....
 
 ## License
 
-MIT License (or specify your license here)
+MIT License
 
 ## Contact
 
