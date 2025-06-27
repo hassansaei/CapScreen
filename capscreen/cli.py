@@ -199,6 +199,8 @@ def run_pear(r1_trimmed: Path, r2_trimmed: Path, sample_dir: Path, config: Dict[
     
     try:
         logger.info("Running PEAR")
+        # Log the PEAR command
+        logger.info(f"[PEAR] Running command: {' '.join(shlex.quote(str(s)) for s in pear_cmd)}")
         with open(log_file, 'w') as log:
             process = subprocess.run(
                 pear_cmd,
@@ -397,7 +399,10 @@ def run_bowtie2_and_samtools(assembled_fastq: Path, sample_dir: Path, config: Di
     # Run the pipeline
     try:
         logger.info("Running Bowtie2 -> Samtools sort pipeline")
-        
+        # Log the Bowtie2 and Samtools pipeline command
+        bowtie2_str = ' '.join(shlex.quote(str(s)) for s in bowtie2_cmd)
+        samtools_str = ' '.join(shlex.quote(str(s)) for s in samtools_sort_cmd)
+        logger.info(f"[Bowtie2/Samtools] Running command: {bowtie2_str} | {samtools_str}")
         with open(log_file, 'w') as log:
             with subprocess.Popen(bowtie2_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p1, \
                 subprocess.Popen(samtools_sort_cmd, stdin=p1.stdout, stderr=subprocess.PIPE) as p2:
