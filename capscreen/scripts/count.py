@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import pandas as pd
+import numpy as np
 import logging
 from pathlib import Path
 from Bio.Seq import Seq
@@ -226,9 +227,11 @@ def calculate_counts(df: pd.DataFrame, total_reads: int) -> Tuple[pd.DataFrame, 
     peptide_counts = df['peptide'].value_counts()
     df['count'] = df['peptide'].map(peptide_counts)
     df['RPM'] = df['count'] / total_reads * 1_000_000
+    # Add log2(RPM + 1) transformation
+    df['log2_RPM'] = np.log2(df['RPM'] + 1)
 
     # Reorder columns as desired
-    df_out = df[['ID_WLG', 'peptide', 'variable_seq', 'count', 'RPM', 'insertions', 'deletions', 'matches']].copy()
+    df_out = df[['ID_WLG', 'peptide', 'variable_seq', 'count', 'RPM', 'log2_RPM', 'insertions', 'deletions', 'matches']].copy()
 
     # Stats (optional, can be adjusted)
     assigned = df_out[df_out['ID_WLG'].notna()]['count'].sum()
