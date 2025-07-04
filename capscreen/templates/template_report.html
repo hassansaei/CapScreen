@@ -94,6 +94,11 @@
     </script>
     {% endif %}
 
+    {% if log2rpm_hist_path %}
+    <h2>Distribution of peptides (log2(RPM + 1))</h2>
+    <img src="{{ log2rpm_hist_path }}" alt="Histogram of log2(RPM + 1)" style="max-width:500px; border:1px solid #ccc; margin-bottom:30px;"/>
+    {% endif %}
+
     <details>
       <summary>Show full pipeline log</summary>
       <pre>{{ pipeline_log_contents }}</pre>

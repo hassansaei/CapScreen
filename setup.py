@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="capscreen",
-    version="1.0.0-alpha.5",
+    version="1.0.0-alpha.6",
     packages=find_packages(),
     package_data={
         "capscreen": [

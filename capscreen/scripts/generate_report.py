@@ -148,6 +148,8 @@ def generate_report(sample_dir, output='report.html'):
     count_matrix_html = ''
     count_matrix_json = '[]'
     show_count_matrix = config.get('show_count_matrix', False)
+    show_histogram = config.get('show_histogram', False)
+    log2rpm_hist_path = None
     if show_count_matrix and counts_tsv.exists():
         df = pd.read_csv(counts_tsv, sep=None, engine='python')
         if 'ID_WLG' in df.columns:
@@ -160,6 +162,19 @@ def generate_report(sample_dir, output='report.html'):
             count_matrix_html = df.head(10).to_html(index=False, escape=False, table_id='count-matrix-table')
             # Prepare JSON for all rows (for DataTables)
             count_matrix_json = df.to_json(orient='records')
+            # Generate histogram for log2_RPM if present and show_histogram is True
+            if show_histogram and 'log2_RPM' in df.columns:
+                import matplotlib.pyplot as plt
+                plt.figure(figsize=(6,4))
+                plt.hist(df['log2_RPM'].dropna(), bins=30, color='#3498db', edgecolor='black')
+                plt.xlabel('log2(RPM + 1)')
+                plt.ylabel('Frequency')
+                plt.title('Distribution of peptides log2(RPM + 1)')
+                hist_path = sample_dir / 'log2rpm_hist.png'
+                plt.tight_layout()
+                plt.savefig(hist_path)
+                plt.close()
+                log2rpm_hist_path = hist_path.name
 
     # Use template from config if present
     template_path = config.get('html_template', 'capscreen/templates/template_report.html')
@@ -176,7 +191,8 @@ def generate_report(sample_dir, output='report.html'):
         pipeline_log_contents=pipeline_log_contents,
         count_matrix_html=count_matrix_html,
         count_matrix_json=count_matrix_json,
-        tool_version=tool_version
+        tool_version=tool_version,
+        log2rpm_hist_path=log2rpm_hist_path
     )
     output_path = sample_dir / output
     with open(output_path, 'w') as f:

@@ -49,5 +49,6 @@
     },
     "html_template": "capscreen/templates/template_report.html",
     "show_count_matrix": true,
+    "show_histogram": true,
     "keep_intermediate": false
 }
