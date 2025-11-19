@@ -76,6 +76,7 @@ The *reference_library.csv* is a user-specific file containing information about
 - `pipeline`: Runs the full pipeline (QC, alignment, and counting).
 - `align`: Runs only QC and alignment steps.
 - `count`: Runs only the variant counting step from a sorted SAM file.
+- `report`: Generates only the HTML report for an existing sample directory.
 
 Example for counting only:
 
@@ -85,7 +86,7 @@ docker run --rm \
   -v /path/to/reference:/data/reference \
   capscreen \
   count \
-    /data/output/my_sample/aligned.sorted.sam \
+    /data/output/my_sample/my_sample.sorted.sam \
     /data/reference/library.csv \
     --output /data/output/my_sample/counts.tsv \
     --config /opt/capscreen/capscreen/config.json

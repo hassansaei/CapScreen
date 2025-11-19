@@ -2,7 +2,7 @@ import os
 import json
 import argparse
 from pathlib import Path
-from jinja2 import Environment, FileSystemLoader
+from jinja2 import Environment, FileSystemLoader, PackageLoader, ChoiceLoader
 import re
 import pandas as pd
 from capscreen.version import __version__ as tool_version
@@ -112,9 +112,18 @@ def render_html_report(sample_name, fastp_data, pipeline_data, pear_data, pipeli
         f.write(html)
 
 
-def generate_report(sample_dir, output='report.html'):
+def generate_report(sample_dir, output=None):
     sample_dir = Path(sample_dir)
     sample_name = sample_dir.name
+
+    # Determine output filename
+    if output is None:
+        output_filename = f"{sample_name}_report.html"
+    else:
+        output_filename = output
+    output_path = Path(output_filename)
+    if not output_path.is_absolute():
+        output_path = sample_dir / output_path
 
     # Read config
     config_path = sample_dir.parent.parent / 'config.json'
@@ -176,13 +185,58 @@ def generate_report(sample_dir, output='report.html'):
                 plt.close()
                 log2rpm_hist_path = hist_path.name
 
-    # Use template from config if present
-    template_path = config.get('html_template', 'capscreen/templates/template_report.html')
-    template_dir = Path(template_path).parent
-    template_file = Path(template_path).name
+    # Resolve HTML template path for local, docker, and installed environments
+    template_config = config.get('html_template')
+    template_name = 'template_report.html'
+    template_loaders = []
+    searched_paths = []
 
-    env = Environment(loader=FileSystemLoader(str(template_dir)))
-    template = env.get_template(template_file)
+    def try_template_path(candidate: Path) -> bool:
+        nonlocal template_name
+        if candidate is None:
+            return False
+        candidate = candidate.expanduser()
+        if candidate.is_file():
+            template_loaders.append(FileSystemLoader(str(candidate.parent)))
+            template_name = candidate.name
+            return True
+        searched_paths.append(str(candidate))
+        return False
+
+    if template_config:
+        cfg_path = Path(template_config)
+        found = try_template_path(cfg_path)
+        if not found and not cfg_path.is_absolute():
+            repo_relative = (Path(__file__).parent.parent / cfg_path).resolve()
+            found = try_template_path(repo_relative)
+            if not found:
+                cwd_relative = (Path.cwd() / cfg_path).resolve()
+                found = try_template_path(cwd_relative)
+        if not found:
+            opt_path = Path("/opt/capscreen") / cfg_path
+            try_template_path(opt_path)
+    else:
+        default_paths = [
+            Path(__file__).parent.parent / 'templates' / template_name,
+            Path.cwd() / 'capscreen' / 'templates' / template_name,
+            Path('/opt/capscreen/capscreen/templates') / template_name,
+        ]
+        for path in default_paths:
+            if try_template_path(path):
+                break
+
+    # Always fall back to package resources (works for installed distributions)
+    template_loaders.append(PackageLoader('capscreen', 'templates'))
+    env = Environment(loader=ChoiceLoader(template_loaders))
+
+    try:
+        template = env.get_template(template_name)
+    except Exception as exc:
+        raise FileNotFoundError(
+            "Could not load HTML template. "
+            f"Tried the following paths: {', '.join(searched_paths)}. "
+            "Ensure the template exists or set 'html_template' to a valid file."
+        ) from exc
     html = template.render(
         sample_name=sample_name,
         fastp=fastp_data,
@@ -194,7 +248,6 @@ def generate_report(sample_dir, output='report.html'):
         tool_version=tool_version,
         log2rpm_hist_path=log2rpm_hist_path
     )
-    output_path = sample_dir / output
     with open(output_path, 'w') as f:
         f.write(html)
     print(f'Report generated: {output_path}')
@@ -203,7 +256,7 @@ def generate_report(sample_dir, output='report.html'):
 def main():
     parser = argparse.ArgumentParser(description='Generate HTML report for CapScreen pipeline.')
     parser.add_argument('sample_dir', help='Directory containing log and result files for the sample')
-    parser.add_argument('--output', default='report.html', help='Output HTML file name')
+    parser.add_argument('--output', default=None, help='Output HTML file name')
     args = parser.parse_args()
     generate_report(args.sample_dir, args.output)
 

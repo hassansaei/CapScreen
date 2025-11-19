@@ -7,6 +7,7 @@ setup(
     package_data={
         "capscreen": [
             "config.json",
+            "templates/*.html",
         ],
     },
     include_package_data=True,

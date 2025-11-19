@@ -344,13 +344,14 @@ def validate_threads(threads: int) -> int:
         logger.warning("Invalid thread count. Setting to 1.")
         return 1
 
-def run_bowtie2_and_samtools(assembled_fastq: Path, sample_dir: Path, config: Dict[str, Any], threads: int) -> bool:
+def run_bowtie2_and_samtools(assembled_fastq: Path, sample_dir: Path, sample_name: str, config: Dict[str, Any], threads: int) -> bool:
     """
     Run Bowtie2 alignment and Samtools processing with piped commands.
 
     Args:
         assembled_fastq (Path): Path to assembled FASTQ file
         sample_dir (Path): Sample-specific output directory
+        sample_name (str): Sample name for output files
         config (Dict): Configuration dictionary
         threads (int): Number of threads to use
 
@@ -361,10 +362,9 @@ def run_bowtie2_and_samtools(assembled_fastq: Path, sample_dir: Path, config: Di
     samtools_config = config['samtools']
     ref_config = config['reference']
     
-    # Final output SAM file
-    prefix = bowtie2_config['output_prefix']
-    sorted_sam = sample_dir / f"{prefix}.sorted.sam"
-    log_file = sample_dir / f"{prefix}.bowtie2.log"
+    # Final output SAM file/log use sample name
+    sorted_sam = sample_dir / f"{sample_name}.sorted.sam"
+    log_file = sample_dir / f"{sample_name}.bowtie2.log"
     
     # Bowtie2 command with memory optimization
     bowtie2_cmd = [
@@ -466,11 +466,10 @@ def run_qc_and_alignment(fastq1, fastq2, output_dir, sample_name, config, thread
     if not assembled_fastq:
         return None
     logger.info("Step 3: Running Bowtie2 and Samtools")
-    if not run_bowtie2_and_samtools(assembled_fastq, sample_dir, config, threads):
+    if not run_bowtie2_and_samtools(assembled_fastq, sample_dir, sample_name, config, threads):
         return None
     # Return path to sorted SAM file
-    prefix = config['bowtie2']['output_prefix']
-    sorted_sam = sample_dir / f"{prefix}.sorted.sam"
+    sorted_sam = sample_dir / f"{sample_name}.sorted.sam"
     return sorted_sam
 
 def main():
@@ -509,6 +508,10 @@ def main():
     count_parser.add_argument("--reference-file", type=Path, required=True, help="Path to reference library file (CSV)")
     count_parser.add_argument("--output", type=Path, help="Path to output file (TSV)")
 
+    # report: HTML report only
+    report_parser = subparsers.add_parser("report", parents=[parent_parser], help="Generate HTML report from an existing sample directory")
+    report_parser.add_argument("--output", type=Path, help="Output HTML file name (defaults to <sample>_report.html)")
+
     args = parser.parse_args()
     json_config = load_config(args.config)
 
@@ -534,8 +537,7 @@ def main():
         try:
             logger.info("Generating HTML report...")
             generate_report_module.generate_report(
-                str(args.output_dir / args.sample_name),
-                output="report.html"
+                str(args.output_dir / args.sample_name)
             )
             logger.info("HTML report generated.")
         except Exception as e:
@@ -578,6 +580,20 @@ def main():
             logger.error(f"Counting failed: {e}")
             sys.exit(1)
         logger.info("Counting completed successfully.")
+        sys.exit(0)
+    elif args.command == "report":
+        sample_dir = args.output_dir / args.sample_name
+        if not sample_dir.exists():
+            logger.error(f"Sample directory not found: {sample_dir}")
+            sys.exit(1)
+        try:
+            logger.info("Generating HTML report...")
+            output_arg = str(args.output) if args.output else None
+            generate_report_module.generate_report(str(sample_dir), output=output_arg)
+            logger.info("HTML report generated.")
+        except Exception as e:
+            logger.error(f"Report generation failed: {e}", exc_info=True)
+            sys.exit(1)
         sys.exit(0)
     else:
         parser.print_help()

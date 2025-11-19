@@ -319,8 +319,13 @@ def main(sam_file: Path, reference_file: Path, config: Dict, output_file: Path, 
         logger.info(f"Unique variants found: {count_stats['unique_variants']:,}")
         logger.info(f"Reads per variant - Max: {count_stats['max_reads_per_variant']:,}, Min: {count_stats['min_reads_per_variant']:,}, Mean: {count_stats['mean_reads_per_variant']:.2f}")
         
+        # Prepare final output: drop duplicate peptides, sort by RPM, reset index
+        df_final = df_final.drop_duplicates(subset=['peptide'], keep='first')
+        df_final = df_final.sort_values(by='RPM', ascending=False)
+        df_final = df_final.reset_index(drop=True)
+        
         # Save results
-        df_final.to_csv(output_file)
+        df_final.to_csv(output_file, index=False)
         logger.info(f"\nResults saved to {output_file}")
         logger.info(f"Log file saved to {output_dir}/{sample_name}.count.log")
         
