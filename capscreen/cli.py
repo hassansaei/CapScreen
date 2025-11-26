@@ -1,22 +1,333 @@
 #!/usr/bin/env python3
 import argparse
+import csv
 import json
 import logging
 import os
 import sys
-import subprocess
-import shlex
+import shutil
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List, Set
 import importlib.resources as pkg_resources
 from capscreen.version import __version__
 from capscreen.scripts import count as count_module
 from capscreen.scripts import generate_report as generate_report_module
+from capscreen.scripts import alignment as alignment_module
 
 # Global Logger
+LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(name)s:%(lineno)d] %(message)s"
 logger = logging.getLogger("FastQProcessor")
 
-def setup_logging(logger_instance: logging.Logger, level_str: str = "INFO", log_file: Optional[Path] = None) -> None:
+SAMPLE_INFO_REQUIRED_COLUMNS = {
+    "sample_id",
+    "run_mode",
+    "path_FASTQ",
+    "group",
+    "tech_rep",
+    "bio_rep",
+    "batch_seq"
+}
+
+@dataclass
+class SampleInfo:
+    sample_id: str
+    run_mode: str
+    fastq1: Path
+    fastq2: Optional[Path]
+    group: str
+    tech_rep: int
+    bio_rep: int
+    batch_seq: int
+
+@contextmanager
+def sample_file_log_handler(log_path: Optional[Path]):
+    """
+    Temporarily attach a file handler to the global logger so that
+    messages are duplicated into the provided sample-specific log file.
+    """
+    handler = None
+    if log_path:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            handler = logging.FileHandler(log_path, mode='w')
+            handler.setFormatter(logging.Formatter(LOG_FORMAT))
+            logger.addHandler(handler)
+        except Exception as exc:
+            logger.error(f"Failed to attach sample log handler for {log_path}: {exc}", exc_info=True)
+            handler = None
+    try:
+        yield
+    finally:
+        if handler:
+            logger.removeHandler(handler)
+            handler.close()
+
+def detach_log_file_handler(logger_instance: logging.Logger, handler: Optional[logging.Handler]) -> None:
+    """
+    Remove and close a logging file handler if it exists.
+    """
+    if handler:
+        handler.flush()
+        logger_instance.removeHandler(handler)
+        handler.close()
+
+def append_sample_log_to_batch(
+    batch_log_path: Optional[Path],
+    sample_log_path: Path,
+    sample_name: str,
+    fallback_message: Optional[str] = None,
+    copy_sample_log: bool = True
+) -> None:
+    """
+    Append the per-sample pipeline log into the batch log so the combined file
+    mirrors the sample logs sequentially.
+    """
+    if not batch_log_path:
+        return
+    try:
+        if not sample_log_path.exists() and not fallback_message:
+            return
+        batch_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with batch_log_path.open("a") as batch_log:
+            batch_log.write(f"\n===== Sample {sample_name} =====\n")
+            if copy_sample_log and sample_log_path.exists():
+                with sample_log_path.open("r") as sample_log:
+                    shutil.copyfileobj(sample_log, batch_log)
+                batch_log.write("\n")
+            elif fallback_message:
+                batch_log.write(f"{fallback_message.strip()}\n")
+            else:
+                batch_log.write("No log output was generated for this sample.\n")
+    except Exception as exc:
+        logger.error(
+            f"Failed to append log for sample {sample_name} to batch log {batch_log_path}: {exc}",
+            exc_info=True
+        )
+
+def append_batch_summary(batch_log_path: Optional[Path], lines: List[str], header: str = "Batch Summary") -> None:
+    """
+    Append a short summary block to the batch log file.
+    """
+    if not batch_log_path:
+        return
+    try:
+        batch_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with batch_log_path.open("a") as batch_log:
+            batch_log.write(f"\n===== {header} =====\n")
+            for line in lines:
+                batch_log.write(f"{line.rstrip()}\n")
+    except Exception as exc:
+        logger.error(f"Failed to append batch summary to {batch_log_path}: {exc}", exc_info=True)
+
+def determine_keep_intermediate(cli_flag: bool, config: Dict[str, Any]) -> bool:
+    """
+    Resolve whether intermediate files should be preserved by combining
+    the CLI flag with the configuration default.
+    """
+    if cli_flag:
+        return True
+    return config.get('keep_intermediate', False)
+
+def infer_fastq2_path(fastq1: Path) -> Path:
+    """
+    Infer the R2 FASTQ path from the R1 FASTQ path.
+    """
+    name = fastq1.name
+    replacements = [
+        ("_R1_", "_R2_"),
+        ("_R1.", "_R2."),
+        ("_R1", "_R2"),
+        ("R1_", "R2_"),
+        ("R1.", "R2.")
+    ]
+    for old, new in replacements:
+        if old in name:
+            return fastq1.with_name(name.replace(old, new, 1))
+    raise ValueError(f"Unable to infer R2 FASTQ file name from {fastq1}")
+
+def _parse_int_field(value: Optional[str], field_name: str) -> int:
+    """
+    Parse an integer field from the CSV and raise a ValueError with context on failure.
+    """
+    if value is None:
+        raise ValueError(f"Missing value for {field_name}")
+    text = str(value).strip()
+    if not text:
+        raise ValueError(f"Empty value for {field_name}")
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise ValueError(f"Invalid integer for {field_name}: {value}") from exc
+
+def _build_sample_info(row: Dict[str, str], seen_ids: Set[str]) -> SampleInfo:
+    sample_id = (row.get("sample_id") or "").strip()
+    if not sample_id:
+        raise ValueError("sample_id cannot be empty")
+    if sample_id in seen_ids:
+        raise ValueError(f"Duplicate sample_id detected: {sample_id}")
+    
+    run_mode = (row.get("run_mode") or "").strip().upper()
+    if run_mode != "PE":
+        raise ValueError(f"Unsupported run_mode '{run_mode}'. Currently only 'PE' is supported.")
+    
+    fastq1_raw = (row.get("path_FASTQ") or "").strip()
+    if not fastq1_raw:
+        raise ValueError("path_FASTQ cannot be empty")
+    fastq1_path = Path(fastq1_raw).expanduser()
+    if not fastq1_path.exists():
+        raise ValueError(f"FASTQ file does not exist: {fastq1_path}")
+    fastq1_path = fastq1_path.resolve()
+    fastq2_path = infer_fastq2_path(fastq1_path).resolve()
+    if not fastq2_path.exists():
+        raise ValueError(f"Inferred FASTQ2 file does not exist: {fastq2_path}")
+    
+    group_value = (row.get("group") or "").strip() or "NA"
+    tech_rep = _parse_int_field(row.get("tech_rep"), "tech_rep")
+    bio_rep = _parse_int_field(row.get("bio_rep"), "bio_rep")
+    batch_seq = _parse_int_field(row.get("batch_seq"), "batch_seq")
+    
+    seen_ids.add(sample_id)
+    
+    return SampleInfo(
+        sample_id=sample_id,
+        run_mode=run_mode,
+        fastq1=fastq1_path,
+        fastq2=fastq2_path,
+        group=group_value,
+        tech_rep=tech_rep,
+        bio_rep=bio_rep,
+        batch_seq=batch_seq
+    )
+
+def load_sample_info(sample_info_path: Path) -> Tuple[List[SampleInfo], List[str]]:
+    """
+    Load and validate sample information entries from a CSV file.
+    Returns a tuple of (valid_samples, skipped_row_messages)
+    """
+    valid_samples: List[SampleInfo] = []
+    skipped_rows: List[str] = []
+    seen_ids: Set[str] = set()
+    
+    with sample_info_path.open("r", newline='') as csv_file:
+        reader = csv.DictReader(csv_file)
+        if reader.fieldnames is None:
+            raise ValueError("Sample info CSV is missing a header row.")
+        normalized_headers = [header.strip() if header else header for header in reader.fieldnames]
+        reader.fieldnames = normalized_headers
+        missing_columns = SAMPLE_INFO_REQUIRED_COLUMNS - set(normalized_headers)
+        if missing_columns:
+            missing = ", ".join(sorted(missing_columns))
+            raise ValueError(f"Sample info CSV is missing required columns: {missing}")
+        
+        for row_index, row in enumerate(reader, start=2):
+            try:
+                sample_info = _build_sample_info(row, seen_ids)
+                valid_samples.append(sample_info)
+            except ValueError as exc:
+                skipped_rows.append(f"Row {row_index}: {exc}")
+    
+    return valid_samples, skipped_rows
+
+def merge_count_tables(
+    sample_entries: List[SampleInfo],
+    output_dir: Path,
+    output_path: Optional[Path] = None
+) -> Optional[Path]:
+    """
+    Merge individual per-sample count tables into a single wide-format table
+    where rows are variants and columns include raw counts and sample-provided RPM values.
+    """
+    if not sample_entries:
+        logger.warning("No sample entries were provided for count merging.")
+        return None
+    
+    merged_records: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    sample_order: List[str] = []
+    
+    for entry in sample_entries:
+        sample_order.append(entry.sample_id)
+        counts_path = output_dir / entry.sample_id / f"{entry.sample_id}.counts.tsv"
+        if not counts_path.exists():
+            logger.warning(f"Count file not found for sample {entry.sample_id}: {counts_path}. Skipping.")
+            continue
+        try:
+            with counts_path.open("r", newline='') as count_file:
+                reader = csv.DictReader(count_file)
+                required_cols = {"ID_WLG", "peptide", "count", "RPM"}
+                if not reader.fieldnames or not required_cols.issubset(set(reader.fieldnames)):
+                    logger.error(f"Count file for sample {entry.sample_id} is missing required columns. Skipping.")
+                    continue
+                for row in reader:
+                    id_wlg = (row.get("ID_WLG") or "").strip()
+                    if not id_wlg or id_wlg.lower() == "unassigned":
+                        continue
+                    key = (id_wlg, row["peptide"])
+                    record = merged_records.setdefault(
+                        key,
+                        {
+                            "ID_WLG": id_wlg,
+                            "peptide": row["peptide"],
+                            "counts": {},
+                            "rpms": {}
+                        }
+                    )
+                    try:
+                        record["counts"][entry.sample_id] = int(row.get("count", 0) or 0)
+                    except ValueError:
+                        logger.warning(
+                            f"Invalid count value in {counts_path} for variant {row['ID_WLG']}. Treating as 0."
+                        )
+                        record["counts"][entry.sample_id] = 0
+                    try:
+                        record["rpms"][entry.sample_id] = float(row.get("RPM", 0) or 0)
+                    except ValueError:
+                        logger.warning(
+                            f"Invalid RPM value in {counts_path} for variant {row['ID_WLG']}. Treating as 0."
+                        )
+                        record["rpms"][entry.sample_id] = 0.0
+        except Exception as exc:
+            logger.error(f"Failed to read count file for sample {entry.sample_id}: {exc}")
+            continue
+    
+    if not merged_records:
+        logger.error("No count files could be read; merged counts table will not be created.")
+        return None
+    
+    output_path = output_path or (output_dir / "merged.counts.tsv")
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", newline='') as merged_file:
+            fieldnames = ["ID_WLG", "peptide"]
+            rpm_columns: List[str] = []
+            for sample_id in sample_order:
+                fieldnames.append(sample_id)
+                rpm_columns.append(f"{sample_id}_RPM")
+            fieldnames.extend(rpm_columns)
+            writer = csv.DictWriter(merged_file, fieldnames=fieldnames)
+            writer.writeheader()
+            for key in sorted(merged_records.keys()):
+                record = merged_records[key]
+                row = {
+                    "ID_WLG": record["ID_WLG"],
+                    "peptide": record["peptide"]
+                }
+                for sample_id in sample_order:
+                    row[sample_id] = record["counts"].get(sample_id, 0)
+                    row[f"{sample_id}_RPM"] = record["rpms"].get(sample_id, 0.0)
+                writer.writerow(row)
+        logger.info(f"Merged counts table written to {output_path}")
+        return output_path
+    except Exception as exc:
+        logger.error(f"Failed to write merged counts table to {output_path}: {exc}")
+        return None
+
+def setup_logging(
+    logger_instance: logging.Logger,
+    level_str: str = "INFO",
+    log_file: Optional[Path] = None
+) -> Optional[logging.Handler]:
     """
     Configures the logging for the FastQ processing pipeline.
     
@@ -29,12 +340,14 @@ def setup_logging(logger_instance: logging.Logger, level_str: str = "INFO", log_
     log_level = getattr(logging, level_str.upper(), logging.INFO)
     logger_instance.setLevel(log_level)
 
-    formatter = logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s:%(lineno)d] %(message)s")
+    formatter = logging.Formatter(LOG_FORMAT)
 
     # Console Handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     logger_instance.addHandler(console_handler)
+
+    file_handler: Optional[logging.Handler] = None
 
     # File Handler
     if log_file:
@@ -49,6 +362,8 @@ def setup_logging(logger_instance: logging.Logger, level_str: str = "INFO", log_
             logger_instance.info("Continuing with console logging only.")
     else:
         logger_instance.info("Logging to console only.")
+
+    return file_handler
 
 def load_config(config_path=None):
     """Load configuration from file or use default."""
@@ -86,391 +401,69 @@ def load_config(config_path=None):
         sys.exit(1)
         
     return config
-
-def run_command(command: list, step_name: str, log_file: Optional[Path] = None) -> bool:
+def sample_results_exist(output_dir: Path, sample_name: str) -> bool:
     """
-    Run a command and log its output.
-    
-    Args:
-        command (list): Command to run as a list of strings
-        step_name (str): Name of the processing step
-        log_file (Path, optional): Path to log file for command output
-        
-    Returns:
-        bool: True if command succeeded, False otherwise
+    Check whether the final count table for a sample already exists.
     """
-    logger.info(f"[{step_name}] Running command: {' '.join(shlex.quote(str(s)) for s in command)}")
-    
-    try:
-        process = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        
-        if process.stdout:
-            logger.debug(f"[{step_name}] STDOUT:\n{process.stdout.strip()}")
-        if process.stderr:
-            logger.debug(f"[{step_name}] STDERR:\n{process.stderr.strip()}")
-            
-        logger.info(f"[{step_name}] Successfully completed.")
-        return True
-        
-    except subprocess.CalledProcessError as e:
-        logger.error(f"[{step_name}] Command failed with exit code {e.returncode}.")
-        if e.stdout:
-            logger.error(f"[{step_name}] STDOUT:\n{e.stdout.strip()}")
-        if e.stderr:
-            logger.error(f"[{step_name}] STDERR:\n{e.stderr.strip()}")
+    if not sample_name:
         return False
-    except Exception as e:
-        logger.error(f"[{step_name}] An unexpected error occurred: {e}", exc_info=True)
-        return False
-
-def run_fastp(fastq1: Path, fastq2: Path, sample_dir: Path, config: Dict[str, Any], threads: int) -> Tuple[Optional[Path], Optional[Path]]:
-    """
-    Run FASTP on the input FASTQ files.
-    
-    Args:
-        fastq1 (Path): Path to first FASTQ file
-        fastq2 (Path): Path to second FASTQ file
-        sample_dir (Path): Sample-specific output directory
-        config (Dict): Configuration dictionary
-        threads (int): Number of threads to use
-        
-    Returns:
-        Tuple[Optional[Path], Optional[Path]]: Paths to trimmed FASTQ files
-    """
-    fastp_config = config['fastp']
-    prefix = fastp_config['output_prefix']
-    
-    r1_trimmed = sample_dir / f"{prefix}_R1.fastq.gz"
-    r2_trimmed = sample_dir / f"{prefix}_R2.fastq.gz"
-    
-    fastp_cmd = [
-        "fastp",
-        "--thread", str(threads),
-        "--in1", str(fastq1),
-        "--in2", str(fastq2),
-        "--out1", str(r1_trimmed),
-        "--out2", str(r2_trimmed),
-        "--compression", str(fastp_config['compression']),
-        "--length_required", str(fastp_config['length_required']),
-        "--dup_calc_accuracy", str(fastp_config['dup_calc_accuracy'])
-    ]
-    
-    if fastp_config['html_report']:
-        fastp_cmd.extend(["--html", str(sample_dir / f"{prefix}.html")])
-    if fastp_config['json_report']:
-        fastp_cmd.extend(["--json", str(sample_dir / f"{prefix}.json")])
-    
-    if run_command(fastp_cmd, "FASTP"):
-        return r1_trimmed, r2_trimmed
-    return None, None
-
-def run_pear(r1_trimmed: Path, r2_trimmed: Path, sample_dir: Path, config: Dict[str, Any], threads: int) -> Optional[Path]:
-    """
-    Run PEAR to merge the trimmed FASTQ files.
-
-    Args:
-        r1_trimmed (Path): Path to trimmed R1 FASTQ
-        r2_trimmed (Path): Path to trimmed R2 FASTQ
-        sample_dir (Path): Sample-specific output directory
-        config (Dict): Configuration dictionary
-        threads (int): Number of threads to use
-
-    Returns:
-        Optional[Path]: Path to assembled FASTQ file
-    """
-    pear_config = config['pear']
-    prefix = pear_config['output_prefix']
-    pear_base = sample_dir / prefix
-    log_file = sample_dir / f"{prefix}.pear.log"
-    
-    # PEAR command
-    pear_cmd = [
-        "pear",
-        "-f", str(r1_trimmed),
-        "-r", str(r2_trimmed),
-        "-o", str(pear_base),
-        "-j", str(threads)
-    ]
-    
-    try:
-        logger.info("Running PEAR")
-        # Log the PEAR command
-        logger.info(f"[PEAR] Running command: {' '.join(shlex.quote(str(s)) for s in pear_cmd)}")
-        with open(log_file, 'w') as log:
-            process = subprocess.run(
-                pear_cmd,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                text=True
-            )
-            
-            if process.returncode != 0:
-                logger.error(f"PEAR failed with return code {process.returncode}")
-                return None
-            
-        # Compress all PEAR output files
-        files_to_compress = [
-            f"{pear_base}.assembled.fastq",
-            f"{pear_base}.discarded.fastq",
-            f"{pear_base}.unassembled.forward.fastq",
-            f"{pear_base}.unassembled.reverse.fastq"
-        ]
-        
-        for file in files_to_compress:
-            if Path(file).exists():
-                gzip_cmd = ["gzip", "-f", file]  # -f to force overwrite
-                if not run_command(gzip_cmd, f"Gzip {file}"):
-                    logger.warning(f"Failed to compress {file}")
-        
-        # Return path to compressed assembled file
-        assembled_fastq_gz = f"{pear_base}.assembled.fastq.gz"
-        if Path(assembled_fastq_gz).exists():
-            return Path(assembled_fastq_gz)
-        else:
-            logger.error("Compressed assembled file not found")
-            return None
-            
-    except Exception as e:
-        logger.error(f"Error in PEAR pipeline: {e}", exc_info=True)
-        return None
-
-def validate_config(config: Dict[str, Any]) -> bool:
-    """
-    Validate the configuration dictionary structure.
-    
-    Args:
-        config (Dict[str, Any]): Configuration dictionary to validate
-        
-    Returns:
-        bool: True if configuration is valid, False otherwise
-    """
-    required_sections = ['fastp', 'pear', 'bowtie2', 'samtools', 'reference']
-    required_fastp_keys = ['output_prefix', 'compression', 'length_required', 'dup_calc_accuracy']
-    required_bowtie2_keys = ['output_prefix', 'mode', 'sensitivity', 'np', 'n_ceil']
-    required_samtools_keys = ['sort_memory']
-    required_reference_keys = ['genome']
-    
-    try:
-        # Check required sections
-        for section in required_sections:
-            if section not in config:
-                logger.error(f"Missing required configuration section: {section}")
-                return False
-        
-        # Check required keys in each section
-        for key in required_fastp_keys:
-            if key not in config['fastp']:
-                logger.error(f"Missing required key in fastp section: {key}")
-                return False
-        
-        for key in required_bowtie2_keys:
-            if key not in config['bowtie2']:
-                logger.error(f"Missing required key in bowtie2 section: {key}")
-                return False
-        
-        for key in required_samtools_keys:
-            if key not in config['samtools']:
-                logger.error(f"Missing required key in samtools section: {key}")
-                return False
-        
-        for key in required_reference_keys:
-            if key not in config['reference']:
-                logger.error(f"Missing required key in reference section: {key}")
-                return False
-        
-        return True
-    except Exception as e:
-        logger.error(f"Error validating configuration: {e}")
-        return False
-
-def validate_paths(fastq1: Path, fastq2: Path, output_dir: Path) -> bool:
-    """
-    Validate input and output paths.
-    
-    Args:
-        fastq1 (Path): Path to first FASTQ file
-        fastq2 (Path): Path to second FASTQ file
-        output_dir (Path): Output directory path
-        
-    Returns:
-        bool: True if all paths are valid, False otherwise
-    """
-    try:
-        # Check input files
-        if not fastq1.exists():
-            logger.error(f"Input file does not exist: {fastq1}")
-            return False
-        if not fastq2.exists():
-            logger.error(f"Input file does not exist: {fastq2}")
-            return False
-        
-        # Check output directory
-        if output_dir.exists() and not os.access(output_dir, os.W_OK):
-            logger.error(f"No write permission for output directory: {output_dir}")
-            return False
-        
-        return True
-    except Exception as e:
-        logger.error(f"Error validating paths: {e}")
-        return False
-
-def validate_threads(threads: int) -> int:
-    """
-    Validate and adjust thread count.
-    
-    Args:
-        threads (int): Requested number of threads
-        
-    Returns:
-        int: Validated thread count
-    """
-    try:
-        threads = int(threads)
-        if threads < 1:
-            logger.warning("Thread count must be positive. Setting to 1.")
-            return 1
-        # Get system CPU count and limit threads
-        cpu_count = os.cpu_count() or 1
-        if threads > cpu_count:
-            logger.warning(f"Thread count ({threads}) exceeds available CPUs ({cpu_count}). Setting to {cpu_count}.")
-            return cpu_count
-        return threads
-    except (ValueError, TypeError):
-        logger.warning("Invalid thread count. Setting to 1.")
-        return 1
-
-def run_bowtie2_and_samtools(assembled_fastq: Path, sample_dir: Path, sample_name: str, config: Dict[str, Any], threads: int) -> bool:
-    """
-    Run Bowtie2 alignment and Samtools processing with piped commands.
-
-    Args:
-        assembled_fastq (Path): Path to assembled FASTQ file
-        sample_dir (Path): Sample-specific output directory
-        sample_name (str): Sample name for output files
-        config (Dict): Configuration dictionary
-        threads (int): Number of threads to use
-
-    Returns:
-        bool: True if processing succeeded, False otherwise
-    """
-    bowtie2_config = config['bowtie2']
-    samtools_config = config['samtools']
-    ref_config = config['reference']
-    
-    # Final output SAM file/log use sample name
-    sorted_sam = sample_dir / f"{sample_name}.sorted.sam"
-    log_file = sample_dir / f"{sample_name}.bowtie2.log"
-    
-    # Bowtie2 command with memory optimization
-    bowtie2_cmd = [
-        "bowtie2",
-        "-x", ref_config['genome'],
-        "-U", str(assembled_fastq),
-        "--" + bowtie2_config['mode'],
-        "--" + bowtie2_config['sensitivity'],
-        "--np", str(bowtie2_config['np']),
-        "--n-ceil", bowtie2_config['n_ceil'],
-        "-p", str(threads)
-    ]
-    
-    if bowtie2_config['xeq']:
-        bowtie2_cmd.append("--xeq")
-    if bowtie2_config['reorder']:
-        bowtie2_cmd.append("--reorder")
-    if bowtie2_config['N']:
-        bowtie2_cmd.extend(["-N", str(bowtie2_config['N'])])
-    if bowtie2_config['score_min']:
-        bowtie2_cmd.extend(["--score-min", bowtie2_config['score_min']])
-    
-    # Samtools sort command for SAM
-    samtools_sort_cmd = [
-        "samtools", "sort",
-        "-@", str(threads),
-        "-m", samtools_config['sort_memory'],
-        "-o", str(sorted_sam),
-        "-"
-    ]
-    
-    # Run the pipeline
-    try:
-        logger.info("Running Bowtie2 -> Samtools sort pipeline")
-        # Log the Bowtie2 and Samtools pipeline command
-        bowtie2_str = ' '.join(shlex.quote(str(s)) for s in bowtie2_cmd)
-        samtools_str = ' '.join(shlex.quote(str(s)) for s in samtools_sort_cmd)
-        logger.info(f"[Bowtie2/Samtools] Running command: {bowtie2_str} | {samtools_str}")
-        with open(log_file, 'w') as log:
-            with subprocess.Popen(bowtie2_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p1, \
-                subprocess.Popen(samtools_sort_cmd, stdin=p1.stdout, stderr=subprocess.PIPE) as p2:
-                
-                # Get stderr from all processes
-                bowtie2_stderr = p1.stderr.read().decode()
-                sort_stderr = p2.stderr.read().decode()
-                
-                # Write Bowtie2 stderr to log file
-                if bowtie2_stderr:
-                    log.write("Bowtie2 output:\n")
-                    log.write(bowtie2_stderr)
-                    log.write("\n")
-                
-                # Write Samtools sort stderr to log file
-                if sort_stderr:
-                    log.write("Samtools sort output:\n")
-                    log.write(sort_stderr)
-                    log.write("\n")
-                
-                # Wait for all processes to complete
-                p1.wait()
-                p2.wait()
-                
-                # Check for errors
-                if p1.returncode != 0:
-                    logger.error(f"Bowtie2 failed with return code {p1.returncode}")
-                    return False
-                if p2.returncode != 0:
-                    logger.error(f"Samtools sort failed with return code {p2.returncode}")
-                    return False
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error in Bowtie2/Samtools pipeline: {e}", exc_info=True)
-        return False
-
-def run_qc_and_alignment(fastq1, fastq2, output_dir, sample_name, config, threads):
-    """
-    Run QC and alignment steps (FASTP, PEAR, Bowtie2/Samtools).
-    Returns the path to the sorted SAM file if successful, else None.
-    """
-    if not validate_config(config):
-        return None
-    if not validate_paths(fastq1, fastq2, output_dir):
-        return None
-    threads = validate_threads(threads)
     sample_dir = output_dir / sample_name
-    sample_dir.mkdir(parents=True, exist_ok=True)
-    # Logging is already set up in main()
-    logger.info(f"Processing sample: {sample_name}")
-    logger.info(f"Output directory: {sample_dir}")
-    logger.info(f"Using {threads} threads")
-    logger.info("Step 1: Running FASTP")
-    r1_trimmed, r2_trimmed = run_fastp(fastq1, fastq2, sample_dir, config, threads)
-    if not r1_trimmed or not r2_trimmed:
-        return None
-    logger.info("Step 2: Running PEAR")
-    assembled_fastq = run_pear(r1_trimmed, r2_trimmed, sample_dir, config, threads)
-    if not assembled_fastq:
-        return None
-    logger.info("Step 3: Running Bowtie2 and Samtools")
-    if not run_bowtie2_and_samtools(assembled_fastq, sample_dir, sample_name, config, threads):
-        return None
-    # Return path to sorted SAM file
-    sorted_sam = sample_dir / f"{sample_name}.sorted.sam"
-    return sorted_sam
+    counts_file = sample_dir / f"{sample_name}.counts.tsv"
+    if counts_file.exists() and counts_file.stat().st_size > 0:
+        logger.info(
+            "Detected existing results for sample %s at %s. Skipping re-run.",
+            sample_name,
+            counts_file
+        )
+        return True
+        return False
+
+def execute_full_pipeline(
+    sample_name: str,
+    fastq1: Path,
+    fastq2: Path,
+    output_dir: Path,
+    reference_file: Path,
+    config: Dict[str, Any],
+    threads: Optional[int],
+    keep_intermediate: bool,
+    log_file: Optional[Path]
+) -> bool:
+    """
+    Run the complete pipeline (QC, alignment, counting, reporting) for a single sample.
+    """
+    sorted_sam = alignment_module.run_qc_and_alignment(fastq1, fastq2, output_dir, sample_name, config, threads)
+    if not sorted_sam:
+        logger.error(f"QC/Alignment failed for sample {sample_name}.")
+        return False
+    
+    sample_dir = output_dir / sample_name
+    output_file = sample_dir / f"{sample_name}.counts.tsv"
+    
+    try:
+        count_module.main(
+            sorted_sam,
+            reference_file,
+            config,
+            output_file,
+            log_file=log_file,
+            logger=logger
+        )
+    except Exception as e:
+        logger.error(f"Counting failed for sample {sample_name}: {e}")
+        return False
+    
+    try:
+        logger.info("Generating HTML report...")
+        generate_report_module.generate_report(str(sample_dir))
+        logger.info("HTML report generated.")
+    except Exception as e:
+        logger.error(f"Report generation failed for sample {sample_name}: {e}", exc_info=True)
+    
+    if not keep_intermediate:
+        alignment_module.cleanup_intermediate_files(sample_dir, sample_name)
+        
+    return True
 
 def main():
     parser = argparse.ArgumentParser(
@@ -483,7 +476,7 @@ def main():
     # Parent parser for shared arguments
     parent_parser = argparse.ArgumentParser(add_help=False)
     parent_parser.add_argument("--output-dir", type=Path, required=True, help="Base output directory")
-    parent_parser.add_argument("--sample-name", required=True, help="Name of the sample")
+    parent_parser.add_argument("--sample-name", required=False, help="Name of the sample")
     parent_parser.add_argument("--config", type=Path, default=Path("config.json"), help="Path to configuration file")
     parent_parser.add_argument("--threads", type=int, help="Number of threads to use")
     parent_parser.add_argument("--log-level", default="INFO", 
@@ -492,8 +485,10 @@ def main():
 
     # pipeline: full pipeline (QC, align, count)
     pipeline_parser = subparsers.add_parser("pipeline", parents=[parent_parser], help="Run full pipeline: QC, alignment, and count")
-    pipeline_parser.add_argument("--fastq1", type=Path, required=True, help="Path to first FASTQ file")
-    pipeline_parser.add_argument("--fastq2", type=Path, required=True, help="Path to second FASTQ file")
+    pipeline_parser.add_argument("--fastq1", type=Path, required=False, help="Path to first FASTQ file")
+    pipeline_parser.add_argument("--fastq2", type=Path, required=False, help="Path to second FASTQ file")
+    pipeline_parser.add_argument("--sample-info", type=Path, required=False, help="CSV file describing multiple samples to process")
+    pipeline_parser.add_argument("--merged-counts-output", type=Path, help="Path to write merged counts table when using --sample-info")
     pipeline_parser.add_argument("--reference-file", type=Path, required=True, help="Path to reference library file (CSV)")
     pipeline_parser.add_argument("--keep_intermediate", action="store_true", help="Keep intermediate FASTQ files (default: remove)")
 
@@ -512,60 +507,183 @@ def main():
     report_parser = subparsers.add_parser("report", parents=[parent_parser], help="Generate HTML report from an existing sample directory")
     report_parser.add_argument("--output", type=Path, help="Output HTML file name (defaults to <sample>_report.html)")
 
+    def normalize_path(path_value: Optional[Path]) -> Optional[Path]:
+        if path_value is None:
+            return None
+        return path_value.expanduser().resolve()
+
     args = parser.parse_args()
+
+    args.output_dir = normalize_path(args.output_dir)
+    if isinstance(args.config, Path):
+        args.config = normalize_path(args.config)
+
+    for attr in ("fastq1", "fastq2", "reference_file", "sam_file", "output", "sample_info", "merged_counts_output"):
+        if hasattr(args, attr):
+            value = getattr(args, attr)
+            if isinstance(value, Path):
+                setattr(args, attr, normalize_path(value))
+
+    # Command-specific validation for sample_name
+    parser_map = {
+        "align": align_parser,
+        "count": count_parser,
+        "report": report_parser
+    }
+    if args.command in parser_map and not args.sample_name:
+        parser_map[args.command].error("--sample-name is required for this command.")
+
+    if args.command == "pipeline":
+        if args.sample_info:
+            if not args.sample_info.exists():
+                pipeline_parser.error(f"Sample info CSV not found: {args.sample_info}")
+        else:
+            missing_flags = []
+            if not args.sample_name:
+                missing_flags.append("--sample-name")
+            if not args.fastq1:
+                missing_flags.append("--fastq1")
+            if not args.fastq2:
+                missing_flags.append("--fastq2")
+            if missing_flags:
+                missing_str = ", ".join(missing_flags)
+                pipeline_parser.error(f"{missing_str} must be provided when --sample-info is not used.")
+
     json_config = load_config(args.config)
 
     # Set up unified log file path
-    log_file = args.output_dir / args.sample_name / f"{args.sample_name}.pipeline.log"
-    setup_logging(logger, args.log_level, log_file=log_file)
+    batch_log_path: Optional[Path] = None
+    if args.command == "pipeline" and args.sample_info:
+        batch_label = args.sample_name if args.sample_name else "sample_info_batch"
+        log_file = args.output_dir / f"{batch_label}.pipeline.log"
+        batch_log_path = log_file
+    else:
+        log_identifier = args.sample_name if args.sample_name else "capscreen"
+        log_file = args.output_dir / log_identifier / f"{log_identifier}.pipeline.log"
+
+    log_file_handler = setup_logging(logger, args.log_level, log_file=log_file)
 
     if args.command == "pipeline":
-        # Run QC and alignment
-        sorted_sam = run_qc_and_alignment(args.fastq1, args.fastq2, args.output_dir, args.sample_name, json_config, args.threads)
-        if not sorted_sam:
-            logger.error("QC/Alignment failed. Pipeline aborted.")
-            sys.exit(1)
-        # Run counting, pass log_file to count.py
-        output_file = args.output_dir / args.sample_name / f"{args.sample_name}.counts.tsv"
-        try:
-            count_module.main(sorted_sam, args.reference_file, json_config, output_file, log_file=log_file)
-        except Exception as e:
-            logger.error(f"Counting failed: {e}")
-            sys.exit(1)
-        logger.info("Pipeline completed successfully.")
-        # Generate HTML report at the end of the pipeline
-        try:
-            logger.info("Generating HTML report...")
-            generate_report_module.generate_report(
-                str(args.output_dir / args.sample_name)
+        keep_intermediate = determine_keep_intermediate(getattr(args, 'keep_intermediate', False), json_config)
+        if args.sample_info:
+            logger.info(f"Sample info CSV provided: {args.sample_info}")
+            try:
+                sample_entries, skipped_rows = load_sample_info(args.sample_info)
+            except ValueError as exc:
+                logger.error(f"Failed to parse sample info CSV: {exc}")
+                sys.exit(1)
+            
+            if skipped_rows:
+                logger.warning(f"Skipping {len(skipped_rows)} row(s) from sample info CSV due to validation issues:")
+                for row_msg in skipped_rows:
+                    logger.warning(f"  - {row_msg}")
+            
+            if not sample_entries:
+                logger.error("No valid rows were found in the provided sample info CSV. Aborting.")
+                sys.exit(1)
+            
+            logger.info(f"Validated {len(sample_entries)} sample(s) for batch processing.")
+            for entry in sample_entries:
+                logger.info(
+                    "Sample accepted: sample_id=%s run_mode=%s group=%s tech_rep=%d bio_rep=%d batch_seq=%d fastq1=%s fastq2=%s",
+                    entry.sample_id,
+                    entry.run_mode,
+                    entry.group,
+                    entry.tech_rep,
+                    entry.bio_rep,
+                    entry.batch_seq,
+                    entry.fastq1,
+                    entry.fastq2
+                )
+
+            if batch_log_path:
+                detach_log_file_handler(logger, log_file_handler)
+                log_file_handler = None
+            
+            skipped_existing = 0
+            completed_samples = 0
+            for entry in sample_entries:
+                sample_dir = args.output_dir / entry.sample_id
+                sample_dir.mkdir(parents=True, exist_ok=True)
+                sample_log_file = sample_dir / f"{entry.sample_id}.pipeline.log"
+                logger.info(f"Starting pipeline for sample {entry.sample_id}")
+                if sample_results_exist(args.output_dir, entry.sample_id):
+                    skipped_existing += 1
+                    append_sample_log_to_batch(
+                        batch_log_path,
+                        sample_log_file,
+                        entry.sample_id,
+                        fallback_message="Sample skipped because existing results were detected.",
+                        copy_sample_log=False
+                    )
+                    continue
+                with sample_file_log_handler(sample_log_file):
+                    success = execute_full_pipeline(
+                        entry.sample_id,
+                        entry.fastq1,
+                        entry.fastq2,
+                        args.output_dir,
+                        args.reference_file,
+                        json_config,
+                        args.threads,
+                        keep_intermediate,
+                        sample_log_file
+                    )
+                append_sample_log_to_batch(batch_log_path, sample_log_file, entry.sample_id)
+                if not success:
+                    logger.warning(f"Pipeline reported a failure for sample {entry.sample_id}. Checking for count file before proceeding.")
+                count_file = args.output_dir / entry.sample_id / f"{entry.sample_id}.counts.tsv"
+                if not count_file.exists():
+                    logger.error(f"Count file not found for sample {entry.sample_id} at {count_file}. Moving on to next sample.")
+                    continue
+                completed_samples += 1
+            logger.info(
+                "Pipeline completed successfully for %d sample(s); skipped %d sample(s) with existing results.",
+                completed_samples,
+                skipped_existing
             )
-            logger.info("HTML report generated.")
-        except Exception as e:
-            logger.error(f"Report generation failed: {e}")
-        # Remove intermediate files if not keeping them
-        keep_intermediate = getattr(args, 'keep_intermediate', False)
-        if not keep_intermediate:
-            # Try to get config value if not set on CLI
-            keep_intermediate = json_config.get('keep_intermediate', False)
-        if not keep_intermediate:
-            sample_dir = args.output_dir / args.sample_name
-            files_to_remove = [
-                sample_dir / 'fastp_R1.fastq.gz',
-                sample_dir / 'fastp_R2.fastq.gz',
-                sample_dir / 'pear.discarded.fastq.gz',
-                sample_dir / 'pear.unassembled.forward.fastq.gz',
-                sample_dir / 'pear.unassembled.reverse.fastq.gz'
-            ]
-            for f in files_to_remove:
-                try:
-                    if f.exists():
-                        f.unlink()
-                        logger.info(f"Removed intermediate file: {f}")
-                except Exception as e:
-                    logger.warning(f"Could not remove {f}: {e}")
-        sys.exit(0)
+            merged_output_path = args.merged_counts_output
+            if merged_output_path is None:
+                merged_output_path = args.output_dir / "merged.counts.tsv"
+            merged_path = merge_count_tables(sample_entries, args.output_dir, merged_output_path)
+            if merged_path:
+                logger.info(f"Merged counts table saved to {merged_path}")
+            else:
+                logger.warning("Merged counts table could not be created.")
+            append_batch_summary(
+                batch_log_path,
+                [
+                    f"Completed samples: {completed_samples}",
+                    f"Skipped samples (existing results): {skipped_existing}",
+                    f"Merged counts table: {merged_path}" if merged_path else "Merged counts table was not created."
+                ]
+            )
+            sys.exit(0)
+        else:
+            if sample_results_exist(args.output_dir, args.sample_name):
+                logger.info("To re-run the pipeline for this sample, remove the existing results or move them elsewhere.")
+                sys.exit(0)
+            success = execute_full_pipeline(
+                args.sample_name,
+                args.fastq1,
+                args.fastq2,
+                args.output_dir,
+                args.reference_file,
+                json_config,
+                args.threads,
+                keep_intermediate,
+                log_file
+            )
+            sys.exit(0 if success else 1)
     elif args.command == "align":
-        sorted_sam = run_qc_and_alignment(args.fastq1, args.fastq2, args.output_dir, args.sample_name, json_config, args.threads)
+        sorted_sam = alignment_module.run_qc_and_alignment(
+            args.fastq1,
+            args.fastq2,
+            args.output_dir,
+            args.sample_name,
+            json_config,
+            args.threads
+        )
         if not sorted_sam:
             logger.error("QC/Alignment failed.")
             sys.exit(1)
@@ -575,7 +693,14 @@ def main():
         # Use provided output file or default
         output_file = args.output if args.output else args.sam_file.parent / f"{args.sam_file.stem}.counts.tsv"
         try:
-            count_module.main(args.sam_file, args.reference_file, json_config, output_file, log_file=log_file)
+            count_module.main(
+                args.sam_file,
+                args.reference_file,
+                json_config,
+                output_file,
+                log_file=log_file,
+                logger=logger
+            )
         except Exception as e:
             logger.error(f"Counting failed: {e}")
             sys.exit(1)

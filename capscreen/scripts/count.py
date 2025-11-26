@@ -4,8 +4,10 @@ import numpy as np
 import logging
 from pathlib import Path
 from Bio.Seq import Seq
-from typing import Dict, Tuple
+from Bio import BiopythonWarning
+from typing import Dict, Tuple, Optional, List, Any
 import sys
+import warnings
 
 def setup_logging(output_dir: Path = None, sample_name: str = None, log_file: Path = None) -> logging.Logger:
     """
@@ -72,11 +74,22 @@ def translate(seq: str) -> str:
         str: Translated protein sequence or None if translation fails
     """
     try:
-        return str(Seq(seq).translate(to_stop=True))
-    except:
+        normalized = seq.upper().replace('U', 'T')
+        remainder = len(normalized) % 3
+
+        if remainder != 0:
+            normalized = normalized[:len(normalized) - remainder]
+
+        if len(normalized) < 3:
+            return None
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", BiopythonWarning)
+            return str(Seq(normalized).translate(to_stop=True))
+    except Exception:
         return None
 
-def process_sam_file(sam_file: Path, config: Dict) -> Tuple[pd.DataFrame, Dict[str, int]]:
+def process_sam_file(sam_file: Path, config: Dict, logger: Optional[logging.Logger] = None) -> Tuple[pd.DataFrame, Dict[str, int]]:
     """
     Process SAM file and extract variable regions.
     
@@ -94,45 +107,17 @@ def process_sam_file(sam_file: Path, config: Dict) -> Tuple[pd.DataFrame, Dict[s
     flank_3p = config['flanking_sequences']['flank_3p']
     
     # Read SAM file and extract mapped reads
-    reads = []
     total_reads = 0
     unmapped_reads = 0
+    mapped_reads = 0
+    reads_with_flanks = 0
+    valid_peptides = 0
+    processed_rows: List[Dict[str, Any]] = []
+    progress_interval = 500_000
     
-    with open(sam_file, "r") as f:
-        for line in f:
-            if not line.startswith("@"):
-                total_reads += 1
-                parts = line.strip().split("\t")
-                flag = int(parts[1])
-                if (flag & 4) == 0:  # only mapped reads
-                    seq = parts[9]
-                    cigar = parts[5]
-                    reads.append({
-                        'full_seq': seq,
-                        'cigar': cigar,
-                        'reference': parts[2],  # Reference sequence name
-                        'position': int(parts[3]),  # 1-based position
-                        'mapping_quality': int(parts[4])  # Mapping quality
-                    })
-                else:
-                    unmapped_reads += 1
-    
-    # Create DataFrame
-    df = pd.DataFrame(reads)
-    
-    # Extract variable regions
-    df['variable_seq'] = df['full_seq'].apply(lambda s: extract_variable_region(s, flank_5p, flank_3p))
-    reads_with_flanks = df['variable_seq'].notna().sum()
-    df = df.dropna(subset=['variable_seq'])  # remove reads where flanks not found
-    
-    # Translate to peptides
-    df['peptide'] = df['variable_seq'].apply(translate)
-    valid_peptides = df['peptide'].notna().sum()
-    df = df.dropna(subset=['peptide'])  # remove frameshifted or invalid
-    
-    # Parse CIGAR string to get variant information
-    def parse_cigar(cigar: str) -> Dict:
-        import re
+    import re
+
+    def parse_cigar(cigar: str) -> Dict[str, int]:
         stats = {
             'matches': 0,
             'insertions': 0,
@@ -142,12 +127,10 @@ def process_sam_file(sam_file: Path, config: Dict) -> Tuple[pd.DataFrame, Dict[s
             'skips': 0,
             'padding': 0
         }
-        
-        # Parse CIGAR string
         cigar_parts = re.findall(r'(\d+)([MIDNSHP=XB])', cigar)
         for length, op in cigar_parts:
             length = int(length)
-            if op == 'M' or op == '=' or op == 'X':
+            if op in {'M', '=', 'X'}:
                 stats['matches'] += length
             elif op == 'I':
                 stats['insertions'] += length
@@ -161,31 +144,75 @@ def process_sam_file(sam_file: Path, config: Dict) -> Tuple[pd.DataFrame, Dict[s
                 stats['skips'] += length
             elif op == 'P':
                 stats['padding'] += length
-        
         return stats
     
-    # Add variant information to DataFrame
-    df['cigar_stats'] = df['cigar'].apply(parse_cigar)
-    df['insertions'] = df['cigar_stats'].apply(lambda x: x['insertions'])
-    df['deletions'] = df['cigar_stats'].apply(lambda x: x['deletions'])
-    df['matches'] = df['cigar_stats'].apply(lambda x: x['matches'])
+    with open(sam_file, "r") as f:
+        for line_number, line in enumerate(f, start=1):
+            if line.startswith("@"):
+                continue
+            total_reads += 1
+            parts = line.rstrip("\n").split("\t")
+            flag = int(parts[1])
+            if (flag & 4) != 0:
+                unmapped_reads += 1
+                continue
+            
+            mapped_reads += 1
+            seq = parts[9]
+            variable_seq = extract_variable_region(seq, flank_5p, flank_3p)
+            if variable_seq is None:
+                continue
+            reads_with_flanks += 1
+            
+            peptide = translate(variable_seq)
+            if peptide is None:
+                continue
+            valid_peptides += 1
+            
+            cigar_stats = parse_cigar(parts[5])
+            processed_rows.append({
+                'peptide': peptide,
+                'variable_seq': variable_seq,
+                'insertions': cigar_stats['insertions'],
+                'deletions': cigar_stats['deletions'],
+                'matches': cigar_stats['matches']
+            })
+            
+            if logger and total_reads % progress_interval == 0:
+                logger.info(
+                    "Processed %s reads (%s mapped, %s valid peptides) ...",
+                    f"{total_reads:,}",
+                    f"{mapped_reads:,}",
+                    f"{valid_peptides:,}"
+                )
     
-    # Compile statistics
-    stats = {
-        'total_reads': total_reads,
-        'mapped_reads': len(reads),
-        'unmapped_reads': unmapped_reads,
-        'reads_with_flanks': reads_with_flanks,
-        'valid_peptides': valid_peptides,
-        'mapping_rate': len(reads) / total_reads if total_reads > 0 else 0,
-        'flank_detection_rate': reads_with_flanks / len(reads) if len(reads) > 0 else 0,
-        'translation_success_rate': valid_peptides / reads_with_flanks if reads_with_flanks > 0 else 0,
-        'variant_stats': {
+    df = pd.DataFrame(processed_rows)
+    
+    if df.empty:
+        variant_stats = {
+            'total_insertions': 0,
+            'total_deletions': 0,
+            'reads_with_insertions': 0,
+            'reads_with_deletions': 0
+        }
+    else:
+        variant_stats = {
             'total_insertions': df['insertions'].sum(),
             'total_deletions': df['deletions'].sum(),
             'reads_with_insertions': (df['insertions'] > 0).sum(),
             'reads_with_deletions': (df['deletions'] > 0).sum()
         }
+    
+    stats = {
+        'total_reads': total_reads,
+        'mapped_reads': mapped_reads,
+        'unmapped_reads': unmapped_reads,
+        'reads_with_flanks': reads_with_flanks,
+        'valid_peptides': valid_peptides,
+        'mapping_rate': mapped_reads / total_reads if total_reads > 0 else 0,
+        'flank_detection_rate': reads_with_flanks / mapped_reads if mapped_reads > 0 else 0,
+        'translation_success_rate': valid_peptides / reads_with_flanks if reads_with_flanks > 0 else 0,
+        'variant_stats': variant_stats
     }
     
     return df, stats
@@ -247,7 +274,14 @@ def calculate_counts(df: pd.DataFrame, total_reads: int) -> Tuple[pd.DataFrame, 
     }
     return df_out, stats
 
-def main(sam_file: Path, reference_file: Path, config: Dict, output_file: Path, log_file: Path = None) -> None:
+def main(
+    sam_file: Path,
+    reference_file: Path,
+    config: Dict,
+    output_file: Path,
+    log_file: Path = None,
+    logger: Optional[logging.Logger] = None
+) -> None:
     """
     Main function to process SAM file and generate counts.
     Accepts an optional log_file argument for unified logging.
@@ -256,15 +290,20 @@ def main(sam_file: Path, reference_file: Path, config: Dict, output_file: Path, 
         # Set up logging
         output_dir = output_file.parent
         sample_name = sam_file.stem.split('.')[0]  # Get sample name from SAM file
-        logger = setup_logging(output_dir, sample_name, log_file=log_file)
+        if logger is None:
+            logger = setup_logging(output_dir, sample_name, log_file=log_file)
+        else:
+            logger.info(f"Using existing logger; count output will be appended to {log_file if log_file else 'configured handlers'}.")
         
         logger.info(f"Starting variant counting for sample: {sample_name}")
         logger.info(f"Input SAM file: {sam_file}")
         logger.info(f"Reference library: {reference_file}")
         logger.info(f"Output file: {output_file}")
+        logger.info("Step 1/4: Processing SAM file and extracting variable regions...")
         
         # Process SAM file
-        df, sam_stats = process_sam_file(sam_file, config)
+        df, sam_stats = process_sam_file(sam_file, config, logger=logger)
+        logger.info("Step 1/4 complete.")
         
         # Log SAM processing statistics
         logger.info("SAM File Processing Statistics:")
@@ -274,27 +313,12 @@ def main(sam_file: Path, reference_file: Path, config: Dict, output_file: Path, 
         logger.info(f"Reads with flanking sequences: {sam_stats['reads_with_flanks']:,} ({sam_stats['flank_detection_rate']:.2%})")
         logger.info(f"Valid peptides after translation: {sam_stats['valid_peptides']:,} ({sam_stats['translation_success_rate']:.2%})")
         
-        # Merge with reference
+        logger.info("Step 2/4: Merging reads with reference library...")
         df_merged, merge_stats = merge_with_reference(df, reference_file)
+        logger.info("Step 2/4 complete.")
 
         # Ensure all unassigned ID_WLG are labeled as 'Unassigned'
         df_merged['ID_WLG'] = df_merged['ID_WLG'].fillna('Unassigned')
-        
-        # Calculate variant statistics for unassigned reads only
-        unassigned_df = df_merged[df_merged['ID_WLG'].isna()]
-        unassigned_variant_stats = {
-            'total_insertions': unassigned_df['insertions'].sum(),
-            'total_deletions': unassigned_df['deletions'].sum(),
-            'reads_with_insertions': (unassigned_df['insertions'] > 0).sum(),
-            'reads_with_deletions': (unassigned_df['deletions'] > 0).sum()
-        }
-        
-        # Log variant statistics for unassigned reads
-        logger.info("\nVariant Statistics for Unassigned Reads:")
-        logger.info(f"Total insertions: {unassigned_variant_stats['total_insertions']:,}")
-        logger.info(f"Total deletions: {unassigned_variant_stats['total_deletions']:,}")
-        logger.info(f"Reads with insertions: {unassigned_variant_stats['reads_with_insertions']:,}")
-        logger.info(f"Reads with deletions: {unassigned_variant_stats['reads_with_deletions']:,}")
         
         # Log merging statistics
         logger.info("\nReference Library Merging Statistics:")
@@ -303,8 +327,9 @@ def main(sam_file: Path, reference_file: Path, config: Dict, output_file: Path, 
         logger.info(f"Peptides found in both: {merge_stats['peptides_in_both']:,}")
         logger.info(f"Peptides only in reads: {merge_stats['peptides_only_in_reads']:,}")
         
-        # Calculate counts
+        logger.info("Step 3/4: Calculating counts and abundance metrics...")
         df_final, count_stats = calculate_counts(df_merged, sam_stats['total_reads'])
+        logger.info("Step 3/4 complete.")
 
         # Calculate correct assigned/unassigned read counts and percentages
         total_sequences = len(df_final)
@@ -324,10 +349,11 @@ def main(sam_file: Path, reference_file: Path, config: Dict, output_file: Path, 
         df_final = df_final.sort_values(by='RPM', ascending=False)
         df_final = df_final.reset_index(drop=True)
         
-        # Save results
+        logger.info("Step 4/4: Writing final count table to disk...")
         df_final.to_csv(output_file, index=False)
         logger.info(f"\nResults saved to {output_file}")
-        logger.info(f"Log file saved to {output_dir}/{sample_name}.count.log")
+        if log_file:
+            logger.info(f"Log file saved to {log_file}")
         
     except Exception as e:
         logger.error(f"Error processing SAM file: {e}", exc_info=True)
