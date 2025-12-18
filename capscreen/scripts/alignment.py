@@ -148,6 +148,98 @@ def run_pear(
         return None
 
 
+def run_cutadapt_umi(
+    assembled_fastq: Path,
+    sample_dir: Path,
+    config: Dict[str, Any],
+    threads: int
+) -> Optional[Path]:
+    """
+    Run Cutadapt to extract the variable region between flanking sequences
+    and then re-attach the flanks to each read.
+
+    Workflow:
+      1. Use Cutadapt to trim everything outside the configured flanks
+         on the PEAR-assembled reads (and discard reads without both flanks).
+      2. Re-add the known flanks (from the config) to each trimmed read so
+         downstream steps that expect flanking sequences still work.
+    """
+    flanking_cfg = config.get("flanking_sequences") or {}
+    flank_5p = flanking_cfg.get("flank_5p")
+    flank_3p = flanking_cfg.get("flank_3p")
+
+    if not flank_5p or not flank_3p:
+        logger.error(
+            "Flanking sequences (flank_5p and flank_3p) must be defined in the "
+            "configuration in order to use UMI cutting."
+        )
+        return None
+
+    trimmed_fastq = sample_dir / "pear.trimmed.fastq"
+    cutadapt_cmd = [
+        "cutadapt",
+        "-g", flank_5p,
+        "-a", flank_3p,
+        "--discard-untrimmed",
+        "-o", str(trimmed_fastq),
+        str(assembled_fastq),
+    ]
+
+    # Use multiple cores if available (Cutadapt uses -j/--cores)
+    if threads and threads > 1:
+        cutadapt_cmd[1:1] = ["-j", str(threads)]
+
+    if not run_command(cutadapt_cmd, "CUTADAPT_UMI"):
+        return None
+
+    # Re-add flanks to each read so that downstream steps (alignment + counting)
+    # still see the flanking regions around the variable region.
+    restored_fastq = sample_dir / "pear.trimmed_with_flanks.fastq"
+    try:
+        logger.info("Re-attaching flanking sequences to Cutadapt-trimmed reads")
+        with trimmed_fastq.open("r") as in_f, restored_fastq.open("w") as out_f:
+            while True:
+                header = in_f.readline()
+                if not header:
+                    break
+                seq = in_f.readline()
+                plus = in_f.readline()
+                qual = in_f.readline()
+
+                if not (header and seq and plus and qual):
+                    logger.warning(
+                        "Encountered incomplete FASTQ record while restoring flanks; "
+                        "stopping early."
+                    )
+                    break
+
+                seq = seq.rstrip("\n\r")
+                qual = qual.rstrip("\n\r")
+
+                new_seq = f"{flank_5p}{seq}{flank_3p}"
+                flank_5p_qual = "I" * len(flank_5p)
+                flank_3p_qual = "I" * len(flank_3p)
+                new_qual = f"{flank_5p_qual}{qual}{flank_3p_qual}"
+
+                out_f.write(header)
+                out_f.write(new_seq + "\n")
+                out_f.write(plus)
+                out_f.write(new_qual + "\n")
+
+    except Exception as exc:
+        logger.error(f"Failed to restore flanks on Cutadapt-trimmed reads: {exc}", exc_info=True)
+        return None
+
+    # Compress the final restored FASTQ to save space and match other steps
+    restored_fastq_gz = f"{restored_fastq}.gz"
+    gzip_cmd = ["gzip", "-f", str(restored_fastq)]
+    if not run_command(gzip_cmd, f"Gzip {restored_fastq}"):
+        logger.warning(f"Failed to compress {restored_fastq}; using uncompressed file instead.")
+        return restored_fastq
+
+    return Path(restored_fastq_gz)
+
+
 def validate_config(config: Dict[str, Any]) -> bool:
     """
     Validate the configuration dictionary structure.
@@ -321,7 +413,8 @@ def run_qc_and_alignment(
     output_dir: Path,
     sample_name: str,
     config: Dict[str, Any],
-    threads: Optional[int]
+    threads: Optional[int],
+    cut_umi: bool = False
 ) -> Optional[Path]:
     """
     Run QC and alignment steps (FASTP, PEAR, Bowtie2/Samtools).
@@ -338,15 +431,27 @@ def run_qc_and_alignment(
     logger.info(f"Processing sample: {sample_name}")
     logger.info(f"Output directory: {sample_dir}")
     logger.info(f"Using {threads} threads")
+
     logger.info("Step 1: Running FASTP")
     r1_trimmed, r2_trimmed = run_fastp(fastq1, fastq2, sample_dir, config, threads)
     if not r1_trimmed or not r2_trimmed:
         return None
+
     logger.info("Step 2: Running PEAR")
     assembled_fastq = run_pear(r1_trimmed, r2_trimmed, sample_dir, config, threads)
     if not assembled_fastq:
         return None
-    logger.info("Step 3: Running Bowtie2 and Samtools")
+
+    if cut_umi:
+        logger.info("Step 3: Running Cutadapt-based UMI trimming")
+        umi_fastq = run_cutadapt_umi(assembled_fastq, sample_dir, config, threads)
+        if not umi_fastq:
+            return None
+        assembled_fastq = umi_fastq
+        logger.info("Step 4: Running Bowtie2 and Samtools")
+    else:
+        logger.info("Step 3: Running Bowtie2 and Samtools")
+
     if not run_bowtie2_and_samtools(assembled_fastq, sample_dir, sample_name, config, threads):
         return None
 
@@ -363,7 +468,10 @@ def cleanup_intermediate_files(sample_dir: Path, sample_name: Optional[str] = No
         sample_dir / 'fastp_R2.fastq.gz',
         sample_dir / 'pear.discarded.fastq.gz',
         sample_dir / 'pear.unassembled.forward.fastq.gz',
-        sample_dir / 'pear.unassembled.reverse.fastq.gz'
+        sample_dir / 'pear.unassembled.reverse.fastq.gz',
+        sample_dir / 'pear.trimmed.fastq',
+        sample_dir / 'pear.trimmed_with_flanks.fastq',
+        sample_dir / 'pear.trimmed_with_flanks.fastq.gz',
     ]
     files_to_remove.extend(sample_dir.glob("*.assembled.fastq.gz"))
     if sample_name:

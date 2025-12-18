@@ -427,12 +427,21 @@ def execute_full_pipeline(
     config: Dict[str, Any],
     threads: Optional[int],
     keep_intermediate: bool,
-    log_file: Optional[Path]
+    log_file: Optional[Path],
+    cut_umi: bool = False
 ) -> bool:
     """
     Run the complete pipeline (QC, alignment, counting, reporting) for a single sample.
     """
-    sorted_sam = alignment_module.run_qc_and_alignment(fastq1, fastq2, output_dir, sample_name, config, threads)
+    sorted_sam = alignment_module.run_qc_and_alignment(
+        fastq1,
+        fastq2,
+        output_dir,
+        sample_name,
+        config,
+        threads,
+        cut_umi=cut_umi,
+    )
     if not sorted_sam:
         logger.error(f"QC/Alignment failed for sample {sample_name}.")
         return False
@@ -491,11 +500,27 @@ def main():
     pipeline_parser.add_argument("--merged-counts-output", type=Path, help="Path to write merged counts table when using --sample-info")
     pipeline_parser.add_argument("--reference-file", type=Path, required=True, help="Path to reference library file (CSV)")
     pipeline_parser.add_argument("--keep_intermediate", action="store_true", help="Keep intermediate FASTQ files (default: remove)")
+    pipeline_parser.add_argument(
+        "--cut-umi",
+        action="store_true",
+        help=(
+            "After PEAR merging, run Cutadapt to trim reads to the variable region "
+            "between configured flanking sequences and re-attach the flanks before alignment."
+        ),
+    )
 
     # align: only QC and alignment
     align_parser = subparsers.add_parser("align", parents=[parent_parser], help="Run QC and alignment only")
     align_parser.add_argument("--fastq1", type=Path, required=True, help="Path to first FASTQ file")
     align_parser.add_argument("--fastq2", type=Path, required=True, help="Path to second FASTQ file")
+    align_parser.add_argument(
+        "--cut-umi",
+        action="store_true",
+        help=(
+            "After PEAR merging, run Cutadapt to trim reads to the variable region "
+            "between configured flanking sequences and re-attach the flanks before alignment."
+        ),
+    )
 
     # count: only counting
     count_parser = subparsers.add_parser("count", parents=[parent_parser], help="Run variant counting only")
@@ -627,7 +652,8 @@ def main():
                         json_config,
                         args.threads,
                         keep_intermediate,
-                        sample_log_file
+                        sample_log_file,
+                        cut_umi=getattr(args, "cut_umi", False),
                     )
                 append_sample_log_to_batch(batch_log_path, sample_log_file, entry.sample_id)
                 if not success:
@@ -672,7 +698,8 @@ def main():
                 json_config,
                 args.threads,
                 keep_intermediate,
-                log_file
+                log_file,
+                cut_umi=getattr(args, "cut_umi", False),
             )
             sys.exit(0 if success else 1)
     elif args.command == "align":
@@ -682,7 +709,8 @@ def main():
             args.output_dir,
             args.sample_name,
             json_config,
-            args.threads
+            args.threads,
+            cut_umi=getattr(args, "cut_umi", False),
         )
         if not sorted_sam:
             logger.error("QC/Alignment failed.")

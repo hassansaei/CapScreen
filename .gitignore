@@ -1,4 +1,6 @@
 *.ipynb
 *.tsv
 *.csv
+*.pdf
+*.png
 
