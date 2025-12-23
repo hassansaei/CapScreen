@@ -544,6 +544,58 @@ def perform_pca(df_norm: pd.DataFrame, meta: pd.DataFrame,
     return pca, pca_df
 
 
+def pair_wt_ko_groups(target_groups: list, background_groups: list) -> list:
+    """
+    Pair WT and KO groups by their prefix (e.g., CD47_WT with CD47_KO).
+    
+    Args:
+        target_groups: List of target group names (typically WT groups)
+        background_groups: List of background group names (typically KO groups)
+        
+    Returns:
+        List of tuples (target_group, background_group) for matched pairs
+    """
+    pairs = []
+    
+    # Extract WT groups and their prefixes
+    wt_groups = [g for g in target_groups if '_WT' in g or g.endswith('WT')]
+    ko_groups = [g for g in background_groups if '_KO' in g or g.endswith('KO')]
+    
+    if wt_groups and ko_groups:
+        # Try to match by prefix
+        for wt_group in wt_groups:
+            # Extract prefix (everything before _WT or WT)
+            if '_WT' in wt_group:
+                prefix = wt_group.rsplit('_WT', 1)[0]
+            elif wt_group.endswith('WT'):
+                prefix = wt_group[:-2].rstrip('_')
+            else:
+                continue
+            
+            # Find matching KO group
+            for ko_group in ko_groups:
+                if '_KO' in ko_group:
+                    ko_prefix = ko_group.rsplit('_KO', 1)[0]
+                elif ko_group.endswith('KO'):
+                    ko_prefix = ko_group[:-2].rstrip('_')
+                else:
+                    continue
+                
+                if prefix == ko_prefix:
+                    pairs.append((wt_group, ko_group))
+                    logger.info(f"Matched pair: {wt_group} vs {ko_group} (prefix: {prefix})")
+                    break
+    
+    # If no pairs found by prefix matching, return all combinations
+    if not pairs:
+        logger.info("No prefix-matched pairs found. Using all target-background combinations.")
+        for target in target_groups:
+            for background in background_groups:
+                pairs.append((target, background))
+    
+    return pairs
+
+
 def perform_differential_expression(df_norm: pd.DataFrame, meta: pd.DataFrame,
                                     target_group: str, background_group: str) -> pd.DataFrame:
     """
@@ -624,17 +676,38 @@ def perform_differential_expression(df_norm: pd.DataFrame, meta: pd.DataFrame,
             continue
     
     # Create results dataframe
+    if len(results) == 0:
+        logger.warning("No results from differential expression analysis")
+        return pd.DataFrame(columns=["peptide", f"log2FC_{target_group}_vs_{background_group}", "pval", "padj"])
+    
     res = pd.DataFrame(results, columns=["peptide", f"log2FC_{target_group}_vs_{background_group}", "pval"])
     res = res.set_index("peptide")
     
-    # Calculate adjusted p-values
-    res["padj"] = multipletests(res["pval"].values, method="fdr_bh")[1]
+    # Calculate adjusted p-values (only if we have valid p-values)
+    if len(res) > 0 and res["pval"].notna().any():
+        try:
+            # Filter out NaN p-values for FDR correction
+            valid_mask = res["pval"].notna()
+            if valid_mask.sum() > 0:
+                padj_values = np.full(len(res), np.nan)
+                padj_values[valid_mask] = multipletests(res.loc[valid_mask, "pval"].values, method="fdr_bh")[1]
+                res["padj"] = padj_values
+            else:
+                res["padj"] = np.nan
+                logger.warning("All p-values are NaN, cannot calculate padj")
+        except Exception as e:
+            logger.error(f"Error calculating adjusted p-values: {e}")
+            res["padj"] = np.nan
+    else:
+        res["padj"] = np.nan
+        logger.warning("No valid p-values for FDR correction")
     
-    # Sort by adjusted p-value
-    res_sorted = res.sort_values("padj")
+    # Sort by adjusted p-value (NaN values will be at the end)
+    res_sorted = res.sort_values("padj", na_position='last')
     
+    n_sig = res_sorted["padj"].notna() & (res_sorted["padj"] < 0.05)
     logger.info(f"Completed differential expression analysis. "
-                f"Found {len(res_sorted[res_sorted['padj'] < 0.05])} significant peptides (padj < 0.05)")
+                f"Found {n_sig.sum()} significant peptides (padj < 0.05) out of {len(res_sorted)} total")
     
     return res_sorted
 
@@ -1512,24 +1585,31 @@ def run_statistical_analysis(
                 title=f"PCA - Top {pca_top_n} Features (No Input Samples)",
                 group_palette=group_palette, config=config)
         
-        # Perform differential expression analysis
-        if de_target and de_background:
-            logger.info(f"Performing differential expression: {de_target} vs {de_background}")
-            try:
-                de_results = perform_differential_expression(
-                    df_norm, meta, de_target, de_background
-                )
-                
-                # Save differential expression results
-                de_file = output_dir / f"DE_{de_target}_vs_{de_background}.tsv"
-                de_results.to_csv(de_file, sep='\t')
-                logger.info(f"Saved differential expression results to {de_file}")
-                
-            except Exception as e:
-                logger.warning(f"Failed to perform differential expression analysis: {e}")
+        # Perform differential expression analysis for all matched pairs
+        # Try to pair WT and KO groups by prefix (e.g., CD47_WT vs CD47_KO)
+        de_pairs = pair_wt_ko_groups(target_groups, background_groups)
+        
+        if de_pairs:
+            logger.info(f"Performing differential expression for {len(de_pairs)} pair(s)...")
+            for de_target, de_background in de_pairs:
+                try:
+                    logger.info(f"Running DE: {de_target} vs {de_background}")
+                    de_results = perform_differential_expression(
+                        df_norm, meta, de_target, de_background
+                    )
+                    
+                    # Save differential expression results
+                    safe_target = de_target.replace(" ", "_").replace("/", "_").replace("-", "_")
+                    safe_background = de_background.replace(" ", "_").replace("/", "_").replace("-", "_")
+                    de_file = output_dir / f"DE_{safe_target}_vs_{safe_background}.tsv"
+                    de_results.to_csv(de_file, sep='\t')
+                    logger.info(f"Saved differential expression results to {de_file}")
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to perform differential expression analysis for {de_target} vs {de_background}: {e}")
         else:
             logger.warning("Skipping differential expression analysis: "
-                          "Could not determine target and background groups")
+                              "Could not determine target and background group pairs")
         
         logger.info("Statistical analysis completed successfully!")
         return True
