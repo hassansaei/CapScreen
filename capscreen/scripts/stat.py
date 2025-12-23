@@ -253,9 +253,9 @@ def identify_groups(meta: pd.DataFrame) -> Tuple[list, list, list]:
     
     # Try to identify target and background groups based on common naming patterns
     # Target patterns: Target, WT, specific receptor names (e.g., CD47)
-    # Background patterns: Bead, KO, Bead-Fc, Pool
+    # Background patterns: Bead, KO, Bead-Fc
     target_keywords = ['Target', 'target', 'WT', 'wt']
-    background_keywords = ['Bead', 'bead', 'KO', 'ko', 'Pool', 'pool', 'Background', 'background']
+    background_keywords = ['Bead', 'bead', 'KO', 'ko', 'Background', 'background']
     
     target_groups = []
     background_groups = []
@@ -313,11 +313,28 @@ def create_deseq_dataset(counts: pd.DataFrame, meta: pd.DataFrame,
     
     logger.info(f"Aligned {len(common_samples)} samples")
     
+    # Determine design factors
+    # Always include group and bio_rep
+    design_factors = ["group", "bio_rep"]
+    
+    # Add batch_seq if there are multiple batches
+    if "batch_seq" in meta_aligned.columns:
+        unique_batches = meta_aligned["batch_seq"].nunique()
+        if unique_batches > 1:
+            design_factors.append("batch_seq")
+            logger.info(f"Multiple batches detected ({unique_batches} unique batches). Adding batch_seq to design.")
+        else:
+            logger.info(f"Single batch detected. Not including batch_seq in design.")
+    else:
+        logger.warning("batch_seq column not found in metadata. Proceeding without batch correction.")
+    
+    logger.info(f"DESeq2 design factors: {design_factors}")
+    
     # Create DESeqDataSet
     dds = DeseqDataSet(
         counts=counts_aligned,
         metadata=meta_aligned,
-        design_factors=["group", "bio_rep"],  # batch-aware design
+        design_factors=design_factors,
         refit_cooks=True,
         n_cpus=n_cpus
     )
@@ -571,8 +588,18 @@ def perform_differential_expression(df_norm: pd.DataFrame, meta: pd.DataFrame,
     bio = pd.get_dummies(meta_de.loc[samples_de, "bio_rep"].astype(str), 
                          prefix="bio", drop_first=True)
     bio = bio.astype(float)
-    
     X = pd.concat([X, bio], axis=1)
+    
+    # Add batch dummies if multiple batches exist (drop first to avoid multicollinearity)
+    if "batch_seq" in meta_de.columns:
+        unique_batches = meta_de.loc[samples_de, "batch_seq"].nunique()
+        if unique_batches > 1:
+            batch = pd.get_dummies(meta_de.loc[samples_de, "batch_seq"].astype(str), 
+                                   prefix="batch", drop_first=True)
+            batch = batch.astype(float)
+            X = pd.concat([X, batch], axis=1)
+            logger.info(f"Added batch correction to differential expression model ({unique_batches} batches)")
+    
     X = sm.add_constant(X).astype(float)
     
     # Final sanity checks
@@ -613,7 +640,9 @@ def perform_differential_expression(df_norm: pd.DataFrame, meta: pd.DataFrame,
 
 
 def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame,
-                                    input_groups: list, LAMBDA: float = 0.01) -> pd.DataFrame:
+                                    input_groups: list, LAMBDA: float = 0.01,
+                                    target_groups: Optional[list] = None,
+                                    background_groups: Optional[list] = None) -> pd.DataFrame:
     """
     Compute RPM-based enrichment analysis following the notebook pattern.
     
@@ -628,6 +657,8 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
         meta: Metadata dataframe
         input_groups: List of input group names
         LAMBDA: Small constant to avoid divide-by-zero (default: 0.01)
+        target_groups: Optional list of target group names (if None, will identify from enrichment columns)
+        background_groups: Optional list of background group names (if None, will identify from enrichment columns)
         
     Returns:
         Annotated RPM dataframe with enrichment metrics
@@ -766,22 +797,64 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
     # Combine
     peptide_annot = pd.concat([mean_wide, sd_wide, cv_wide], axis=1)
     
-    # Compute target specificity if we have Target and Bead-Fc groups
-    target_groups = [g for g in mean_wide.columns if 'Target' in g or 'target' in g]
-    background_groups = [g for g in mean_wide.columns if any(x in g for x in ['Bead', 'bead', 'KO', 'ko'])]
+    # Compute target specificity for ALL target-background pairs
+    # First, get the original group names (before prefix was added)
+    # mean_wide columns now have prefix "mean_log2Enrich_", so we need to extract group names
+    all_group_cols = mean_wide.columns.tolist()
+    all_groups_in_enrich = [col.replace("mean_log2Enrich_", "") for col in all_group_cols]
     
+    # Use provided target/background groups if available, otherwise identify from column names
+    if target_groups is None or background_groups is None:
+        # Identify target groups (Target, WT, etc.) - extract group name from column name
+        identified_target_groups = []
+        for group_name in all_groups_in_enrich:
+            if any(x in group_name for x in ['Target', 'target', 'WT', 'wt', 'CD', 'receptor']):
+                identified_target_groups.append(group_name)
+        
+        # Identify background groups (Bead, KO, etc.) - extract group name from column name
+        identified_background_groups = []
+        for group_name in all_groups_in_enrich:
+            if any(x in group_name for x in ['Bead', 'bead', 'KO', 'ko', 'Background', 'background']):
+                identified_background_groups.append(group_name)
+        
+        # Use identified groups if not provided
+        if target_groups is None:
+            target_groups = identified_target_groups
+        if background_groups is None:
+            background_groups = identified_background_groups
+    
+    # Filter to only groups that actually have enrichment data
+    target_groups = [g for g in target_groups if g in all_groups_in_enrich]
+    background_groups = [g for g in background_groups if g in all_groups_in_enrich]
+    
+    # Create specificity columns for all target-background pairs
     if target_groups and background_groups:
-        target_col = f"mean_log2Enrich_{target_groups[0]}"
-        background_col = f"mean_log2Enrich_{background_groups[0]}"
-        if target_col in peptide_annot.columns and background_col in peptide_annot.columns:
-            # Create specificity column name (handle special characters like "-")
-            target_name = target_groups[0].replace("-", "").replace("_", "")
-            bg_name = background_groups[0].replace("-", "").replace("_", "")
-            specificity_col_name = f"{target_name}_minus_{bg_name}"
-            peptide_annot[specificity_col_name] = (
-                peptide_annot[target_col] - peptide_annot[background_col]
-            )
-            logger.info(f"Created specificity column: {specificity_col_name}")
+        logger.info(f"Found {len(target_groups)} target group(s): {target_groups}")
+        logger.info(f"Found {len(background_groups)} background group(s): {background_groups}")
+        specificity_created = 0
+        for target_group in target_groups:
+            for background_group in background_groups:
+                target_col = f"mean_log2Enrich_{target_group}"
+                background_col = f"mean_log2Enrich_{background_group}"
+                if target_col in peptide_annot.columns and background_col in peptide_annot.columns:
+                    # Create specificity column name (handle special characters like "-")
+                    target_name = target_group.replace("-", "").replace("_", "")
+                    bg_name = background_group.replace("-", "").replace("_", "")
+                    specificity_col_name = f"{target_name}_minus_{bg_name}"
+                    peptide_annot[specificity_col_name] = (
+                        peptide_annot[target_col] - peptide_annot[background_col]
+                    )
+                    logger.info(f"Created specificity column: {specificity_col_name} ({target_group} - {background_group})")
+                    specificity_created += 1
+                else:
+                    logger.warning(f"Columns not found for specificity calculation: {target_col} or {background_col}")
+                    logger.debug(f"Available columns in peptide_annot: {list(peptide_annot.columns)}")
+        if specificity_created == 0:
+            logger.warning("No specificity columns were created. Check if target/background enrichment columns exist.")
+    else:
+        logger.warning(f"Could not identify target/background groups. Target groups: {target_groups}, Background groups: {background_groups}")
+        logger.info(f"Available enrichment columns: {list(mean_wide.columns)}")
+        logger.info(f"All groups found in enrichment: {[col.replace('mean_log2Enrich_', '') for col in mean_wide.columns]}")
     
     # Reset index to merge (peptide_annot index is already "peptide")
     peptide_annot = peptide_annot.reset_index()
@@ -865,6 +938,7 @@ def plot_target_enrichment_scatter(df_rpm_annot: pd.DataFrame, output_file: Path
     all_size = scatter_config.get("all_points_size", 10)
     all_alpha = scatter_config.get("all_points_alpha", 0.4)
     highlight_size = scatter_config.get("highlighted_size", 40)
+    enable_highlighting = scatter_config.get("enable_highlighting", True)
     fontsize = plot_config.get("fontsize", 10)
     colors_config = config.get("colors", {})
     gray_color = colors_config.get("gray", "#808080")
@@ -880,21 +954,25 @@ def plot_target_enrichment_scatter(df_rpm_annot: pd.DataFrame, output_file: Path
         s=all_size, alpha=all_alpha, color=gray_color
     )
     
-    # Highlight top peptides by sorting on specificity (target - background)
-    top = df_plot.sort_values('specificity', ascending=False).head(top_n)
-    
-    if len(top) > 0:
-        plt.scatter(
-            top[background_col],
-            top[target_col],
-            s=highlight_size, color=highlight_color, zorder=5  # zorder to ensure points are on top
-        )
-        logger.info(f"Highlighted {len(top)} top enriched variants (sorted by {target_col} - {background_col})")
+    # Highlight top peptides by sorting on specificity (target - background) if enabled
+    if enable_highlighting:
+        top = df_plot.sort_values('specificity', ascending=False).head(top_n)
+        
+        if len(top) > 0:
+            plt.scatter(
+                top[background_col],
+                top[target_col],
+                s=highlight_size, color=highlight_color, zorder=5  # zorder to ensure points are on top
+            )
+            logger.info(f"Highlighted {len(top)} top enriched variants (sorted by {target_col} - {background_col})")
+        else:
+            logger.warning(f"No peptides found for highlighting")
     else:
-        logger.warning(f"No peptides found for highlighting")
+        logger.info("Highlighting disabled in config, showing all points only")
     
-    # Add diagonal line
-    plt.axline((0, 0), slope=1, linestyle="--", color="black")
+    # Add vertical and horizontal lines at 0
+    plt.axvline(x=0, linestyle="--", color="black", linewidth=1)
+    plt.axhline(y=0, linestyle="--", color="black", linewidth=1)
     
     # Set labels
     plt.xlabel(f"{background_group} log2 enrichment vs Input", fontsize=fontsize)
@@ -1314,7 +1392,8 @@ def run_statistical_analysis(
             try:
                 lambda_val = config.get("analysis", {}).get("lambda", 0.01)
                 df_rpm_annot = compute_rpm_enrichment_analysis(
-                    rpm_counts, meta, input_groups, LAMBDA=lambda_val
+                    rpm_counts, meta, input_groups, LAMBDA=lambda_val,
+                    target_groups=target_groups, background_groups=background_groups
                 )
                 
                 # Save annotated RPM table with informative name
@@ -1322,47 +1401,61 @@ def run_statistical_analysis(
                 df_rpm_annot.to_csv(rpm_enrichment_file, sep='\t')
                 logger.info(f"Saved RPM enrichment analysis to {rpm_enrichment_file}")
                 
-                # Create target enrichment scatter plot
+                # Create target enrichment scatter plots and bar plots for ALL target-background pairs
                 if df_rpm_annot is not None:
-                    # Try to find target and background groups from the enrichment columns
+                    # Find all target and background groups from the enrichment columns
                     enrich_cols = [col for col in df_rpm_annot.columns if col.startswith("mean_log2Enrich_")]
                     if enrich_cols:
                         # Extract group names from column names
                         groups_in_enrich = [col.replace("mean_log2Enrich_", "") for col in enrich_cols]
                         
-                        # Find target and background groups
-                        plot_target = None
-                        plot_background = None
+                        # Identify all target groups
+                        plot_targets = [g for g in groups_in_enrich if any(x in g for x in ['Target', 'target', 'WT', 'wt', 'CD', 'receptor'])]
+                        # Identify all background groups
+                        plot_backgrounds = [g for g in groups_in_enrich if any(x in g for x in ['Bead', 'bead', 'KO', 'ko', 'Background', 'background'])]
                         
-                        for g in groups_in_enrich:
-                            if any(x in g for x in ['Target', 'target', 'WT', 'wt']):
-                                plot_target = g
-                            elif any(x in g for x in ['Bead', 'bead', 'KO', 'ko', 'Background', 'background']):
-                                plot_background = g
-                        
-                        if plot_target and plot_background:
-                            scatter_file = output_dir / "target_enrichment_scatter.png"
+                        # Create plots for each target-background pair
+                        if plot_targets and plot_backgrounds:
                             scatter_top_n = config.get("plots", {}).get("scatter_highlight_top_n", 60)
-                            plot_target_enrichment_scatter(
-                                df_rpm_annot, scatter_file,
-                                target_group=plot_target,
-                                background_group=plot_background,
-                                top_n=scatter_top_n,
-                                config=config
-                            )
-                            
-                            # Create top variants bar plot
-                            bar_plot_file = output_dir / "top_target_specific_variants.png"
                             bar_top_n = config.get("plots", {}).get("bar_plot_top_n", 30)
-                            plot_top_target_specific_variants(
-                                df_rpm_annot, bar_plot_file,
-                                target_group=plot_target,
-                                background_group=plot_background,
-                                top_n=bar_top_n,
-                                config=config
-                            )
+                            
+                            plot_count = 0
+                            for plot_target in plot_targets:
+                                for plot_background in plot_backgrounds:
+                                    # Create safe filenames
+                                    safe_target = plot_target.replace(" ", "_").replace("/", "_").replace("-", "_")
+                                    safe_background = plot_background.replace(" ", "_").replace("/", "_").replace("-", "_")
+                                    
+                                    # Scatter plot
+                                    scatter_file = output_dir / f"target_enrichment_scatter_{safe_target}_vs_{safe_background}.png"
+                                    try:
+                                        plot_target_enrichment_scatter(
+                                            df_rpm_annot, scatter_file,
+                                            target_group=plot_target,
+                                            background_group=plot_background,
+                                            top_n=scatter_top_n,
+                                            config=config
+                                        )
+                                        plot_count += 1
+                                    except Exception as e:
+                                        logger.warning(f"Failed to create scatter plot for {plot_target} vs {plot_background}: {e}")
+                                    
+                                    # Bar plot
+                                    bar_plot_file = output_dir / f"top_target_specific_variants_{safe_target}_vs_{safe_background}.png"
+                                    try:
+                                        plot_top_target_specific_variants(
+                                            df_rpm_annot, bar_plot_file,
+                                            target_group=plot_target,
+                                            background_group=plot_background,
+                                            top_n=bar_top_n,
+                                            config=config
+                                        )
+                                    except Exception as e:
+                                        logger.warning(f"Failed to create bar plot for {plot_target} vs {plot_background}: {e}")
+                            
+                            logger.info(f"Created {plot_count} scatter plots and bar plots for {len(plot_targets)} target(s) vs {len(plot_backgrounds)} background(s)")
                         else:
-                            logger.warning("Could not determine target/background groups for scatter plot")
+                            logger.warning("Could not determine target/background groups for scatter plots")
                 
             except Exception as e:
                 logger.warning(f"Failed to perform RPM enrichment analysis: {e}")

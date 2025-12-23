@@ -83,7 +83,8 @@
             "scatter": {
                 "all_points_size": 10,
                 "all_points_alpha": 0.4,
-                "highlighted_size": 40
+                "highlighted_size": 40,
+                "enable_highlighting": false
             },
             "pca": {
                 "point_size": 120,
