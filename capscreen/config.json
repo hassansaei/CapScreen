@@ -52,6 +52,11 @@
     "show_histogram": true,
     "keep_intermediate": false,
     "statistical_analysis": {
+        "group_roles": {
+            "input": [],
+            "target": [],
+            "background": []
+        },
         "analysis": {
             "n_cpus": 8,
             "lambda": 0.01,

@@ -87,6 +87,11 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
         logger.warning(f"Config file not found at {config_file}, using default values")
         # Return default config
         return {
+            "group_roles": {
+                "input": [],
+                "target": [],
+                "background": []
+            },
             "analysis": {
                 "n_cpus": 8,
                 "lambda": 0.01,
@@ -233,9 +238,132 @@ def read_sample_info(sample_info_file: Path) -> pd.DataFrame:
     return meta
 
 
-def identify_groups(meta: pd.DataFrame) -> Tuple[list, list, list]:
+def identify_groups(meta: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> Tuple[list, list, list]:
     """
     Identify target, background, and input groups from metadata.
+    
+    First checks for explicit group role definitions in config file.
+    Falls back to string heuristics if config is not provided or incomplete.
+    
+    Config format (in statistical_analysis.group_roles):
+    {
+        "input": ["Input_group1", "Input_group2"],
+        "target": ["Target_group1", "CD47_WT"],
+        "background": ["Bead_group1", "CD47_KO"]
+    }
+    
+    If group_roles is empty or not provided, uses heuristics:
+    - Input: groups containing "input" (case-insensitive)
+    - Target: groups containing "target", "wt", "cd", "receptor"
+    - Background: groups containing "bead", "ko", "background"
+    
+    Args:
+        meta: DataFrame with sample metadata
+        config: Optional configuration dictionary with group role definitions.
+                Should contain "group_roles" key with "input", "target", "background" lists.
+        
+    Returns:
+        Tuple of (target_groups, background_groups, input_groups)
+    """
+    all_groups = meta['group'].unique().tolist()
+    
+    # Check for explicit group role definitions in config
+    group_roles = None
+    if config is not None:
+        group_roles = config.get("group_roles", None)
+    
+    # Check if group_roles exists and has at least one non-empty list
+    # If all lists are empty, fall back to heuristics
+    has_explicit_roles = (group_roles is not None and 
+                         isinstance(group_roles, dict) and
+                         any(isinstance(v, list) and len(v) > 0 
+                             for v in group_roles.values()))
+    
+    if has_explicit_roles:
+        # Use explicit configuration
+        input_groups = group_roles.get("input", [])
+        target_groups = group_roles.get("target", [])
+        background_groups = group_roles.get("background", [])
+        
+        # Validate that configured groups exist in metadata
+        input_groups = [g for g in input_groups if g in all_groups]
+        target_groups = [g for g in target_groups if g in all_groups]
+        background_groups = [g for g in background_groups if g in all_groups]
+        
+        # Warn about missing groups
+        missing_input = [g for g in group_roles.get("input", []) if g not in all_groups]
+        missing_target = [g for g in group_roles.get("target", []) if g not in all_groups]
+        missing_background = [g for g in group_roles.get("background", []) if g not in all_groups]
+        
+        if missing_input:
+            logger.warning(f"Configured input groups not found in metadata: {missing_input}")
+        if missing_target:
+            logger.warning(f"Configured target groups not found in metadata: {missing_target}")
+        if missing_background:
+            logger.warning(f"Configured background groups not found in metadata: {missing_background}")
+        
+        # Find unassigned groups (groups in metadata but not in config)
+        assigned_groups = set(input_groups + target_groups + background_groups)
+        unassigned_groups = [g for g in all_groups if g not in assigned_groups]
+        
+        if unassigned_groups:
+            logger.warning(f"Groups found in metadata but not in config group_roles: {unassigned_groups}")
+            logger.info("Unassigned groups will be classified using heuristics")
+            # Classify unassigned groups using heuristics
+            for g in unassigned_groups:
+                role = _classify_group_heuristic(g)
+                if role == "input":
+                    input_groups.append(g)
+                elif role == "target":
+                    target_groups.append(g)
+                else:
+                    background_groups.append(g)
+        
+        logger.info(f"Using explicit group role configuration from config file")
+        logger.info(f"Input groups: {input_groups}")
+        logger.info(f"Target groups: {target_groups}")
+        logger.info(f"Background groups: {background_groups}")
+        
+        return target_groups, background_groups, input_groups
+    
+    # Fall back to heuristics if no config provided
+    logger.info("No explicit group role configuration found, using heuristics")
+    return _identify_groups_heuristic(meta)
+
+
+def _classify_group_heuristic(group_name: str) -> str:
+    """
+    Classify a single group using string heuristics.
+    
+    Args:
+        group_name: Name of the group
+        
+    Returns:
+        "input", "target", or "background"
+    """
+    group_lower = group_name.lower()
+    
+    # Check for input groups
+    if 'input' in group_lower:
+        return "input"
+    
+    # Check for target groups
+    target_keywords = ['target', 'wt', 'WT', 'receptor']
+    if any(kw in group_lower for kw in target_keywords):
+        return "target"
+    
+    # Check for background groups
+    background_keywords = ['bead', 'KO', 'background']
+    if any(kw in group_lower for kw in background_keywords):
+        return "background"
+    
+    # Default to background if unclear
+    return "background"
+
+
+def _identify_groups_heuristic(meta: pd.DataFrame) -> Tuple[list, list, list]:
+    """
+    Identify target, background, and input groups using string heuristics.
     
     Args:
         meta: DataFrame with sample metadata
@@ -718,7 +846,8 @@ def perform_differential_expression(df_norm: pd.DataFrame, meta: pd.DataFrame,
 def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame,
                                     input_groups: list, LAMBDA: float = 0.01,
                                     target_groups: Optional[list] = None,
-                                    background_groups: Optional[list] = None) -> pd.DataFrame:
+                                    background_groups: Optional[list] = None,
+                                    config: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
     """
     Compute RPM-based enrichment analysis following the notebook pattern.
     
@@ -884,24 +1013,44 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
     all_groups_in_enrich = [col.replace("mean_log2Enrich_", "") for col in all_group_cols]
     
     # Use provided target/background groups if available, otherwise identify from column names
+    # Check config first for explicit group role definitions
+    config_groups = None
+    if config is not None:
+        config_groups = config.get("group_roles", None)
+    
     if target_groups is None or background_groups is None:
-        # Identify target groups (Target, WT, etc.) - extract group name from column name
-        identified_target_groups = []
-        for group_name in all_groups_in_enrich:
-            if any(x in group_name for x in ['Target', 'target', 'WT', 'wt', 'CD', 'receptor']):
-                identified_target_groups.append(group_name)
+        if config_groups:
+            # Use explicit configuration if available
+            if target_groups is None:
+                target_groups = [g for g in config_groups.get("target", []) if g in all_groups_in_enrich]
+            if background_groups is None:
+                background_groups = [g for g in config_groups.get("background", []) if g in all_groups_in_enrich]
         
-        # Identify background groups (Bead, KO, etc.) - extract group name from column name
-        identified_background_groups = []
-        for group_name in all_groups_in_enrich:
-            if any(x in group_name for x in ['Bead', 'bead', 'KO', 'ko', 'Background', 'background']):
-                identified_background_groups.append(group_name)
+        # Fall back to heuristics for any remaining unclassified groups
+        unclassified_groups = [g for g in all_groups_in_enrich 
+                              if g not in (target_groups or []) and g not in (background_groups or [])]
         
-        # Use identified groups if not provided
-        if target_groups is None:
-            target_groups = identified_target_groups
-        if background_groups is None:
-            background_groups = identified_background_groups
+        if unclassified_groups:
+            identified_target_groups = []
+            identified_background_groups = []
+            
+            for group_name in unclassified_groups:
+                role = _classify_group_heuristic(group_name)
+                if role == "target":
+                    identified_target_groups.append(group_name)
+                elif role == "background":
+                    identified_background_groups.append(group_name)
+            
+            # Merge with config-based groups
+            if target_groups is None:
+                target_groups = identified_target_groups
+            else:
+                target_groups.extend(identified_target_groups)
+            
+            if background_groups is None:
+                background_groups = identified_background_groups
+            else:
+                background_groups.extend(identified_background_groups)
     
     # Filter to only groups that actually have enrichment data
     target_groups = [g for g in target_groups if g in all_groups_in_enrich]
@@ -1417,8 +1566,8 @@ def run_statistical_analysis(
         raw_counts, rpm_counts = read_count_table(counts_file)
         meta = read_sample_info(sample_info_file)
         
-        # Identify groups
-        target_groups, background_groups, input_groups = identify_groups(meta)
+        # Identify groups (with config support for explicit role definitions)
+        target_groups, background_groups, input_groups = identify_groups(meta, config=config)
         
         # Create DESeq2 dataset
         n_cpus_val = n_cpus if n_cpus is not None else config.get("analysis", {}).get("n_cpus", 8)
@@ -1450,7 +1599,8 @@ def run_statistical_analysis(
                 lambda_val = config.get("analysis", {}).get("lambda", 0.01)
                 df_rpm_annot = compute_rpm_enrichment_analysis(
                     rpm_counts, meta, input_groups, LAMBDA=lambda_val,
-                    target_groups=target_groups, background_groups=background_groups
+                    target_groups=target_groups, background_groups=background_groups,
+                    config=config
                 )
                 
                 # Save annotated RPM table with informative name
@@ -1466,10 +1616,28 @@ def run_statistical_analysis(
                         # Extract group names from column names
                         groups_in_enrich = [col.replace("mean_log2Enrich_", "") for col in enrich_cols]
                         
-                        # Identify all target groups
-                        plot_targets = [g for g in groups_in_enrich if any(x in g for x in ['Target', 'target', 'WT', 'wt', 'CD', 'receptor'])]
-                        # Identify all background groups
-                        plot_backgrounds = [g for g in groups_in_enrich if any(x in g for x in ['Bead', 'bead', 'KO', 'ko', 'Background', 'background'])]
+                        # Use config-based group identification if available, otherwise use heuristics
+                        config_groups = config.get("group_roles", None) if config else None
+                        
+                        if config_groups:
+                            # Use explicit configuration
+                            plot_targets = [g for g in config_groups.get("target", []) if g in groups_in_enrich]
+                            plot_backgrounds = [g for g in config_groups.get("background", []) if g in groups_in_enrich]
+                            
+                            # For unclassified groups, use heuristics
+                            classified = set(plot_targets + plot_backgrounds)
+                            unclassified = [g for g in groups_in_enrich if g not in classified]
+                            
+                            for g in unclassified:
+                                role = _classify_group_heuristic(g)
+                                if role == "target":
+                                    plot_targets.append(g)
+                                elif role == "background":
+                                    plot_backgrounds.append(g)
+                        else:
+                            # Fall back to heuristics
+                            plot_targets = [g for g in groups_in_enrich if _classify_group_heuristic(g) == "target"]
+                            plot_backgrounds = [g for g in groups_in_enrich if _classify_group_heuristic(g) == "background"]
                         
                         # Create plots for each target-background pair
                         if plot_targets and plot_backgrounds:
