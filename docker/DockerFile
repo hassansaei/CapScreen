@@ -30,13 +30,19 @@ RUN mkdir -p /opt/tools && \
     wget http://opengene.org/fastp/fastp && \
     chmod a+x ./fastp
 
-# Copy conda environment file first
+# Copy conda environment files
 COPY conda/capscreen.yml /tmp/capscreen.yml
+COPY conda/capscreen-stat.yml /tmp/capscreen-stat.yml
 
 # Create and install conda environments
+# Main environment for pipeline (Python 3.7)
 RUN mamba env create -f /tmp/capscreen.yml && \
-    conda clean -afy && \
-    rm /tmp/capscreen.yml 
+    rm /tmp/capscreen.yml
+
+# Statistical analysis environment (Python 3.9+ for pydeseq2)
+RUN mamba env create -f /tmp/capscreen-stat.yml && \
+    rm /tmp/capscreen-stat.yml && \
+    conda clean -afy 
 
 # Copy capscreen package
 COPY . /opt/capscreen/
@@ -44,9 +50,12 @@ COPY . /opt/capscreen/
 # Set up default input, output, and reference directories
 RUN mkdir -p $DEFAULT_INPUT_DIR $DEFAULT_OUTPUT_DIR $DEFAULT_REFERENCE_DIR
 
-# Install capscreen package
+# Install capscreen package in main environment
 WORKDIR /opt/capscreen
-RUN pip install -e .
+RUN /opt/conda/envs/capscreen/bin/pip install -e .
+
+# Install capscreen package in stat environment (needed to import stat module)
+RUN /opt/conda/envs/capscreen-stat/bin/pip install -e .
 
 # Allow dynamic UID and GID as build arguments
 ARG USERNAME=appuser

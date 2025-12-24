@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import shutil
+import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,7 +16,161 @@ from capscreen.version import __version__
 from capscreen.scripts import count as count_module
 from capscreen.scripts import generate_report as generate_report_module
 from capscreen.scripts import alignment as alignment_module
-from capscreen.scripts import stat as stat_module
+# stat_module imported conditionally - may use separate conda environment
+try:
+    from capscreen.scripts import stat as stat_module
+    STAT_MODULE_AVAILABLE = True
+except ImportError:
+    STAT_MODULE_AVAILABLE = False
+    stat_module = None
+
+
+def get_stat_python_executable() -> Optional[Path]:
+    """
+    Find the Python executable for the capscreen-stat conda environment.
+    
+    Returns:
+        Path to Python executable in stat environment, or None if not found
+    """
+    # Check common conda environment locations
+    possible_paths = [
+        Path("/opt/conda/envs/capscreen-stat/bin/python"),  # Docker
+        Path.home() / ".conda" / "envs" / "capscreen-stat" / "bin" / "python",  # Local conda
+        Path(os.environ.get("CONDA_PREFIX", "")) / "../capscreen-stat/bin/python",  # Relative to current env
+    ]
+    
+    # Also check if CONDA_ENVS_PATH is set
+    if "CONDA_ENVS_PATH" in os.environ:
+        possible_paths.append(Path(os.environ["CONDA_ENVS_PATH"]) / "capscreen-stat" / "bin" / "python")
+    
+    for path in possible_paths:
+        if path.exists() and path.is_file():
+            return path
+    
+    return None
+
+
+def run_statistical_analysis_with_stat_env(
+    counts_file: Path,
+    sample_info_file: Path,
+    output_dir: Path,
+    config_file: Optional[Path] = None,
+    n_cpus: Optional[int] = None,
+    verbose: bool = False,
+    logger_instance: Optional[logging.Logger] = None
+) -> bool:
+    """
+    Run statistical analysis using the capscreen-stat conda environment.
+    
+    This function uses subprocess to call stat.py with the stat environment's Python,
+    which has Python 3.9+ and all required dependencies (pydeseq2, etc.).
+    
+    Args:
+        counts_file: Path to merged.counts.tsv file
+        sample_info_file: Path to Sample_info.csv file
+        output_dir: Output directory for results
+        config_file: Path to config.json file (optional)
+        n_cpus: Number of CPUs to use (optional)
+        verbose: Enable verbose logging
+        logger_instance: Optional logger instance
+        
+    Returns:
+        True if analysis completed successfully, False otherwise
+    """
+    stat_python = get_stat_python_executable()
+    
+    if stat_python is None:
+        # Fall back to trying direct import (might work if in stat env already)
+        if STAT_MODULE_AVAILABLE and stat_module:
+            if logger_instance:
+                logger_instance.warning("Stat environment not found, trying direct import...")
+            try:
+                return stat_module.run_statistical_analysis(
+                    counts_file=counts_file,
+                    sample_info_file=sample_info_file,
+                    output_dir=output_dir,
+                    config_file=config_file,
+                    n_cpus=n_cpus,
+                    verbose=verbose,
+                    logger_instance=logger_instance
+                )
+            except Exception as e:
+                if logger_instance:
+                    logger_instance.error(f"Direct import failed: {e}")
+                return False
+        else:
+            if logger_instance:
+                logger_instance.error("Cannot run statistical analysis: capscreen-stat environment not found and stat module not available")
+            return False
+    
+    # Build command to run stat.py as a module using the stat environment's Python
+    # First try to find the file path via import (most reliable)
+    stat_script_path = None
+    try:
+        import capscreen.scripts.stat as stat_module_file
+        if hasattr(stat_module_file, '__file__'):
+            stat_script_path = Path(stat_module_file.__file__)
+    except Exception:
+        pass
+    
+    # Use module execution if we can't find the file, otherwise use direct file execution
+    if stat_script_path and stat_script_path.exists():
+        # Use direct file execution (more explicit)
+        cmd = [
+            str(stat_python),
+            str(stat_script_path),
+            "--counts", str(counts_file),
+            "--sample-info", str(sample_info_file),
+            "--output-dir", str(output_dir),
+        ]
+    else:
+        # Fallback to module execution
+        cmd = [
+            str(stat_python),
+            "-m", "capscreen.scripts.stat",
+            "--counts", str(counts_file),
+            "--sample-info", str(sample_info_file),
+            "--output-dir", str(output_dir),
+        ]
+    
+    if config_file:
+        cmd.extend(["--config", str(config_file)])
+    
+    if n_cpus:
+        cmd.extend(["--n-cpus", str(n_cpus)])
+    
+    if verbose:
+        cmd.append("--verbose")
+    
+    # Run the command
+    try:
+        if logger_instance:
+            logger_instance.info(f"Running statistical analysis using stat environment: {stat_python}")
+            logger_instance.debug(f"Command: {' '.join(cmd)}")
+        
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        
+        # Log output
+        if logger_instance:
+            if result.stdout:
+                logger_instance.info(result.stdout)
+            if result.stderr:
+                if result.returncode != 0:
+                    logger_instance.error(result.stderr)
+                else:
+                    logger_instance.debug(result.stderr)
+        
+        return result.returncode == 0
+        
+    except Exception as e:
+        if logger_instance:
+            logger_instance.error(f"Failed to run statistical analysis: {e}", exc_info=True)
+        return False
 
 # Global Logger
 LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(name)s:%(lineno)d] %(message)s"
@@ -134,14 +289,24 @@ def determine_keep_intermediate(cli_flag: bool, config: Dict[str, Any]) -> bool:
 def infer_fastq2_path(fastq1: Path) -> Path:
     """
     Infer the R2 FASTQ path from the R1 FASTQ path.
+    
+    Supports multiple naming conventions:
+    - Illumina standard: _1.fq.gz / _2.fq.gz or _1.fastq.gz / _2.fastq.gz
+    - Common patterns: _R1_ / _R2_, _R1. / _R2., _R1 / _R2
+    - Alternative: R1_ / R2_, R1. / R2.
     """
     name = fastq1.name
     replacements = [
-        ("_R1_", "_R2_"),
-        ("_R1.", "_R2."),
-        ("_R1", "_R2"),
-        ("R1_", "R2_"),
-        ("R1.", "R2.")
+        ("_1.fq.gz", "_2.fq.gz"),      # Illumina standard: _1.fq.gz → _2.fq.gz
+        ("_1.fastq.gz", "_2.fastq.gz"), # Illumina standard: _1.fastq.gz → _2.fastq.gz
+        ("_1.fq", "_2.fq"),             # Without compression: _1.fq → _2.fq
+        ("_1.fastq", "_2.fastq"),       # Without compression: _1.fastq → _2.fastq
+        ("_1.", "_2."),                 # Generic: _1. → _2. (catches other extensions)
+        ("_R1_", "_R2_"),               # Standard: _R1_ → _R2_
+        ("_R1.", "_R2."),               # Standard: _R1. → _R2.
+        ("_R1", "_R2"),                 # Standard: _R1 → _R2
+        ("R1_", "R2_"),                 # Alternative: R1_ → R2_
+        ("R1.", "R2.")                  # Alternative: R1. → R2.
     ]
     for old, new in replacements:
         if old in name:
@@ -742,9 +907,9 @@ def main():
                         stat_output_dir = args.output_dir / "statistical_analysis"
                         stat_output_dir.mkdir(parents=True, exist_ok=True)
                         
-                        # Run statistical analysis
+                        # Run statistical analysis using stat environment
                         try:
-                            success = stat_module.run_statistical_analysis(
+                            success = run_statistical_analysis_with_stat_env(
                                 counts_file=merged_path,
                                 sample_info_file=sample_info_path,
                                 output_dir=stat_output_dir,
@@ -858,10 +1023,10 @@ def main():
         # Create output directory
         args.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Run statistical analysis
+        # Run statistical analysis using stat environment
         try:
             n_cpus_val = getattr(args, 'n_cpus', None) or args.threads
-            success = stat_module.run_statistical_analysis(
+            success = run_statistical_analysis_with_stat_env(
                 counts_file=args.counts,
                 sample_info_file=args.sample_info,
                 output_dir=args.output_dir,

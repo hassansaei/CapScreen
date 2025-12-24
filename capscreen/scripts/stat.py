@@ -1169,7 +1169,7 @@ def plot_target_enrichment_scatter(df_rpm_annot: pd.DataFrame, output_file: Path
     all_size = scatter_config.get("all_points_size", 10)
     all_alpha = scatter_config.get("all_points_alpha", 0.4)
     highlight_size = scatter_config.get("highlighted_size", 40)
-    enable_highlighting = scatter_config.get("enable_highlighting", True)
+    enable_highlighting = scatter_config.get("enable_highlighting", False)
     fontsize = plot_config.get("fontsize", 10)
     colors_config = config.get("colors", {})
     gray_color = colors_config.get("gray", "#808080")

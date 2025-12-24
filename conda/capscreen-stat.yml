@@ -1,0 +1,19 @@
+name: capscreen-stat
+channels:
+  - bioconda
+  - defaults
+  - conda-forge
+dependencies:
+  - python>=3.9,<3.12
+  - pip
+  - pandas
+  - numpy
+  - scipy
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - statsmodels
+  - pydeseq2
+  - mpl-scatter-density
+  - jinja2
+
