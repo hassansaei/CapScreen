@@ -15,6 +15,7 @@ from capscreen.version import __version__
 from capscreen.scripts import count as count_module
 from capscreen.scripts import generate_report as generate_report_module
 from capscreen.scripts import alignment as alignment_module
+from capscreen.scripts import stat as stat_module
 
 # Global Logger
 LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(name)s:%(lineno)d] %(message)s"
@@ -229,6 +230,42 @@ def load_sample_info(sample_info_path: Path) -> Tuple[List[SampleInfo], List[str
                 skipped_rows.append(f"Row {row_index}: {exc}")
     
     return valid_samples, skipped_rows
+
+def create_sample_info_csv(
+    sample_entries: List[SampleInfo],
+    output_path: Path
+) -> bool:
+    """
+    Create a Sample_info.csv file from sample entries for statistical analysis.
+    
+    Args:
+        sample_entries: List of SampleInfo objects
+        output_path: Path where to write the CSV file
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", newline='') as csv_file:
+            writer = csv.DictWriter(
+                csv_file,
+                fieldnames=["sample_id", "group", "tech_rep", "bio_rep", "batch_seq"]
+            )
+            writer.writeheader()
+            for entry in sample_entries:
+                writer.writerow({
+                    "sample_id": entry.sample_id,
+                    "group": entry.group,
+                    "tech_rep": entry.tech_rep,
+                    "bio_rep": entry.bio_rep,
+                    "batch_seq": entry.batch_seq
+                })
+        logger.info(f"Created Sample_info.csv at {output_path}")
+        return True
+    except Exception as exc:
+        logger.error(f"Failed to create Sample_info.csv at {output_path}: {exc}")
+        return False
 
 def merge_count_tables(
     sample_entries: List[SampleInfo],
@@ -508,6 +545,11 @@ def main():
             "between configured flanking sequences and re-attach the flanks before alignment."
         ),
     )
+    pipeline_parser.add_argument(
+        "--stat",
+        action="store_true",
+        help="Run statistical analysis after creating merged counts table (requires --sample-info)"
+    )
 
     # align: only QC and alignment
     align_parser = subparsers.add_parser("align", parents=[parent_parser], help="Run QC and alignment only")
@@ -532,6 +574,12 @@ def main():
     report_parser = subparsers.add_parser("report", parents=[parent_parser], help="Generate HTML report from an existing sample directory")
     report_parser.add_argument("--output", type=Path, help="Output HTML file name (defaults to <sample>_report.html)")
 
+    # stat: statistical analysis
+    stat_parser = subparsers.add_parser("stat", parents=[parent_parser], help="Run statistical analysis on merged counts")
+    stat_parser.add_argument("--counts", type=Path, required=True, help="Path to merged.counts.tsv file")
+    stat_parser.add_argument("--sample-info", type=Path, required=True, help="Path to Sample_info.csv file")
+    stat_parser.add_argument("--n-cpus", type=int, help="Number of CPUs to use for DESeq2")
+
     def normalize_path(path_value: Optional[Path]) -> Optional[Path]:
         if path_value is None:
             return None
@@ -543,7 +591,7 @@ def main():
     if isinstance(args.config, Path):
         args.config = normalize_path(args.config)
 
-    for attr in ("fastq1", "fastq2", "reference_file", "sam_file", "output", "sample_info", "merged_counts_output"):
+    for attr in ("fastq1", "fastq2", "reference_file", "sam_file", "output", "sample_info", "merged_counts_output", "counts"):
         if hasattr(args, attr):
             value = getattr(args, attr)
             if isinstance(value, Path):
@@ -676,12 +724,64 @@ def main():
                 logger.info(f"Merged counts table saved to {merged_path}")
             else:
                 logger.warning("Merged counts table could not be created.")
+            
+            # Track statistical analysis success status
+            stat_success = None  # None = not attempted, True = succeeded, False = failed
+            
+            # Run statistical analysis if requested
+            if getattr(args, 'stat', False):
+                if not merged_path:
+                    logger.error("Cannot run statistical analysis: merged counts table was not created.")
+                    stat_success = False
+                else:
+                    logger.info("Starting statistical analysis...")
+                    # Create Sample_info.csv for stat analysis
+                    sample_info_path = args.output_dir / "Sample_info.csv"
+                    if create_sample_info_csv(sample_entries, sample_info_path):
+                        # Create output directory for stat results
+                        stat_output_dir = args.output_dir / "statistical_analysis"
+                        stat_output_dir.mkdir(parents=True, exist_ok=True)
+                        
+                        # Run statistical analysis
+                        try:
+                            success = stat_module.run_statistical_analysis(
+                                counts_file=merged_path,
+                                sample_info_file=sample_info_path,
+                                output_dir=stat_output_dir,
+                                config_file=args.config,
+                                n_cpus=args.threads,
+                                verbose=(args.log_level == "DEBUG"),
+                                logger_instance=logger
+                            )
+                            stat_success = success
+                            if success:
+                                logger.info(f"Statistical analysis completed. Results saved to {stat_output_dir}")
+                            else:
+                                logger.warning("Statistical analysis completed with warnings or errors.")
+                        except Exception as e:
+                            logger.error(f"Statistical analysis failed: {e}", exc_info=True)
+                            stat_success = False
+                    else:
+                        logger.error("Failed to create Sample_info.csv for statistical analysis.")
+                        stat_success = False
+            
+            # Determine statistical analysis status for summary
+            if stat_success is True:
+                stat_status = "Completed"
+            elif stat_success is False:
+                stat_status = "Failed"
+            elif getattr(args, 'stat', False):
+                stat_status = "Skipped (merged counts table not available)"
+            else:
+                stat_status = "Skipped"
+            
             append_batch_summary(
                 batch_log_path,
                 [
                     f"Completed samples: {completed_samples}",
                     f"Skipped samples (existing results): {skipped_existing}",
-                    f"Merged counts table: {merged_path}" if merged_path else "Merged counts table was not created."
+                    f"Merged counts table: {merged_path}" if merged_path else "Merged counts table was not created.",
+                    f"Statistical analysis: {stat_status}"
                 ]
             )
             sys.exit(0)
@@ -748,6 +848,37 @@ def main():
             logger.error(f"Report generation failed: {e}", exc_info=True)
             sys.exit(1)
         sys.exit(0)
+    elif args.command == "stat":
+        # Validate inputs
+        if not args.counts.exists():
+            stat_parser.error(f"Counts file not found: {args.counts}")
+        if not args.sample_info.exists():
+            stat_parser.error(f"Sample info file not found: {args.sample_info}")
+        
+        # Create output directory
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Run statistical analysis
+        try:
+            n_cpus_val = getattr(args, 'n_cpus', None) or args.threads
+            success = stat_module.run_statistical_analysis(
+                counts_file=args.counts,
+                sample_info_file=args.sample_info,
+                output_dir=args.output_dir,
+                config_file=args.config,
+                n_cpus=n_cpus_val,
+                verbose=(args.log_level == "DEBUG"),
+                logger_instance=logger
+            )
+            if success:
+                logger.info("Statistical analysis completed successfully.")
+                sys.exit(0)
+            else:
+                logger.error("Statistical analysis failed.")
+                sys.exit(1)
+        except Exception as e:
+            logger.error(f"Statistical analysis failed: {e}", exc_info=True)
+            sys.exit(1)
     else:
         parser.print_help()
         sys.exit(1)

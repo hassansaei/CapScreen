@@ -50,5 +50,59 @@
     "html_template": "capscreen/templates/template_report.html",
     "show_count_matrix": true,
     "show_histogram": true,
-    "keep_intermediate": false
+    "keep_intermediate": false,
+    "statistical_analysis": {
+        "group_roles": {
+            "input": [],
+            "target": [],
+            "background": []
+        },
+        "analysis": {
+            "n_cpus": 8,
+            "lambda": 0.01,
+            "low_expression_threshold": 10,
+            "pca": {
+                "n_components": 2,
+                "random_state": 0,
+                "top_n_features": 500
+            }
+        },
+        "differential_expression": {
+            "padj_threshold": 0.05,
+            "log2fc_threshold": 1.0
+        },
+        "plots": {
+            "scatter_highlight_top_n": 60,
+            "bar_plot_top_n": 30,
+            "dpi": {
+                "standard": 300,
+                "heatmap": 600
+            },
+            "figure_sizes": {
+                "scatter": [6, 6],
+                "bar": [6, 6],
+                "rpm_scatter": [6, 4],
+                "pca": [6, 5],
+                "heatmap": [10, 10]
+            },
+            "scatter": {
+                "all_points_size": 10,
+                "all_points_alpha": 0.4,
+                "highlighted_size": 40,
+                "enable_highlighting": false
+            },
+            "pca": {
+                "point_size": 120,
+                "fontsize": 10
+            },
+            "fontsize": 10
+        },
+        "colors": {
+            "target": "#d62728",
+            "background_bead": "#1f77b4",
+            "background_bead_fc": "#ff7f0e",
+            "gray": "#808080",
+            "highlight": "#d62728"
+        }
+    }
 }
