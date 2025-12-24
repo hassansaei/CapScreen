@@ -363,7 +363,7 @@ def extract_normalized_counts(dds: DeseqDataSet) -> pd.DataFrame:
     
     df_norm = pd.DataFrame(
         norm_counts,
-        index=dds.obs_names,      # variant/peptide IDs (rows)
+        index=dds.obs_names,      # variant IDs (ID_WLG) - rows
         columns=dds.var_names     # sample IDs (columns)
     )
     
@@ -675,13 +675,16 @@ def perform_differential_expression(df_norm: pd.DataFrame, meta: pd.DataFrame,
             logger.warning(f"Failed to fit model for {pep}: {e}")
             continue
     
+    # Refactored: Changed column name from "peptide" to "ID_WLG" for consistency
+    # Sourcery-AI suggestion: Use ID_WLG as identifier since Y.index contains variant IDs, not sequences
     # Create results dataframe
+    # Note: Y.index contains ID_WLG values (variant identifiers), not peptide sequences
     if len(results) == 0:
         logger.warning("No results from differential expression analysis")
-        return pd.DataFrame(columns=["peptide", f"log2FC_{target_group}_vs_{background_group}", "pval", "padj"])
+        return pd.DataFrame(columns=["ID_WLG", f"log2FC_{target_group}_vs_{background_group}", "pval", "padj"])
     
-    res = pd.DataFrame(results, columns=["peptide", f"log2FC_{target_group}_vs_{background_group}", "pval"])
-    res = res.set_index("peptide")
+    res = pd.DataFrame(results, columns=["ID_WLG", f"log2FC_{target_group}_vs_{background_group}", "pval"])
+    res = res.set_index("ID_WLG")
     
     # Calculate adjusted p-values (only if we have valid p-values)
     if len(res) > 0 and res["pval"].notna().any():
@@ -738,16 +741,15 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
     """
     logger.info("Computing RPM-based enrichment analysis...")
     
-    # Prepare RPM counts: set ID_WLG as index if it's a column
+    # Refactored: Fixed index/column naming to use ID_WLG as identifier and preserve peptide column
+    # Sourcery-AI suggestion: Keep ID_WLG as index (don't rename to 'peptide') and preserve 'peptide' 
+    # column (contains actual sequence) to avoid confusion between identifiers and sequences
+    # Prepare RPM counts: set ID_WLG as index if it's a column, preserve peptide column
     df_rpm = rpm_counts.copy()
     if 'ID_WLG' in df_rpm.columns:
         df_rpm = df_rpm.set_index('ID_WLG')
-        df_rpm.index.name = 'peptide'  # Rename index for consistency
-    elif df_rpm.index.name != 'peptide':
-        df_rpm.index.name = 'peptide'
-    
-    if 'peptide' in df_rpm.columns:
-        df_rpm = df_rpm.drop(columns='peptide', errors='ignore')
+    # Keep ID_WLG as index name (don't rename to 'peptide')
+    # Preserve 'peptide' column (contains actual sequence) - don't drop it
     
     # Remove AAV2 or control variants
     control_variants = df_rpm.index[df_rpm.index.str.contains('AAV', case=False, na=False)]
@@ -781,9 +783,10 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
                 continue
             
             mu_r = df_rpm[samples_in_rpm].mean(axis=1)  # μ_{i,s}
+            # Refactored: Changed from "peptide" to "ID_WLG" to use identifier consistently
             mu.append(
                 pd.DataFrame({
-                    "peptide": mu_r.index,
+                    "ID_WLG": mu_r.index,
                     "mu": mu_r.values,
                     "group": group,
                     "bio_rep": rep
@@ -791,7 +794,7 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
             )
     
     mu_df = pd.concat(mu, ignore_index=True)
-    logger.info(f"Computed means for {len(mu_df)} peptide-group-bio_rep combinations")
+    logger.info(f"Computed means for {len(mu_df)} ID_WLG-group-bio_rep combinations")
     
     # Step 2: Compute log2 enrichment vs Input
     logger.info("Step 2: Computing log2 enrichment vs Input...")
@@ -809,13 +812,14 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
             logger.warning(f"No input samples found for bio_rep {rep}, skipping")
             continue
         
+        # Refactored: Changed groupby and set_index from "peptide" to "ID_WLG" for identifier consistency
         # Average across input groups if multiple exist
-        mu_input = mu_input_df.groupby("peptide")["mu"].mean()
+        mu_input = mu_input_df.groupby("ID_WLG")["mu"].mean()
         
         for group in non_input_groups:
             mu_g = (
                 mu_r[mu_r["group"] == group]
-                .set_index("peptide")["mu"]
+                .set_index("ID_WLG")["mu"]
             )
             
             common = mu_g.index.intersection(mu_input.index)
@@ -823,9 +827,10 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
             if len(common) > 0:
                 e = np.log2((mu_g.loc[common] + LAMBDA) / (mu_input.loc[common] + LAMBDA))
                 
+                # Refactored: Changed from "peptide" to "ID_WLG" for identifier consistency
                 enrich.append(
                     pd.DataFrame({
-                        "peptide": common,
+                        "ID_WLG": common,
                         "log2_enrichment": e.values,
                         "group": group,
                         "bio_rep": rep
@@ -837,13 +842,14 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
         return df_rpm
     
     enrich_df = pd.concat(enrich, ignore_index=True)
-    logger.info(f"Computed enrichments for {len(enrich_df)} peptide-group-bio_rep combinations")
+    logger.info(f"Computed enrichments for {len(enrich_df)} ID_WLG-group-bio_rep combinations")
     
     # Step 3: Aggregate across experiments
     logger.info("Step 3: Aggregating across experiments...")
+    # Refactored: Changed groupby from "peptide" to "ID_WLG" for identifier consistency
     enrich_summary = (
         enrich_df
-        .groupby(["peptide", "group"])
+        .groupby(["ID_WLG", "group"])
         .agg(
             mean_log2_enrichment=("log2_enrichment", "mean"),
             sd_log2_enrichment=("log2_enrichment", "std")
@@ -855,9 +861,10 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
     logger.info("Step 4: Creating summary statistics...")
     df_rpm_mat = df_rpm.copy()
     
+    # Refactored: Changed pivot index from "peptide" to "ID_WLG" for identifier consistency
     # Pivot mean and sd
-    mean_wide = enrich_summary.pivot(index="peptide", columns="group", values="mean_log2_enrichment")
-    sd_wide = enrich_summary.pivot(index="peptide", columns="group", values="sd_log2_enrichment")
+    mean_wide = enrich_summary.pivot(index="ID_WLG", columns="group", values="mean_log2_enrichment")
+    sd_wide = enrich_summary.pivot(index="ID_WLG", columns="group", values="sd_log2_enrichment")
     
     # Rename columns
     # Calculate CV (coefficient of variation) with protection against division by zero
@@ -929,23 +936,25 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
         logger.info(f"Available enrichment columns: {list(mean_wide.columns)}")
         logger.info(f"All groups found in enrichment: {[col.replace('mean_log2Enrich_', '') for col in mean_wide.columns]}")
     
-    # Reset index to merge (peptide_annot index is already "peptide")
+    # Refactored: Changed merge key from "peptide" to "ID_WLG" for identifier consistency
+    # Reset index to merge (peptide_annot index is ID_WLG)
     peptide_annot = peptide_annot.reset_index()
     
-    # Merge into df_rpm (df_rpm_mat index should be peptide IDs)
+    # Merge into df_rpm (df_rpm_mat index is ID_WLG)
     df_rpm_annot = (
         df_rpm_mat
-        .reset_index()  # Reset to make index a column for merging
-        .merge(peptide_annot, on="peptide", how="left")
-        .set_index("peptide")
+        .reset_index()  # Reset to make index a column (ID_WLG) for merging
+        .merge(peptide_annot, on="ID_WLG", how="left")
+        .set_index("ID_WLG")
     )
     
     # Step 5: Add per-replicate enrichments in wide format
     logger.info("Step 5: Adding per-replicate enrichments...")
+    # Refactored: Changed pivot_table index from "peptide" to "ID_WLG" for identifier consistency
     enrich_wide = (
         enrich_df
         .pivot_table(
-            index="peptide",
+            index="ID_WLG",
             columns=["group", "bio_rep"],
             values="log2_enrichment"
         )
@@ -1193,13 +1202,15 @@ def create_rpm_scatter_density_plots(rpm_counts: pd.DataFrame, meta: pd.DataFram
     # Create custom colormap
     white_viridis = create_white_viridis_colormap()
     
+    # Refactored: Fixed to preserve peptide column instead of dropping it
+    # Sourcery-AI suggestion: Keep ID_WLG as index and preserve peptide column to maintain 
+    # both identifier and sequence information for downstream use
     # Align RPM counts with metadata
     # rpm_counts has variants as rows, samples as columns
-    # Remove ID_WLG and peptide columns if they exist
+    # Set ID_WLG as index if it's a column, preserve peptide column (contains sequence)
     if 'ID_WLG' in rpm_counts.columns:
         rpm_counts = rpm_counts.set_index('ID_WLG')
-    if 'peptide' in rpm_counts.columns:
-        rpm_counts = rpm_counts.drop(columns='peptide', errors='ignore')
+    # Keep peptide column - don't drop it (contains actual sequence)
     
     # Remove AAV2 or control variants if they exist
     control_variants = rpm_counts.index[rpm_counts.index.str.contains('AAV', case=False, na=False)]
