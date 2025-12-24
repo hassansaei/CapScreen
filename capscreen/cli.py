@@ -725,10 +725,14 @@ def main():
             else:
                 logger.warning("Merged counts table could not be created.")
             
+            # Track statistical analysis success status
+            stat_success = None  # None = not attempted, True = succeeded, False = failed
+            
             # Run statistical analysis if requested
             if getattr(args, 'stat', False):
                 if not merged_path:
                     logger.error("Cannot run statistical analysis: merged counts table was not created.")
+                    stat_success = False
                 else:
                     logger.info("Starting statistical analysis...")
                     # Create Sample_info.csv for stat analysis
@@ -749,14 +753,27 @@ def main():
                                 verbose=(args.log_level == "DEBUG"),
                                 logger_instance=logger
                             )
+                            stat_success = success
                             if success:
                                 logger.info(f"Statistical analysis completed. Results saved to {stat_output_dir}")
                             else:
                                 logger.warning("Statistical analysis completed with warnings or errors.")
                         except Exception as e:
                             logger.error(f"Statistical analysis failed: {e}", exc_info=True)
+                            stat_success = False
                     else:
                         logger.error("Failed to create Sample_info.csv for statistical analysis.")
+                        stat_success = False
+            
+            # Determine statistical analysis status for summary
+            if stat_success is True:
+                stat_status = "Completed"
+            elif stat_success is False:
+                stat_status = "Failed"
+            elif getattr(args, 'stat', False):
+                stat_status = "Skipped (merged counts table not available)"
+            else:
+                stat_status = "Skipped"
             
             append_batch_summary(
                 batch_log_path,
@@ -764,7 +781,7 @@ def main():
                     f"Completed samples: {completed_samples}",
                     f"Skipped samples (existing results): {skipped_existing}",
                     f"Merged counts table: {merged_path}" if merged_path else "Merged counts table was not created.",
-                    f"Statistical analysis: {'Completed' if getattr(args, 'stat', False) and merged_path else 'Skipped'}"
+                    f"Statistical analysis: {stat_status}"
                 ]
             )
             sys.exit(0)
