@@ -1409,33 +1409,6 @@ def run_statistical_analysis(
         # Identify groups
         target_groups, background_groups, input_groups = identify_groups(meta)
         
-        # Determine target and background groups for differential expression
-        # Use first target and first background group, or infer from group names
-        if len(target_groups) > 0 and len(background_groups) > 0:
-            de_target = target_groups[0]
-            de_background = background_groups[0]
-        elif len(target_groups) >= 2:
-            # If we have multiple non-input groups, use first two
-            de_target = target_groups[0]
-            de_background = target_groups[1] if len(target_groups) > 1 else None
-        else:
-            # Try to infer from group names (common patterns)
-            all_non_input = target_groups
-            # Look for common patterns: Target, WT, etc. for target; Bead, KO, etc. for background
-            target_candidates = [g for g in all_non_input if any(x in g for x in ['Target', 'WT', 'target'])]
-            background_candidates = [g for g in all_non_input if any(x in g for x in ['Bead', 'KO', 'background', 'Background'])]
-            
-            if target_candidates and background_candidates:
-                de_target = target_candidates[0]
-                de_background = background_candidates[0]
-            elif len(all_non_input) >= 2:
-                de_target = all_non_input[0]
-                de_background = all_non_input[1]
-            else:
-                logger.warning("Could not determine target and background groups for differential expression")
-                de_target = None
-                de_background = None
-        
         # Create DESeq2 dataset
         n_cpus_val = n_cpus if n_cpus is not None else config.get("analysis", {}).get("n_cpus", 8)
         dds = create_deseq_dataset(raw_counts, meta, n_cpus=n_cpus_val)
