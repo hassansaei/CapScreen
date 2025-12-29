@@ -697,8 +697,7 @@ def execute_full_pipeline(
             config,
             output_file,
             log_file=log_file,
-            logger=logger,
-            n_cpus=threads
+            logger=logger
         )
     except Exception as e:
         logger.error(f"Counting failed for sample {sample_name}: {e}")
@@ -1032,8 +1031,7 @@ def main():
                 json_config,
                 output_file,
                 log_file=log_file,
-                logger=logger,
-                n_cpus=getattr(args, 'threads', None)
+                logger=logger
             )
         except Exception as e:
             logger.error(f"Counting failed: {e}")
