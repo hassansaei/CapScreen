@@ -603,13 +603,16 @@ def load_config(config_path=None):
         sys.exit(1)
         
     return config
-def sample_results_exist(output_dir: Path, sample_name: str) -> bool:
+def sample_results_exist(output_dir: Path, sample_name: str, config: Optional[Dict[str, Any]] = None) -> bool:
     """
     Check whether the final count table for a sample already exists.
+    Also checks for SAM file and PEAR merge output to avoid rerunning completed steps.
     """
     if not sample_name:
         return False
     sample_dir = output_dir / sample_name
+    
+    # Check for final count table - if exists, skip entire pipeline
     counts_file = sample_dir / f"{sample_name}.counts.tsv"
     if counts_file.exists() and counts_file.stat().st_size > 0:
         logger.info(
@@ -618,7 +621,31 @@ def sample_results_exist(output_dir: Path, sample_name: str) -> bool:
             counts_file
         )
         return True
-        return False
+    
+    # Check for SAM file - if exists, skip alignment step (but will still run counting)
+    sam_file = sample_dir / f"{sample_name}.sorted.sam"
+    if sam_file.exists() and sam_file.stat().st_size > 0:
+        logger.info(
+            "Detected existing SAM file for sample %s at %s. Will skip alignment step.",
+            sample_name,
+            sam_file
+        )
+        # Don't return True here - we still want to run counting if count.tsv doesn't exist
+    
+    # Check for PEAR merge output - if exists, skip PEAR step (but will still run alignment)
+    if config:
+        pear_config = config.get('pear', {})
+        pear_prefix = pear_config.get('output_prefix', 'pear')
+        pear_output = sample_dir / f"{pear_prefix}.assembled.fastq.gz"
+        if pear_output.exists() and pear_output.stat().st_size > 0:
+            logger.info(
+                "Detected existing PEAR merge output for sample %s at %s. Will skip PEAR step.",
+                sample_name,
+                pear_output
+            )
+            # Don't return True here - we still want to run alignment if SAM doesn't exist
+    
+    return False
 
 def execute_full_pipeline(
     sample_name: str,
@@ -634,21 +661,33 @@ def execute_full_pipeline(
 ) -> bool:
     """
     Run the complete pipeline (QC, alignment, counting, reporting) for a single sample.
+    Skips alignment step if SAM file already exists.
     """
-    sorted_sam = alignment_module.run_qc_and_alignment(
-        fastq1,
-        fastq2,
-        output_dir,
-        sample_name,
-        config,
-        threads,
-        cut_umi=cut_umi,
-    )
-    if not sorted_sam:
-        logger.error(f"QC/Alignment failed for sample {sample_name}.")
-        return False
-    
     sample_dir = output_dir / sample_name
+    sorted_sam = sample_dir / f"{sample_name}.sorted.sam"
+    
+    # Check if SAM file already exists - if so, skip alignment step
+    if sorted_sam.exists() and sorted_sam.stat().st_size > 0:
+        logger.info(
+            "Detected existing SAM file for sample %s at %s. Skipping alignment step.",
+            sample_name,
+            sorted_sam
+        )
+    else:
+        # Run QC and alignment steps
+        sorted_sam = alignment_module.run_qc_and_alignment(
+            fastq1,
+            fastq2,
+            output_dir,
+            sample_name,
+            config,
+            threads,
+            cut_umi=cut_umi,
+        )
+        if not sorted_sam:
+            logger.error(f"QC/Alignment failed for sample {sample_name}.")
+            return False
+    
     output_file = sample_dir / f"{sample_name}.counts.tsv"
     
     try:
@@ -845,7 +884,7 @@ def main():
                 sample_dir.mkdir(parents=True, exist_ok=True)
                 sample_log_file = sample_dir / f"{entry.sample_id}.pipeline.log"
                 logger.info(f"Starting pipeline for sample {entry.sample_id}")
-                if sample_results_exist(args.output_dir, entry.sample_id):
+                if sample_results_exist(args.output_dir, entry.sample_id, json_config):
                     skipped_existing += 1
                     append_sample_log_to_batch(
                         batch_log_path,
@@ -951,7 +990,7 @@ def main():
             )
             sys.exit(0)
         else:
-            if sample_results_exist(args.output_dir, args.sample_name):
+            if sample_results_exist(args.output_dir, args.sample_name, json_config):
                 logger.info("To re-run the pipeline for this sample, remove the existing results or move them elsewhere.")
                 sys.exit(0)
             success = execute_full_pipeline(

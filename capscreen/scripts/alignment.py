@@ -424,6 +424,7 @@ def run_qc_and_alignment(
 ) -> Optional[Path]:
     """
     Run QC and alignment steps (FASTP, PEAR, Bowtie2/Samtools).
+    Skips PEAR step if PEAR output already exists.
     Returns the path to the sorted SAM file if successful.
     """
     if not validate_config(config):
@@ -438,15 +439,27 @@ def run_qc_and_alignment(
     logger.info(f"Output directory: {sample_dir}")
     logger.info(f"Using {threads} threads")
 
-    logger.info("Step 1: Running FASTP")
-    r1_trimmed, r2_trimmed = run_fastp(fastq1, fastq2, sample_dir, config, threads)
-    if not r1_trimmed or not r2_trimmed:
-        return None
+    # Check if PEAR output already exists
+    pear_config = config.get('pear', {})
+    pear_prefix = pear_config.get('output_prefix', 'pear')
+    pear_base = sample_dir / pear_prefix
+    assembled_fastq = Path(f"{pear_base}.assembled.fastq.gz")
+    
+    if assembled_fastq.exists() and assembled_fastq.stat().st_size > 0:
+        logger.info(
+            "Detected existing PEAR merge output at %s. Skipping FASTP and PEAR steps.",
+            assembled_fastq
+        )
+    else:
+        logger.info("Step 1: Running FASTP")
+        r1_trimmed, r2_trimmed = run_fastp(fastq1, fastq2, sample_dir, config, threads)
+        if not r1_trimmed or not r2_trimmed:
+            return None
 
-    logger.info("Step 2: Running PEAR")
-    assembled_fastq = run_pear(r1_trimmed, r2_trimmed, sample_dir, config, threads)
-    if not assembled_fastq:
-        return None
+        logger.info("Step 2: Running PEAR")
+        assembled_fastq = run_pear(r1_trimmed, r2_trimmed, sample_dir, config, threads)
+        if not assembled_fastq:
+            return None
 
     if cut_umi:
         logger.info("Step 3: Running Cutadapt-based UMI trimming")

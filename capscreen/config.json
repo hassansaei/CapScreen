@@ -35,7 +35,7 @@
         "output_prefix": "aligned"
     },
     "samtools": {
-        "sort_memory": "16G",
+        "sort_memory": "2G",
         "compression_level": 6
     },
     "flanking_sequences": {
