@@ -19,6 +19,7 @@ RUN apt-get update && \
         zip \
         curl \
         samtools \
+        pigz \
         && rm -rf /var/lib/apt/lists/*
 
 # Install mamba for faster conda package installation

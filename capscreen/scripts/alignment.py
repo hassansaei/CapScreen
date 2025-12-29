@@ -6,8 +6,11 @@ import logging
 import os
 import shlex
 import subprocess
+import concurrent.futures
+import multiprocessing as mp
+from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 logger = logging.getLogger("FastQProcessor")
 
@@ -129,11 +132,18 @@ def run_pear(
             f"{pear_base}.unassembled.reverse.fastq"
         ]
 
-        for file_path in files_to_compress:
+        # Compress files in parallel using pigz
+        def compress_file(file_path: str) -> bool:
             path_obj = Path(file_path)
             if path_obj.exists():
-                gzip_cmd = ["gzip", "-f", file_path]
-                if not run_command(gzip_cmd, f"Gzip {file_path}"):
+                pigz_cmd = ["pigz", "-p", str(threads), "-f", file_path]
+                return run_command(pigz_cmd, f"Pigz {file_path}")
+            return True
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(files_to_compress), threads)) as executor:
+            results = list(executor.map(compress_file, files_to_compress))
+            for file_path, success in zip(files_to_compress, results):
+                if not success:
                     logger.warning(f"Failed to compress {file_path}")
 
         assembled_fastq_gz = f"{pear_base}.assembled.fastq.gz"
@@ -195,51 +205,127 @@ def run_cutadapt_umi(
     # Re-add flanks to each read so that downstream steps (alignment + counting)
     # still see the flanking regions around the variable region.
     restored_fastq = sample_dir / "pear.trimmed_with_flanks.fastq"
+    
+    # Pre-compute quality strings once (optimization)
+    flank_5p_qual = "I" * len(flank_5p)
+    flank_3p_qual = "I" * len(flank_3p)
+    
+    def _process_fastq_chunk(chunk_lines: List[str], flank_5p: str, flank_3p: str, 
+                             flank_5p_qual: str, flank_3p_qual: str) -> str:
+        """
+        Worker function to process a chunk of FASTQ lines and restore flanks.
+        Returns the processed FASTQ content as a string.
+        """
+        output_lines = []
+        i = 0
+        while i + 3 < len(chunk_lines):
+            header = chunk_lines[i]
+            seq = chunk_lines[i + 1]
+            plus = chunk_lines[i + 2]
+            qual = chunk_lines[i + 3]
+            
+            if not (header and seq and plus and qual):
+                break
+            
+            # Strip newlines efficiently
+            seq_clean = seq.rstrip("\n\r")
+            qual_clean = qual.rstrip("\n\r")
+            
+            # Reconstruct sequence and quality
+            new_seq = f"{flank_5p}{seq_clean}{flank_3p}"
+            new_qual = f"{flank_5p_qual}{qual_clean}{flank_3p_qual}"
+            
+            # Build output lines
+            output_lines.append(header)
+            output_lines.append(new_seq + "\n")
+            output_lines.append(plus)
+            output_lines.append(new_qual + "\n")
+            
+            i += 4
+        
+        return "".join(output_lines)
+    
     try:
         logger.info("Re-attaching flanking sequences to Cutadapt-trimmed reads")
-        with trimmed_fastq.open("r") as in_f, restored_fastq.open("w") as out_f:
-            while True:
-                header = in_f.readline()
-                if not header:
-                    break
-                seq = in_f.readline()
-                plus = in_f.readline()
-                qual = in_f.readline()
-
-                if not (header and seq and plus and qual):
-                    logger.warning(
-                        "Encountered incomplete FASTQ record while restoring flanks; "
-                        "stopping early."
-                    )
-                    break
-
-                seq = seq.rstrip("\n\r")
-                qual = qual.rstrip("\n\r")
-
-                new_seq = f"{flank_5p}{seq}{flank_3p}"
-                flank_5p_qual = "I" * len(flank_5p)
-                flank_3p_qual = "I" * len(flank_3p)
-                new_qual = f"{flank_5p_qual}{qual}{flank_3p_qual}"
-
-                out_f.write(header)
-                out_f.write(new_seq + "\n")
-                out_f.write(plus)
-                out_f.write(new_qual + "\n")
+        
+        # Read all lines into memory for chunking
+        with trimmed_fastq.open("r", buffering=8192*4) as in_f:
+            all_lines = in_f.readlines()
+        
+        total_reads = len(all_lines) // 4
+        if logger:
+            logger.info(f"Processing {total_reads:,} reads for flank restoration")
+        
+        # Determine if we should use parallel processing
+        use_parallel = threads > 1 and total_reads > 10000
+        
+        if use_parallel:
+            # Chunk the lines for parallel processing (~10k reads per chunk)
+            # Aim for ~10k-50k reads per chunk
+            reads_per_chunk = max(10000, total_reads // (threads * 2))
+            chunk_size = reads_per_chunk * 4  # 4 lines per read
+            chunks = [all_lines[i:i + chunk_size] for i in range(0, len(all_lines), chunk_size)]
+            
+            if logger:
+                logger.info(f"Processing {len(chunks)} chunk(s) in parallel with {threads} thread(s)")
+            
+            # Process chunks in parallel
+            worker_func = partial(_process_fastq_chunk, 
+                                 flank_5p=flank_5p, 
+                                 flank_3p=flank_3p,
+                                 flank_5p_qual=flank_5p_qual,
+                                 flank_3p_qual=flank_3p_qual)
+            
+            with mp.Pool(processes=min(threads, len(chunks))) as pool:
+                chunk_results = pool.map(worker_func, chunks)
+            
+            # Write all results with buffering
+            with restored_fastq.open("w", buffering=8192*16) as out_f:
+                for chunk_result in chunk_results:
+                    out_f.write(chunk_result)
+        else:
+            # Single-threaded processing with buffering
+            if logger:
+                logger.info("Using single-threaded processing with buffering")
+            
+            with restored_fastq.open("w", buffering=8192*16) as out_f:
+                i = 0
+                while i + 3 < len(all_lines):
+                    header = all_lines[i]
+                    seq = all_lines[i + 1]
+                    plus = all_lines[i + 2]
+                    qual = all_lines[i + 3]
+                    
+                    if not (header and seq and plus and qual):
+                        break
+                    
+                    seq_clean = seq.rstrip("\n\r")
+                    qual_clean = qual.rstrip("\n\r")
+                    
+                    new_seq = f"{flank_5p}{seq_clean}{flank_3p}"
+                    new_qual = f"{flank_5p_qual}{qual_clean}{flank_3p_qual}"
+                    
+                    out_f.write(header)
+                    out_f.write(new_seq + "\n")
+                    out_f.write(plus)
+                    out_f.write(new_qual + "\n")
+                    
+                    i += 4
 
     except Exception as exc:
         logger.error(f"Failed to restore flanks on Cutadapt-trimmed reads: {exc}", exc_info=True)
         return None
 
-    # Compress the trimmed FASTQ file to save space
+    # Compress the trimmed FASTQ file to save space using pigz
     if trimmed_fastq.exists():
-        gzip_cmd = ["gzip", "-f", str(trimmed_fastq)]
-        if not run_command(gzip_cmd, f"Gzip {trimmed_fastq}"):
+        pigz_cmd = ["pigz", "-p", str(threads), "-f", str(trimmed_fastq)]
+        if not run_command(pigz_cmd, f"Pigz {trimmed_fastq}"):
             logger.warning(f"Failed to compress {trimmed_fastq}")
 
-    # Compress the final restored FASTQ to save space and match other steps
+    # Compress the final restored FASTQ to save space and match other steps using pigz
     restored_fastq_gz = f"{restored_fastq}.gz"
-    gzip_cmd = ["gzip", "-f", str(restored_fastq)]
-    if not run_command(gzip_cmd, f"Gzip {restored_fastq}"):
+    pigz_cmd = ["pigz", "-p", str(threads), "-f", str(restored_fastq)]
+    if not run_command(pigz_cmd, f"Pigz {restored_fastq}"):
         logger.warning(f"Failed to compress {restored_fastq}; using uncompressed file instead.")
         return restored_fastq
 
