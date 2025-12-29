@@ -8,6 +8,9 @@ from Bio import BiopythonWarning
 from typing import Dict, Tuple, Optional, List, Any
 import sys
 import warnings
+import multiprocessing as mp
+from functools import partial
+import os
 
 def setup_logging(output_dir: Path = None, sample_name: str = None, log_file: Path = None) -> logging.Logger:
     """
@@ -89,34 +92,21 @@ def translate(seq: str) -> str:
     except Exception:
         return None
 
-def process_sam_file(sam_file: Path, config: Dict, logger: Optional[logging.Logger] = None) -> Tuple[pd.DataFrame, Dict[str, int]]:
+def _process_chunk_worker(chunk_lines: List[str], flank_5p: str, flank_3p: str) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
-    Process SAM file and extract variable regions.
+    Worker function to process a chunk of SAM file lines.
+    This function is called by multiprocessing workers.
     
     Args:
-        sam_file (Path): Path to SAM file
-        config (Dict): Configuration dictionary containing flanking sequences
+        chunk_lines: List of SAM file lines to process
+        flank_5p: 5' flanking sequence
+        flank_3p: 3' flanking sequence
         
     Returns:
-        Tuple[pd.DataFrame, Dict[str, int]]: 
-            - DataFrame with processed sequences
-            - Dictionary with processing statistics
+        Tuple of (processed_rows, stats_dict)
     """
-    # Get flanking sequences from config
-    flank_5p = config['flanking_sequences']['flank_5p']
-    flank_3p = config['flanking_sequences']['flank_3p']
-    
-    # Read SAM file and extract mapped reads
-    total_reads = 0
-    unmapped_reads = 0
-    mapped_reads = 0
-    reads_with_flanks = 0
-    valid_peptides = 0
-    processed_rows: List[Dict[str, Any]] = []
-    progress_interval = 500_000
-    
     import re
-
+    
     def parse_cigar(cigar: str) -> Dict[str, int]:
         stats = {
             'matches': 0,
@@ -146,46 +136,154 @@ def process_sam_file(sam_file: Path, config: Dict, logger: Optional[logging.Logg
                 stats['padding'] += length
         return stats
     
-    with open(sam_file, "r") as f:
-        for line_number, line in enumerate(f, start=1):
-            if line.startswith("@"):
-                continue
-            total_reads += 1
-            parts = line.rstrip("\n").split("\t")
-            flag = int(parts[1])
-            if (flag & 4) != 0:
-                unmapped_reads += 1
-                continue
-            
-            mapped_reads += 1
-            seq = parts[9]
-            variable_seq = extract_variable_region(seq, flank_5p, flank_3p)
-            if variable_seq is None:
-                continue
-            reads_with_flanks += 1
-            
-            peptide = translate(variable_seq)
-            if peptide is None:
-                continue
-            valid_peptides += 1
-            
-            cigar_stats = parse_cigar(parts[5])
-            processed_rows.append({
-                'peptide': peptide,
-                'variable_seq': variable_seq,
-                'insertions': cigar_stats['insertions'],
-                'deletions': cigar_stats['deletions'],
-                'matches': cigar_stats['matches']
-            })
-            
-            if logger and total_reads % progress_interval == 0:
-                logger.info(
-                    "Processed %s reads (%s mapped, %s valid peptides) ...",
-                    f"{total_reads:,}",
-                    f"{mapped_reads:,}",
-                    f"{valid_peptides:,}"
-                )
+    total_reads = 0
+    unmapped_reads = 0
+    mapped_reads = 0
+    reads_with_flanks = 0
+    valid_peptides = 0
+    processed_rows: List[Dict[str, Any]] = []
     
+    for line in chunk_lines:
+        if line.startswith("@"):
+            continue
+        total_reads += 1
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 10:
+            continue
+        flag = int(parts[1])
+        if (flag & 4) != 0:
+            unmapped_reads += 1
+            continue
+        
+        mapped_reads += 1
+        seq = parts[9]
+        variable_seq = extract_variable_region(seq, flank_5p, flank_3p)
+        if variable_seq is None:
+            continue
+        reads_with_flanks += 1
+        
+        peptide = translate(variable_seq)
+        if peptide is None:
+            continue
+        valid_peptides += 1
+        
+        cigar_stats = parse_cigar(parts[5])
+        processed_rows.append({
+            'peptide': peptide,
+            'variable_seq': variable_seq,
+            'insertions': cigar_stats['insertions'],
+            'deletions': cigar_stats['deletions'],
+            'matches': cigar_stats['matches']
+        })
+    
+    stats = {
+        'total_reads': total_reads,
+        'mapped_reads': mapped_reads,
+        'unmapped_reads': unmapped_reads,
+        'reads_with_flanks': reads_with_flanks,
+        'valid_peptides': valid_peptides
+    }
+    
+    return processed_rows, stats
+
+def process_sam_file(sam_file: Path, config: Dict, logger: Optional[logging.Logger] = None, n_cpus: Optional[int] = None) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """
+    Process SAM file and extract variable regions using multiprocessing.
+    
+    Args:
+        sam_file (Path): Path to SAM file
+        config (Dict): Configuration dictionary containing flanking sequences
+        logger (Optional[logging.Logger]): Logger instance
+        n_cpus (Optional[int]): Number of CPUs to use. If None, uses all available CPUs.
+        
+    Returns:
+        Tuple[pd.DataFrame, Dict[str, int]]: 
+            - DataFrame with processed sequences
+            - Dictionary with processing statistics
+    """
+    # Get flanking sequences from config
+    flank_5p = config['flanking_sequences']['flank_5p']
+    flank_3p = config['flanking_sequences']['flank_3p']
+    
+    # Determine number of CPUs to use
+    if n_cpus is None:
+        n_cpus = max(1, os.cpu_count() or 1)
+    else:
+        n_cpus = max(1, min(n_cpus, os.cpu_count() or 1))
+    
+    # Read all non-header lines into memory (chunked for large files)
+    if logger:
+        logger.info(f"Reading SAM file with {n_cpus} CPU(s)...")
+    all_lines = []
+    header_lines = []
+    
+    with open(sam_file, "r") as f:
+        for line in f:
+            if line.startswith("@"):
+                header_lines.append(line)
+            else:
+                all_lines.append(line)
+    
+    total_lines = len(all_lines)
+    if logger:
+        logger.info(f"Total reads to process: {total_lines:,}")
+    
+    # Determine chunk size (aim for ~100k-500k reads per chunk)
+    chunk_size = max(100_000, total_lines // (n_cpus * 4))
+    chunks = [all_lines[i:i + chunk_size] for i in range(0, len(all_lines), chunk_size)]
+    num_chunks = len(chunks)
+    
+    if logger:
+        logger.info(f"Processing {num_chunks} chunk(s) with ~{chunk_size:,} reads per chunk")
+    
+    # Create worker function with fixed parameters
+    worker_func = partial(_process_chunk_worker, flank_5p=flank_5p, flank_3p=flank_3p)
+    
+    # Process chunks in parallel
+    processed_rows: List[Dict[str, Any]] = []
+    total_reads = 0
+    unmapped_reads = 0
+    mapped_reads = 0
+    reads_with_flanks = 0
+    valid_peptides = 0
+    
+    if n_cpus > 1 and num_chunks > 1:
+        # Use multiprocessing
+        with mp.Pool(processes=n_cpus) as pool:
+            results = pool.map(worker_func, chunks)
+        
+        # Merge results from all chunks
+        for chunk_rows, chunk_stats in results:
+            processed_rows.extend(chunk_rows)
+            total_reads += chunk_stats['total_reads']
+            unmapped_reads += chunk_stats['unmapped_reads']
+            mapped_reads += chunk_stats['mapped_reads']
+            reads_with_flanks += chunk_stats['reads_with_flanks']
+            valid_peptides += chunk_stats['valid_peptides']
+            
+            if logger:
+                logger.info(
+                    "Processed chunk: %s reads (%s mapped, %s valid peptides)",
+                    f"{chunk_stats['total_reads']:,}",
+                    f"{chunk_stats['mapped_reads']:,}",
+                    f"{chunk_stats['valid_peptides']:,}"
+                )
+    else:
+        # Single-threaded fallback
+        if logger:
+            logger.info("Using single-threaded processing")
+        chunk_rows, chunk_stats = worker_func(chunks[0])
+        processed_rows.extend(chunk_rows)
+        total_reads = chunk_stats['total_reads']
+        unmapped_reads = chunk_stats['unmapped_reads']
+        mapped_reads = chunk_stats['mapped_reads']
+        reads_with_flanks = chunk_stats['reads_with_flanks']
+        valid_peptides = chunk_stats['valid_peptides']
+    
+    if logger:
+        logger.info(f"Total processed: {total_reads:,} reads, {mapped_reads:,} mapped, {valid_peptides:,} valid peptides")
+    
+    # Create DataFrame from all processed rows
     df = pd.DataFrame(processed_rows)
     
     if df.empty:
@@ -280,11 +378,21 @@ def main(
     config: Dict,
     output_file: Path,
     log_file: Path = None,
-    logger: Optional[logging.Logger] = None
+    logger: Optional[logging.Logger] = None,
+    n_cpus: Optional[int] = None
 ) -> None:
     """
     Main function to process SAM file and generate counts.
     Accepts an optional log_file argument for unified logging.
+    
+    Args:
+        sam_file: Path to SAM file
+        reference_file: Path to reference library file
+        config: Configuration dictionary
+        output_file: Path to output file
+        log_file: Optional log file path
+        logger: Optional logger instance
+        n_cpus: Number of CPUs to use for parallel processing. If None, uses all available CPUs.
     """
     try:
         # Set up logging
@@ -301,8 +409,8 @@ def main(
         logger.info(f"Output file: {output_file}")
         logger.info("Step 1/4: Processing SAM file and extracting variable regions...")
         
-        # Process SAM file
-        df, sam_stats = process_sam_file(sam_file, config, logger=logger)
+        # Process SAM file with multiprocessing
+        df, sam_stats = process_sam_file(sam_file, config, logger=logger, n_cpus=n_cpus)
         logger.info("Step 1/4 complete.")
         
         # Log SAM processing statistics
