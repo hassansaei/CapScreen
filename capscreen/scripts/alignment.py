@@ -230,6 +230,12 @@ def run_cutadapt_umi(
         logger.error(f"Failed to restore flanks on Cutadapt-trimmed reads: {exc}", exc_info=True)
         return None
 
+    # Compress the trimmed FASTQ file to save space
+    if trimmed_fastq.exists():
+        gzip_cmd = ["gzip", "-f", str(trimmed_fastq)]
+        if not run_command(gzip_cmd, f"Gzip {trimmed_fastq}"):
+            logger.warning(f"Failed to compress {trimmed_fastq}")
+
     # Compress the final restored FASTQ to save space and match other steps
     restored_fastq_gz = f"{restored_fastq}.gz"
     gzip_cmd = ["gzip", "-f", str(restored_fastq)]
@@ -470,6 +476,7 @@ def cleanup_intermediate_files(sample_dir: Path, sample_name: Optional[str] = No
         sample_dir / 'pear.unassembled.forward.fastq.gz',
         sample_dir / 'pear.unassembled.reverse.fastq.gz',
         sample_dir / 'pear.trimmed.fastq',
+        sample_dir / 'pear.trimmed.fastq.gz',
         sample_dir / 'pear.trimmed_with_flanks.fastq',
         sample_dir / 'pear.trimmed_with_flanks.fastq.gz',
     ]
