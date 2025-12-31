@@ -691,6 +691,10 @@ def execute_full_pipeline(
     
     output_file = sample_dir / f"{sample_name}.counts.tsv"
     
+    # Use threads from parameter if provided, otherwise use config value
+    # count_module.main will handle config fallback if n_threads is None
+    n_threads = threads if threads is not None else config.get('threads')
+    
     try:
         count_module.main(
             sorted_sam,
@@ -698,7 +702,8 @@ def execute_full_pipeline(
             config,
             output_file,
             log_file=log_file,
-            logger=logger
+            logger=logger,
+            n_threads=n_threads
         )
     except Exception as e:
         logger.error(f"Counting failed for sample {sample_name}: {e}")
@@ -952,9 +957,12 @@ def main():
                         logger.warning("QC analysis completed with warnings or errors, continuing with statistical analysis...")
                     
                     logger.info("Starting statistical analysis...")
-                    # Create Sample_info.csv for stat analysis
-                    sample_info_path = args.output_dir / "Sample_info.csv"
-                    if create_sample_info_csv(sample_entries, sample_info_path):
+                    # Use the original Sample_info.csv file provided via --sample-info (preserve all columns)
+                    # Do NOT create a new file that would overwrite the original
+                    if args.sample_info and args.sample_info.exists():
+                        sample_info_path = args.sample_info
+                        logger.info(f"Using original Sample_info.csv at {sample_info_path} (all columns preserved)")
+                        
                         # Run statistical analysis using stat environment
                         try:
                             success = run_statistical_analysis_with_stat_env(
@@ -975,7 +983,7 @@ def main():
                             logger.error(f"Statistical analysis failed: {e}", exc_info=True)
                             stat_success = False
                     else:
-                        logger.error("Failed to create Sample_info.csv for statistical analysis.")
+                        logger.error("Original Sample_info.csv file not found. Cannot proceed with statistical analysis.")
                         stat_success = False
             
             # Determine statistical analysis status for summary
@@ -1033,6 +1041,8 @@ def main():
     elif args.command == "count":
         # Use provided output file or default
         output_file = args.output if args.output else args.sam_file.parent / f"{args.sam_file.stem}.counts.tsv"
+        # Use --threads if provided, otherwise use config value (count_module.main will handle config fallback)
+        n_threads = args.threads if args.threads is not None else json_config.get('threads')
         try:
             count_module.main(
                 args.sam_file,
@@ -1040,7 +1050,8 @@ def main():
                 json_config,
                 output_file,
                 log_file=log_file,
-                logger=logger
+                logger=logger,
+                n_threads=n_threads
             )
         except Exception as e:
             logger.error(f"Counting failed: {e}")

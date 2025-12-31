@@ -16,6 +16,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for saving plots
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
@@ -254,73 +256,112 @@ def plot_assembled_reads(df: pd.DataFrame, output_file: Path):
     """Create bar plot for assembled reads by sample."""
     logger.info("Creating assembled reads plot...")
     
-    # Sort samples by assembled reads
-    df_sorted = df.sort_values(by='assembled_reads', ascending=False)
-    
-    plt.figure(figsize=(8, 6), dpi=300)
-    sns.barplot(data=df_sorted, x='assembled_reads', y='sample', hue='sample', palette='viridis', legend=False)
-    plt.title('Assembled Reads by Sample')
-    plt.xlabel('Assembled Reads')
-    plt.ylabel('Sample')
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    logger.info(f"Saved assembled reads plot to {output_file}")
+    try:
+        # Filter out rows with missing assembled_reads
+        df_plot = df[df['assembled_reads'].notna()].copy()
+        if len(df_plot) == 0:
+            logger.warning("No data with assembled_reads values, skipping plot")
+            return
+        
+        # Sort samples by assembled reads
+        df_sorted = df_plot.sort_values(by='assembled_reads', ascending=False)
+        
+        plt.figure(figsize=(8, 6), dpi=300)
+        ax = sns.barplot(data=df_sorted, x='assembled_reads', y='sample', palette='viridis')
+        ax.legend_.remove() if ax.legend_ else None
+        plt.title('Assembled Reads by Sample')
+        plt.xlabel('Assembled Reads')
+        plt.ylabel('Sample')
+        plt.tight_layout()
+        plt.savefig(str(output_file), dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"Saved assembled reads plot to {output_file}")
+    except Exception as e:
+        logger.error(f"Failed to create assembled reads plot: {e}", exc_info=True)
+        if plt.get_fignums():
+            plt.close('all')
+        raise
 
 
 def plot_q30_rate(df: pd.DataFrame, output_file: Path):
     """Create bar plot for Q30 rate by sample with 95% threshold line."""
     logger.info("Creating Q30 rate plot...")
     
-    # Sort samples by assembled reads
-    df_sorted = df.sort_values(by='assembled_reads', ascending=False)
-    
-    plt.figure(figsize=(8, 6), dpi=300)
-    sns.barplot(data=df_sorted, x='q30_rate_percent', y='sample', hue='sample', palette='viridis', legend=False)
-    plt.title('Q30 rate by sample')
-    plt.xlabel('Q30 rate (%)')
-    plt.ylabel('Samples')
-    plt.axvline(
-        x=95,
-        linestyle="--",
-        color="red",
-        linewidth=1,
-        label="95%"
-    )
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    logger.info(f"Saved Q30 rate plot to {output_file}")
+    try:
+        # Filter out rows with missing q30_rate_percent
+        df_plot = df[df['q30_rate_percent'].notna()].copy()
+        if len(df_plot) == 0:
+            logger.warning("No data with q30_rate_percent values, skipping plot")
+            return
+        
+        # Sort samples by assembled reads
+        df_sorted = df_plot.sort_values(by='assembled_reads', ascending=False)
+        
+        plt.figure(figsize=(8, 6), dpi=300)
+        ax = sns.barplot(data=df_sorted, x='q30_rate_percent', y='sample', palette='viridis')
+        ax.legend_.remove() if ax.legend_ else None
+        plt.title('Q30 rate by sample')
+        plt.xlabel('Q30 rate (%)')
+        plt.ylabel('Samples')
+        plt.axvline(
+            x=95,
+            linestyle="--",
+            color="red",
+            linewidth=1,
+            label="95%"
+        )
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(str(output_file), dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"Saved Q30 rate plot to {output_file}")
+    except Exception as e:
+        logger.error(f"Failed to create Q30 rate plot: {e}", exc_info=True)
+        if plt.get_fignums():
+            plt.close('all')
+        raise
 
 
 def plot_assigned_sequences(df: pd.DataFrame, output_file: Path):
     """Create bar plot for percentage of reads assigned to valid peptides by sample with 60% threshold line."""
     logger.info("Creating assigned sequences plot...")
     
-    # Sort samples by assigned sequences percentage
-    df_sorted = df.sort_values(by='assigned_sequences_to_valid_peptides', ascending=False)
-    
-    plt.figure(figsize=(8, 6), dpi=300)
-    sns.barplot(data=df_sorted, x='assigned_sequences_to_valid_peptides', y='sample', hue='sample', palette='viridis', legend=False)
-    plt.title('Percentage of reads assigned to valid peptides by sample')
-    plt.xlabel('Reads assigned to valid peptides (%)')
-    plt.ylabel('Samples')
-    plt.axvline(
-        x=60,
-        linestyle="--",
-        color="red",
-        linewidth=1,
-        label="60%"
-    )
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    logger.info(f"Saved assigned sequences plot to {output_file}")
+    try:
+        # Filter out rows with missing assigned_sequences_to_valid_peptides
+        df_plot = df[df['assigned_sequences_to_valid_peptides'].notna()].copy()
+        if len(df_plot) == 0:
+            logger.warning("No data with assigned_sequences_to_valid_peptides values, skipping plot")
+            return
+        
+        # Sort samples by assigned sequences percentage
+        df_sorted = df_plot.sort_values(by='assigned_sequences_to_valid_peptides', ascending=False)
+        
+        plt.figure(figsize=(8, 6), dpi=300)
+        ax = sns.barplot(data=df_sorted, x='assigned_sequences_to_valid_peptides', y='sample', palette='viridis')
+        ax.legend_.remove() if ax.legend_ else None
+        plt.title('Percentage of reads assigned to valid peptides by sample')
+        plt.xlabel('Reads assigned to valid peptides (%)')
+        plt.ylabel('Samples')
+        plt.axvline(
+            x=60,
+            linestyle="--",
+            color="red",
+            linewidth=1,
+            label="60%"
+        )
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(str(output_file), dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"Saved assigned sequences plot to {output_file}")
+    except Exception as e:
+        logger.error(f"Failed to create assigned sequences plot: {e}", exc_info=True)
+        if plt.get_fignums():
+            plt.close('all')
+        raise
 
 
 def run_qc_analysis(reports_dir: Path, output_dir: Path, logger_instance: Optional[logging.Logger] = None) -> bool:
@@ -360,9 +401,20 @@ def run_qc_analysis(reports_dir: Path, output_dir: Path, logger_instance: Option
         logger.info(f"Saved QC summary to {qc_summary_file}")
         
         # Create plots
-        plot_assembled_reads(df, output_dir / "qc_assembled_reads.png")
-        plot_q30_rate(df, output_dir / "qc_q30_rate.png")
-        plot_assigned_sequences(df, output_dir / "qc_assigned_sequences.png")
+        try:
+            plot_assembled_reads(df, output_dir / "qc_assembled_reads.png")
+        except Exception as e:
+            logger.error(f"Failed to create assembled reads plot: {e}", exc_info=True)
+        
+        try:
+            plot_q30_rate(df, output_dir / "qc_q30_rate.png")
+        except Exception as e:
+            logger.error(f"Failed to create Q30 rate plot: {e}", exc_info=True)
+        
+        try:
+            plot_assigned_sequences(df, output_dir / "qc_assigned_sequences.png")
+        except Exception as e:
+            logger.error(f"Failed to create assigned sequences plot: {e}", exc_info=True)
         
         logger.info("QC analysis completed successfully")
         return True

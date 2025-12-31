@@ -11,6 +11,7 @@ import warnings
 import os
 import tempfile
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def setup_logging(output_dir: Path = None, sample_name: str = None, log_file: Path = None) -> logging.Logger:
     """
@@ -92,7 +93,7 @@ def translate(seq: str) -> str:
     except Exception:
         return None
 
-def process_sam_file(sam_file: Path, config: Dict, logger: Optional[logging.Logger] = None) -> Tuple[pd.DataFrame, Dict[str, int]]:
+def process_sam_file(sam_file: Path, config: Dict, n_threads: Optional[int] = None, logger: Optional[logging.Logger] = None) -> Tuple[pd.DataFrame, Dict[str, int]]:
     """
     Process SAM file and extract variable regions using memory-efficient chunked processing.
     
@@ -101,6 +102,7 @@ def process_sam_file(sam_file: Path, config: Dict, logger: Optional[logging.Logg
     Args:
         sam_file (Path): Path to SAM file
         config (Dict): Configuration dictionary containing flanking sequences
+        n_threads (Optional[int]): Not used (kept for API compatibility)
         logger (Optional[logging.Logger]): Logger instance
         
     Returns:
@@ -255,36 +257,12 @@ def process_sam_file(sam_file: Path, config: Dict, logger: Optional[logging.Logg
                 )
             processed_rows = []  # Clear memory
         
-        # Combine all chunks into final DataFrame
+        # Combine all chunks into final DataFrame (sequential reading)
         if logger:
             logger.info("Reading %s chunk file(s) and combining into DataFrame...", len(chunk_files))
         
         if chunk_files:
-            # Determine file format from first chunk
-            use_parquet = chunk_files[0].suffix == '.parquet'
-            
-            # Read chunks sequentially
-            if len(chunk_files) <= 50:
-                # Small number of chunks: read all at once
-                if use_parquet:
-                    df = pd.concat([pd.read_parquet(f) for f in chunk_files], ignore_index=True)
-                else:
-                    df = pd.concat([pd.read_csv(f, compression='gzip') for f in chunk_files], ignore_index=True)
-            else:
-                # Large number of chunks: read in batches
-                batch_size = 50
-                df_parts = []
-                for i in range(0, len(chunk_files), batch_size):
-                    batch = chunk_files[i:i + batch_size]
-                    if use_parquet:
-                        batch_df = pd.concat([pd.read_parquet(f) for f in batch], ignore_index=True)
-                    else:
-                        batch_df = pd.concat([pd.read_csv(f, compression='gzip') for f in batch], ignore_index=True)
-                    df_parts.append(batch_df)
-                    if logger and (i // batch_size + 1) % 10 == 0:
-                        logger.debug("Read %s/%s chunk batches...", (i // batch_size + 1), (len(chunk_files) // batch_size + 1))
-                df = pd.concat(df_parts, ignore_index=True)
-            
+            df = _combine_chunks_sequential(chunk_files, logger)
             if logger:
                 logger.info("Successfully combined chunks into DataFrame with %s rows", f"{len(df):,}")
         else:
@@ -332,6 +310,153 @@ def process_sam_file(sam_file: Path, config: Dict, logger: Optional[logging.Logg
     }
     
     return df, stats
+
+
+def _read_chunk_file(chunk_file: Path) -> pd.DataFrame:
+    """
+    Read a single chunk file (Parquet or CSV).
+    
+    Args:
+        chunk_file: Path to chunk file
+        
+    Returns:
+        DataFrame with chunk data
+        
+    Raises:
+        Exception: If file cannot be read
+    """
+    try:
+        if chunk_file.suffix == '.parquet':
+            return pd.read_parquet(chunk_file)
+        else:
+            return pd.read_csv(chunk_file, compression='gzip')
+    except Exception as e:
+        raise Exception(f"Error reading chunk file {chunk_file.name}: {e}") from e
+
+
+def _combine_chunks_parallel(chunk_files: List[Path], n_threads: int, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
+    """
+    Read and combine chunks in parallel using threading.
+    
+    This function uses ThreadPoolExecutor to read multiple chunk files concurrently,
+    which is effective for I/O-bound operations like reading from disk.
+    
+    Args:
+        chunk_files: List of chunk file paths
+        n_threads: Number of threads to use for parallel reading (not currently used)
+        logger: Optional logger instance
+        
+    Returns:
+        Combined DataFrame with all chunks
+        
+    Raises:
+        Exception: If any chunk file cannot be read
+    """
+    if not chunk_files:
+        return pd.DataFrame(columns=['peptide', 'variable_seq', 'insertions', 'deletions', 'matches'])
+    
+    if logger:
+        logger.info(f"Reading {len(chunk_files)} chunks in parallel using {n_threads} threads...")
+    
+    df_parts = []
+    errors = []
+    
+    try:
+        with ThreadPoolExecutor(max_workers=n_threads) as executor:
+            # Submit all read tasks
+            future_to_file = {executor.submit(_read_chunk_file, f): f for f in chunk_files}
+            
+            # Collect results as they complete
+            completed = 0
+            for future in as_completed(future_to_file):
+                chunk_file = future_to_file[future]
+                completed += 1
+                try:
+                    df_chunk = future.result()
+                    df_parts.append(df_chunk)
+                    if logger and completed % max(1, len(chunk_files) // 10) == 0:
+                        logger.debug(
+                            "Read %s/%s chunks (%s rows in this chunk)...",
+                            completed,
+                            len(chunk_files),
+                            f"{len(df_chunk):,}"
+                        )
+                except Exception as e:
+                    error_msg = f"Error reading chunk {chunk_file.name}: {e}"
+                    errors.append(error_msg)
+                    if logger:
+                        logger.error(error_msg)
+                    # Continue processing other chunks, but track the error
+    
+    except Exception as e:
+        if logger:
+            logger.error(f"Fatal error in parallel chunk reading: {e}", exc_info=True)
+        raise
+    
+    # Check if we had any errors
+    if errors:
+        error_summary = f"Failed to read {len(errors)} chunk(s) out of {len(chunk_files)}"
+        if logger:
+            logger.error(error_summary)
+        raise Exception(f"{error_summary}. First error: {errors[0]}")
+    
+    # Combine all chunks
+    if df_parts:
+        if logger:
+            logger.debug(f"Combining {len(df_parts)} chunk DataFrames...")
+        df = pd.concat(df_parts, ignore_index=True)
+        if logger:
+            logger.info(f"Successfully combined {len(df_parts)} chunks into DataFrame with {len(df):,} rows")
+        return df
+    else:
+        if logger:
+            logger.warning("No chunks were successfully read")
+        return pd.DataFrame(columns=['peptide', 'variable_seq', 'insertions', 'deletions', 'matches'])
+
+
+def _combine_chunks_sequential(chunk_files: List[Path], logger: Optional[logging.Logger] = None) -> pd.DataFrame:
+    """
+    Read and combine chunks sequentially (original behavior).
+    
+    This is the fallback method when parallel reading is not requested or not available.
+    
+    Args:
+        chunk_files: List of chunk file paths
+        logger: Optional logger instance
+        
+    Returns:
+        Combined DataFrame with all chunks
+    """
+    if not chunk_files:
+        return pd.DataFrame(columns=['peptide', 'variable_seq', 'insertions', 'deletions', 'matches'])
+    
+    # Determine file format from first chunk
+    use_parquet = chunk_files[0].suffix == '.parquet'
+    
+    # Read chunks sequentially
+    if len(chunk_files) <= 50:
+        # Small number of chunks: read all at once
+        if use_parquet:
+            df = pd.concat([pd.read_parquet(f) for f in chunk_files], ignore_index=True)
+        else:
+            df = pd.concat([pd.read_csv(f, compression='gzip') for f in chunk_files], ignore_index=True)
+    else:
+        # Large number of chunks: read in batches
+        batch_size = 50
+        df_parts = []
+        for i in range(0, len(chunk_files), batch_size):
+            batch = chunk_files[i:i + batch_size]
+            if use_parquet:
+                batch_df = pd.concat([pd.read_parquet(f) for f in batch], ignore_index=True)
+            else:
+                batch_df = pd.concat([pd.read_csv(f, compression='gzip') for f in batch], ignore_index=True)
+            df_parts.append(batch_df)
+            if logger and (i // batch_size + 1) % 10 == 0:
+                logger.debug("Read %s/%s chunk batches...", (i // batch_size + 1), (len(chunk_files) // batch_size + 1))
+        df = pd.concat(df_parts, ignore_index=True)
+    
+    return df
+
 
 def merge_with_reference(df: pd.DataFrame, reference_file: Path) -> Tuple[pd.DataFrame, Dict[str, int]]:
     """
@@ -396,7 +521,8 @@ def main(
     config: Dict,
     output_file: Path,
     log_file: Path = None,
-    logger: Optional[logging.Logger] = None
+    logger: Optional[logging.Logger] = None,
+    n_threads: Optional[int] = None
 ) -> None:
     """
     Main function to process SAM file and generate counts.
@@ -409,6 +535,7 @@ def main(
         output_file: Path to output file
         log_file: Optional log file path
         logger: Optional logger instance
+        n_threads: Not used (kept for API compatibility). Threads are read from config['threads'] if available.
     """
     try:
         # Set up logging
@@ -419,6 +546,12 @@ def main(
         else:
             logger.info(f"Using existing logger; count output will be appended to {log_file if log_file else 'configured handlers'}.")
         
+        # Determine number of threads: use n_threads if provided, otherwise read from config
+        if n_threads is None:
+            n_threads = config.get('threads')
+            if n_threads is not None:
+                logger.info(f"Using threads from config file: {n_threads}")
+        
         logger.info(f"Starting variant counting for sample: {sample_name}")
         logger.info(f"Input SAM file: {sam_file}")
         logger.info(f"Reference library: {reference_file}")
@@ -426,7 +559,7 @@ def main(
         logger.info("Step 1/4: Processing SAM file and extracting variable regions...")
         
         # Process SAM file
-        df, sam_stats = process_sam_file(sam_file, config, logger=logger)
+        df, sam_stats = process_sam_file(sam_file, config, n_threads=n_threads, logger=logger)
         logger.info("Step 1/4 complete.")
         
         # Log SAM processing statistics
