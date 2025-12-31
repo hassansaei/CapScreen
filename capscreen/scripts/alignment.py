@@ -7,8 +7,6 @@ import os
 import shlex
 import subprocess
 import concurrent.futures
-import multiprocessing as mp
-from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
 
@@ -210,107 +208,38 @@ def run_cutadapt_umi(
     flank_5p_qual = "I" * len(flank_5p)
     flank_3p_qual = "I" * len(flank_3p)
     
-    def _process_fastq_chunk(chunk_lines: List[str], flank_5p: str, flank_3p: str, 
-                             flank_5p_qual: str, flank_3p_qual: str) -> str:
-        """
-        Worker function to process a chunk of FASTQ lines and restore flanks.
-        Returns the processed FASTQ content as a string.
-        """
-        output_lines = []
-        i = 0
-        while i + 3 < len(chunk_lines):
-            header = chunk_lines[i]
-            seq = chunk_lines[i + 1]
-            plus = chunk_lines[i + 2]
-            qual = chunk_lines[i + 3]
-            
-            if not (header and seq and plus and qual):
-                break
-            
-            # Strip newlines efficiently
-            seq_clean = seq.rstrip("\n\r")
-            qual_clean = qual.rstrip("\n\r")
-            
-            # Reconstruct sequence and quality
-            new_seq = f"{flank_5p}{seq_clean}{flank_3p}"
-            new_qual = f"{flank_5p_qual}{qual_clean}{flank_3p_qual}"
-            
-            # Build output lines
-            output_lines.append(header)
-            output_lines.append(new_seq + "\n")
-            output_lines.append(plus)
-            output_lines.append(new_qual + "\n")
-            
-            i += 4
-        
-        return "".join(output_lines)
-    
     try:
         logger.info("Re-attaching flanking sequences to Cutadapt-trimmed reads")
         
-        # Read all lines into memory for chunking
-        with trimmed_fastq.open("r", buffering=8192*4) as in_f:
-            all_lines = in_f.readlines()
-        
-        total_reads = len(all_lines) // 4
-        if logger:
-            logger.info(f"Processing {total_reads:,} reads for flank restoration")
-        
-        # Determine if we should use parallel processing
-        use_parallel = threads > 1 and total_reads > 10000
-        
-        if use_parallel:
-            # Chunk the lines for parallel processing (~10k reads per chunk)
-            # Aim for ~10k-50k reads per chunk
-            reads_per_chunk = max(10000, total_reads // (threads * 2))
-            chunk_size = reads_per_chunk * 4  # 4 lines per read
-            chunks = [all_lines[i:i + chunk_size] for i in range(0, len(all_lines), chunk_size)]
+        # Process reads sequentially with buffering
+        with trimmed_fastq.open("r", buffering=8192*4) as in_f, \
+             restored_fastq.open("w", buffering=8192*16) as out_f:
             
-            if logger:
-                logger.info(f"Processing {len(chunks)} chunk(s) in parallel with {threads} thread(s)")
-            
-            # Process chunks in parallel
-            worker_func = partial(_process_fastq_chunk, 
-                                 flank_5p=flank_5p, 
-                                 flank_3p=flank_3p,
-                                 flank_5p_qual=flank_5p_qual,
-                                 flank_3p_qual=flank_3p_qual)
-            
-            with mp.Pool(processes=min(threads, len(chunks))) as pool:
-                chunk_results = pool.map(worker_func, chunks)
-            
-            # Write all results with buffering
-            with restored_fastq.open("w", buffering=8192*16) as out_f:
-                for chunk_result in chunk_results:
-                    out_f.write(chunk_result)
-        else:
-            # Single-threaded processing with buffering
-            if logger:
-                logger.info("Using single-threaded processing with buffering")
-            
-            with restored_fastq.open("w", buffering=8192*16) as out_f:
-                i = 0
-                while i + 3 < len(all_lines):
-                    header = all_lines[i]
-                    seq = all_lines[i + 1]
-                    plus = all_lines[i + 2]
-                    qual = all_lines[i + 3]
-                    
-                    if not (header and seq and plus and qual):
-                        break
-                    
-                    seq_clean = seq.rstrip("\n\r")
-                    qual_clean = qual.rstrip("\n\r")
-                    
-                    new_seq = f"{flank_5p}{seq_clean}{flank_3p}"
-                    new_qual = f"{flank_5p_qual}{qual_clean}{flank_3p_qual}"
-                    
-                    out_f.write(header)
-                    out_f.write(new_seq + "\n")
-                    out_f.write(plus)
-                    out_f.write(new_qual + "\n")
-                    
-                    i += 4
+            i = 0
+            while True:
+                header = in_f.readline()
+                if not header:
+                    break
+                
+                seq = in_f.readline()
+                plus = in_f.readline()
+                qual = in_f.readline()
+                
+                if not (header and seq and plus and qual):
+                    break
+                
+                seq_clean = seq.rstrip("\n\r")
+                qual_clean = qual.rstrip("\n\r")
+                
+                new_seq = f"{flank_5p}{seq_clean}{flank_3p}"
+                new_qual = f"{flank_5p_qual}{qual_clean}{flank_3p_qual}"
+                
+                out_f.write(header)
+                out_f.write(new_seq + "\n")
+                out_f.write(plus)
+                out_f.write(new_qual + "\n")
+                
+                i += 1
 
     except Exception as exc:
         logger.error(f"Failed to restore flanks on Cutadapt-trimmed reads: {exc}", exc_info=True)

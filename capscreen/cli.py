@@ -16,6 +16,7 @@ from capscreen.version import __version__
 from capscreen.scripts import count as count_module
 from capscreen.scripts import generate_report as generate_report_module
 from capscreen.scripts import alignment as alignment_module
+from capscreen.scripts import qc as qc_module
 # stat_module imported conditionally - may use separate conda environment
 try:
     from capscreen.scripts import stat as stat_module
@@ -938,14 +939,22 @@ def main():
                     logger.error("Cannot run statistical analysis: merged counts table was not created.")
                     stat_success = False
                 else:
+                    logger.info("Starting QC analysis before statistical analysis...")
+                    # Create output directory for stat results (QC plots will be saved here too)
+                    stat_output_dir = args.output_dir / "statistical_analysis"
+                    stat_output_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Run QC analysis on reports in output_dir, save plots to stat_output_dir
+                    qc_success = qc_module.run_qc_analysis(args.output_dir, stat_output_dir, logger_instance=logger)
+                    if qc_success:
+                        logger.info("QC analysis completed successfully")
+                    else:
+                        logger.warning("QC analysis completed with warnings or errors, continuing with statistical analysis...")
+                    
                     logger.info("Starting statistical analysis...")
                     # Create Sample_info.csv for stat analysis
                     sample_info_path = args.output_dir / "Sample_info.csv"
                     if create_sample_info_csv(sample_entries, sample_info_path):
-                        # Create output directory for stat results
-                        stat_output_dir = args.output_dir / "statistical_analysis"
-                        stat_output_dir.mkdir(parents=True, exist_ok=True)
-                        
                         # Run statistical analysis using stat environment
                         try:
                             success = run_statistical_analysis_with_stat_env(

@@ -113,8 +113,8 @@ def process_sam_file(sam_file: Path, config: Dict, logger: Optional[logging.Logg
     flank_3p = config['flanking_sequences']['flank_3p']
     
     # Memory-efficient chunked processing parameters
-    chunk_size = 1_000_000  # Process 100k valid reads per chunk
-    progress_interval = 2_000_000
+    chunk_size = 500_000  # Process 100k valid reads per chunk
+    progress_interval = 1_000_000
     
     # Initialize counters
     total_reads = 0
@@ -263,7 +263,7 @@ def process_sam_file(sam_file: Path, config: Dict, logger: Optional[logging.Logg
             # Determine file format from first chunk
             use_parquet = chunk_files[0].suffix == '.parquet'
             
-            # Read chunks in batches to avoid loading all at once if there are many chunks
+            # Read chunks sequentially
             if len(chunk_files) <= 50:
                 # Small number of chunks: read all at once
                 if use_parquet:
