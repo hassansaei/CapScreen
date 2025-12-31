@@ -61,4 +61,6 @@ dependencies:
   - zlib=1.2.11=h7f8727e_4
   - jinja2
   - matplotlib
+  - seaborn
+  - lxml
 
