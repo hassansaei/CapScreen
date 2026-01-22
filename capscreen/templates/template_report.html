@@ -45,16 +45,18 @@
         {% endfor %}
 
         <tr><th colspan="2">Reference capsid Library Statistics</th></tr>
-        {% for k, v in pipeline.merging_stats.items() %}
+        {% if 'unique_peptides_in_reference' in pipeline.merging_stats %}
         <tr>
-            <td>
-                {% if k == 'unique_peptides_in_reads' %}Unique peptides in input
-                {% elif k == 'peptides_only_in_reads' %}Peptides only in input
-                {% else %}{{ k.replace('_', ' ').capitalize() }}{% endif %}
-            </td>
-            <td>{{ v }}</td>
+            <td>Unique peptides in reference</td>
+            <td>{{ pipeline.merging_stats.unique_peptides_in_reference }}</td>
         </tr>
-        {% endfor %}
+        {% endif %}
+        {% if 'peptides_in_ref_not_in_input' in pipeline.merging_stats %}
+        <tr>
+            <td>Peptides in reference but not in input</td>
+            <td>{{ pipeline.merging_stats.peptides_in_ref_not_in_input }} ({{ pipeline.merging_stats.peptides_in_ref_not_in_input_pct }}%)</td>
+        </tr>
+        {% endif %}
 
         <tr><th colspan="2">Variant Count Statistics</th></tr>
         {% for k, v in pipeline.variant_stats.items() %}
@@ -63,6 +65,7 @@
                 {% if k == 'assigned_sequences' %}Assigned sequences to valid peptides
                 {% elif k == 'unassigned_sequences' %}Unassigned sequences to valid peptides
                 {% elif k == 'unique_variants_found' %}Unique variants found in input
+                {% elif k == 'usable_reads_for_statistics' %}Usable reads for statistical analysis
                 {% else %}{{ k.replace('_', ' ').capitalize() }}{% endif %}
             </td>
             <td>{{ v }}</td>

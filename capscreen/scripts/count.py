@@ -481,11 +481,17 @@ def merge_with_reference(df: pd.DataFrame, reference_file: Path) -> Tuple[pd.Dat
     df_merged = pd.merge(df, ref_df, on='peptide', how='left')
     
     # Calculate statistics
+    unique_peptides_in_ref = ref_df['peptide'].nunique()
+    # Get unique peptides that were found in both (peptides that matched reference)
+    unique_peptides_found_in_both = df_merged[df_merged['ID_WLG'].notna()]['peptide'].nunique()
+    # Calculate peptides in reference but not in input
+    peptides_in_ref_not_in_input = unique_peptides_in_ref - unique_peptides_found_in_both
+    peptides_in_ref_not_in_input_pct = (peptides_in_ref_not_in_input / unique_peptides_in_ref * 100) if unique_peptides_in_ref > 0 else 0.0
+    
     stats = {
-        'unique_peptides': unique_peptides,
-        'unique_peptides_in_ref': ref_df['peptide'].nunique(),
-        'peptides_in_both': df_merged['ID_WLG'].notna().sum(),
-        'peptides_only_in_reads': df_merged['ID_WLG'].isna().sum()
+        'unique_peptides_in_ref': unique_peptides_in_ref,
+        'peptides_in_ref_not_in_input': peptides_in_ref_not_in_input,
+        'peptides_in_ref_not_in_input_pct': peptides_in_ref_not_in_input_pct
     }
     
     return df_merged, stats
@@ -579,10 +585,8 @@ def main(
         
         # Log merging statistics
         logger.info("\nReference Library Merging Statistics:")
-        logger.info(f"Unique peptides in reads: {merge_stats['unique_peptides']:,}")
         logger.info(f"Unique peptides in reference: {merge_stats['unique_peptides_in_ref']:,}")
-        logger.info(f"Peptides found in both: {merge_stats['peptides_in_both']:,}")
-        logger.info(f"Peptides only in reads: {merge_stats['peptides_only_in_reads']:,}")
+        logger.info(f"Peptides in reference but not in input: {merge_stats['peptides_in_ref_not_in_input']:,} ({merge_stats['peptides_in_ref_not_in_input_pct']:.2f}%)")
         
         logger.info("Step 3/4: Calculating counts and abundance metrics...")
         df_final, count_stats = calculate_counts(df_merged, sam_stats['total_reads'])

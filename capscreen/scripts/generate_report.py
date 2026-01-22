@@ -54,14 +54,18 @@ def parse_pipeline_log(filepath):
             stats['reads_with_flanking'] = msg.split(':')[-1].strip()
         elif 'Valid peptides after translation:' in msg:
             stats['valid_peptides'] = msg.split(':')[-1].strip()
-        elif 'Unique peptides in reads:' in msg:
-            merging_stats['unique_peptides_in_reads'] = msg.split(':')[-1].strip().replace(',', '')
         elif 'Unique peptides in reference:' in msg:
             merging_stats['unique_peptides_in_reference'] = msg.split(':')[-1].strip().replace(',', '')
-        elif 'Peptides found in both:' in msg:
-            merging_stats['peptides_found_in_both'] = msg.split(':')[-1].strip().replace(',', '')
-        elif 'Peptides only in reads:' in msg:
-            merging_stats['peptides_only_in_reads'] = msg.split(':')[-1].strip().replace(',', '')
+        elif 'Peptides in reference but not in input:' in msg:
+            # Parse format: "Peptides in reference but not in input: 1234 (45.67%)"
+            parts = msg.split(':')[-1].strip()
+            if '(' in parts and ')' in parts:
+                count_part = parts.split('(')[0].strip().replace(',', '')
+                pct_part = parts.split('(')[1].split(')')[0].strip().replace('%', '')
+                merging_stats['peptides_in_ref_not_in_input'] = count_part
+                merging_stats['peptides_in_ref_not_in_input_pct'] = pct_part
+            else:
+                merging_stats['peptides_in_ref_not_in_input'] = parts.replace(',', '')
         elif 'Total sequences:' in msg:
             variant_stats['total_sequences'] = msg.split(':')[-1].strip().replace(',', '')
         elif 'Assigned sequences:' in msg:
@@ -145,6 +149,28 @@ def generate_report(sample_dir, output=None):
     fastp_data = parse_fastp_json(fastp_json)
     pipeline_data = parse_pipeline_log(pipeline_log)
     pear_data = parse_pear_log(pear_log)
+    
+    # Calculate usable reads for statistical analysis
+    # This is: Assigned sequences to valid peptides / assembled reads
+    if 'assigned_sequences' in pipeline_data.get('variant_stats', {}) and 'assembled_reads' in pear_data:
+        try:
+            # Parse assigned_sequences (format: "1234 (45.67%)" or just "1234")
+            assigned_str = pipeline_data['variant_stats']['assigned_sequences'].replace(',', '')
+            if '(' in assigned_str:
+                assigned_str = assigned_str.split('(')[0].strip()
+            assigned = int(assigned_str)
+            
+            # Parse assembled_reads (format: "1234" or "1234 / 5678")
+            assembled_str = pear_data['assembled_reads'].replace(',', '').split()[0]  # Get number before any text
+            assembled = int(assembled_str)
+            
+            if assembled > 0:
+                usable_reads_pct = (assigned / assembled) * 100
+                pipeline_data['variant_stats']['usable_reads_for_statistics'] = f"{assigned:,} / {assembled:,} ({usable_reads_pct:.2f}%)"
+            else:
+                pipeline_data['variant_stats']['usable_reads_for_statistics'] = "N/A (no assembled reads)"
+        except (ValueError, KeyError, AttributeError) as e:
+            pipeline_data['variant_stats']['usable_reads_for_statistics'] = "N/A (calculation error)"
 
     # Read full pipeline log for collapsible section
     if pipeline_log.exists():

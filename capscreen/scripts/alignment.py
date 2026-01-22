@@ -164,7 +164,7 @@ def run_cutadapt_umi(
 ) -> Optional[Path]:
     """
     Run Cutadapt to extract the variable region between flanking sequences
-    and then re-attach the flanks to each read.
+    and then re-attach the flanks to each read. This is done to remove the UMI sequences from the reads
 
     Workflow:
       1. Use Cutadapt to trim everything outside the configured flanks
