@@ -191,10 +191,15 @@ def process_sam_file(sam_file: Path, config: Dict, n_threads: Optional[int] = No
             for line_number, line in enumerate(f, start=1):
                 if line.startswith("@"):
                     continue
-                total_reads += 1
+                # Skip empty lines
+                if not line.strip():
+                    continue
+                # Validate SAM line structure before counting
                 parts = line.rstrip("\n").split("\t")
                 if len(parts) < 10:
                     continue
+                # Count only valid SAM lines
+                total_reads += 1
                 flag = int(parts[1])
                 if (flag & 4) != 0:
                     unmapped_reads += 1
@@ -496,11 +501,12 @@ def merge_with_reference(df: pd.DataFrame, reference_file: Path) -> Tuple[pd.Dat
     
     return df_merged, stats
 
-def calculate_counts(df: pd.DataFrame, total_reads: int) -> Tuple[pd.DataFrame, Dict[str, int]]:
+def calculate_counts(df: pd.DataFrame, mapped_reads: int) -> Tuple[pd.DataFrame, Dict[str, int]]:
     # Calculate peptide abundance (how many times each peptide appears)
     peptide_counts = df['peptide'].value_counts()
     df['count'] = df['peptide'].map(peptide_counts)
-    df['RPM'] = df['count'] / total_reads * 1_000_000
+    # Normalize RPM using mapped reads only (not total reads including unmapped)
+    df['RPM'] = df['count'] / mapped_reads * 1_000_000
     # Add log2(RPM + epsilon) transformation
     epsilon = np.finfo(float).eps  # Machine epsilon for numerical stability
     df['log2_RPM'] = np.log2(df['RPM'] + epsilon)
@@ -590,7 +596,8 @@ def main(
         logger.info(f"Peptides in reference but not in input: {merge_stats['peptides_in_ref_not_in_input']:,} ({merge_stats['peptides_in_ref_not_in_input_pct']:.2f}%)")
         
         logger.info("Step 3/4: Calculating counts and abundance metrics...")
-        df_final, count_stats = calculate_counts(df_merged, sam_stats['total_reads'])
+        # Use mapped_reads for RPM normalization (not total_reads including unmapped)
+        df_final, count_stats = calculate_counts(df_merged, sam_stats['mapped_reads'])
         logger.info("Step 3/4 complete.")
 
         # Calculate correct assigned/unassigned read counts and percentages
