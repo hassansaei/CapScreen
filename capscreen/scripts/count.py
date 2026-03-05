@@ -507,9 +507,8 @@ def calculate_counts(df: pd.DataFrame, mapped_reads: int) -> Tuple[pd.DataFrame,
     df['count'] = df['peptide'].map(peptide_counts)
     # Normalize RPM using mapped reads only (not total reads including unmapped)
     df['RPM'] = df['count'] / mapped_reads * 1_000_000
-    # Add log2(RPM + epsilon) transformation
-    epsilon = np.finfo(float).eps  # Machine epsilon for numerical stability
-    df['log2_RPM'] = np.log2(df['RPM'] + epsilon)
+    # Add log2(RPM + 1) transformation (avoids negative values; 0 RPM → 0)
+    df['log2_RPM'] = np.log2(df['RPM'] + 1)
 
     # Reorder columns as desired
     df_out = df[['ID_WLG', 'peptide', 'variable_seq', 'count', 'RPM', 'log2_RPM', 'insertions', 'deletions', 'matches']].copy()
