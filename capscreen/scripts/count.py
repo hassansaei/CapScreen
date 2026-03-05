@@ -501,8 +501,9 @@ def calculate_counts(df: pd.DataFrame, total_reads: int) -> Tuple[pd.DataFrame, 
     peptide_counts = df['peptide'].value_counts()
     df['count'] = df['peptide'].map(peptide_counts)
     df['RPM'] = df['count'] / total_reads * 1_000_000
-    # Add log2(RPM + 1) transformation
-    df['log2_RPM'] = np.log2(df['RPM'] + 1)
+    # Add log2(RPM + epsilon) transformation
+    epsilon = np.finfo(float).eps  # Machine epsilon for numerical stability
+    df['log2_RPM'] = np.log2(df['RPM'] + epsilon)
 
     # Reorder columns as desired
     df_out = df[['ID_WLG', 'peptide', 'variable_seq', 'count', 'RPM', 'log2_RPM', 'insertions', 'deletions', 'matches']].copy()

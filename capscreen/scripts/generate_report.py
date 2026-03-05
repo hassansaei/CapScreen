@@ -202,9 +202,9 @@ def generate_report(sample_dir, output=None):
                 import matplotlib.pyplot as plt
                 plt.figure(figsize=(6,4))
                 plt.hist(df['log2_RPM'].dropna(), bins=30, color='#3498db', edgecolor='black')
-                plt.xlabel('log2(RPM + 1)')
+                plt.xlabel('log2(RPM)')
                 plt.ylabel('Frequency')
-                plt.title('Distribution of peptides log2(RPM + 1)')
+                plt.title('Distribution of peptides log2(RPM)')
                 hist_path = sample_dir / 'log2rpm_hist.png'
                 plt.tight_layout()
                 plt.savefig(hist_path)

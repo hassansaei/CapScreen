@@ -1389,9 +1389,10 @@ def create_rpm_scatter_density_plots(rpm_counts: pd.DataFrame, meta: pd.DataFram
                     x_rpm = rpm_counts_aligned[s1].to_numpy()
                     y_rpm = rpm_counts_aligned[s2].to_numpy()
                     
-                    # Apply log2 transformation (add 1 to avoid log(0))
-                    x = np.log2(x_rpm + 1)
-                    y = np.log2(y_rpm + 1)
+                    # Apply log2 transformation (add epsilon to avoid log(0))
+                    epsilon = np.finfo(float).eps  # Machine epsilon for numerical stability
+                    x = np.log2(x_rpm + epsilon)
+                    y = np.log2(y_rpm + epsilon)
                     
                     # Remove NaN and Inf values
                     mask = np.isfinite(x) & np.isfinite(y)
