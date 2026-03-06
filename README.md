@@ -1,5 +1,7 @@
 # CapScreen
 
+[![DOI](https://zenodo.org/badge/1004327193.svg)](https://doi.org/10.5281/zenodo.18895265)
+
 **CapScreen** is a pipeline designed for high-throughput screening of amplicon sequencing (NGS) results from AAV (Adeno-Associated Virus) library screens targeting specific receptors. The pipeline is suitable for both *binding* and *transduction* screening experiments, providing robust quality control, alignment, variant counting, and statistical analysis functionalities.
 
 
@@ -277,7 +279,18 @@ The `statistical_analysis` section configures downstream analysis:
 
 ## Citation
 
-Coming soon.
+If you use CapScreen in your research, please cite it using the following DOI:
+
+```bibtex
+@software{saei_capscreen_2025,
+  author       = {Saei, Hassan},
+  title        = {{CapScreen: A pipeline for AAV library amplicon sequencing analysis}},
+  year         = {2025},
+  publisher    = {Zenodo},
+  doi          = {10.5281/zenodo.18895265},
+  url          = {https://doi.org/10.5281/zenodo.18895265}
+}
+```
 
 
 ## License

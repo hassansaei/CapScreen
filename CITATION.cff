@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+title: CapScreen
+message: "If you use this software, please cite it using the metadata from this file."
+type: software
+authors:
+  - family-names: Saei
+    given-names: Hassan
+    email: hassan.saeiahan@gmail.com
+version: 1.0.0
+date-released: 2025-03-06
+url: https://github.com/hassansaei/CapScreen
+repository-code: https://github.com/hassansaei/CapScreen
+doi: 10.5281/zenodo.18895265
+keywords:
+  - AAV
+  - adeno-associated virus
+  - NGS
+  - amplicon sequencing
+  - library screening
+  - bioinformatics
+  - pipeline
+license: MIT
