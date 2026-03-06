@@ -8,6 +8,7 @@ on:
 
 jobs:
   release:
+    if: false  # Disabled: re-enable when ready to use automatic releases
     runs-on: ubuntu-latest
     concurrency: release
     permissions:

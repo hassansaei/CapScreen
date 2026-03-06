@@ -277,12 +277,12 @@ The `statistical_analysis` section configures downstream analysis:
 
 ## Citation
 
-Coming soon....
+Coming soon.
 
 
 ## License
 
-MIT License
+CapScreen is released under the [MIT License](LICENSE).
 
 ## Contact
 
