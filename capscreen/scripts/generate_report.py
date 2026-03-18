@@ -188,8 +188,6 @@ def generate_report(sample_dir, output=None):
     if show_count_matrix and counts_tsv.exists():
         df = pd.read_csv(counts_tsv, sep=None, engine='python')
         if 'ID_WLG' in df.columns:
-            df = df.drop_duplicates(subset=['ID_WLG'])
-            # Remove unwanted columns
             for col in ['insertions', 'deletions', 'matches', 'Unnamed: 0']:
                 if col in df.columns:
                     df = df.drop(columns=[col])

@@ -446,7 +446,7 @@ def merge_count_tables(
         logger.warning("No sample entries were provided for count merging.")
         return None
     
-    merged_records: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    merged_records: Dict[tuple, Dict[str, Any]] = {}
     sample_order: List[str] = []
     
     for entry in sample_entries:
@@ -458,35 +458,42 @@ def merge_count_tables(
         try:
             with counts_path.open("r", newline='') as count_file:
                 reader = csv.DictReader(count_file)
-                required_cols = {"ID_WLG", "peptide", "count", "RPM"}
+                required_cols = {"ID_WLG", "peptide", "variable_seq", "count", "RPM"}
                 if not reader.fieldnames or not required_cols.issubset(set(reader.fieldnames)):
                     logger.error(f"Count file for sample {entry.sample_id} is missing required columns. Skipping.")
                     continue
                 for row in reader:
                     id_wlg = (row.get("ID_WLG") or "").strip()
+                    peptide = row["peptide"]
+                    variable_seq = (row.get("variable_seq") or "").strip()
                     if not id_wlg or id_wlg.lower() == "unassigned":
-                        continue
-                    key = (id_wlg, row["peptide"])
+                        id_wlg = "Unassigned"
+                        key = (id_wlg, peptide, variable_seq)
+                    else:
+                        key = (id_wlg, peptide, "")
                     record = merged_records.setdefault(
                         key,
                         {
                             "ID_WLG": id_wlg,
-                            "peptide": row["peptide"],
+                            "peptide": peptide,
+                            "variable_seqs": set(),
                             "counts": {},
                             "rpms": {}
                         }
                     )
+                    if variable_seq:
+                        record["variable_seqs"].add(variable_seq)
                     try:
                         record["counts"][entry.sample_id] = record["counts"].get(entry.sample_id, 0) + int(row.get("count", 0) or 0)
                     except ValueError:
                         logger.warning(
-                            f"Invalid count value in {counts_path} for variant {row['ID_WLG']}. Treating as 0."
+                            f"Invalid count value in {counts_path} for variant {id_wlg}. Treating as 0."
                         )
                     try:
                         record["rpms"][entry.sample_id] = record["rpms"].get(entry.sample_id, 0.0) + float(row.get("RPM", 0) or 0)
                     except ValueError:
                         logger.warning(
-                            f"Invalid RPM value in {counts_path} for variant {row['ID_WLG']}. Treating as 0."
+                            f"Invalid RPM value in {counts_path} for variant {id_wlg}. Treating as 0."
                         )
         except Exception as exc:
             logger.error(f"Failed to read count file for sample {entry.sample_id}: {exc}")
@@ -500,7 +507,7 @@ def merge_count_tables(
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open("w", newline='') as merged_file:
-            fieldnames = ["ID_WLG", "peptide"]
+            fieldnames = ["ID_WLG", "peptide", "variable_seq"]
             rpm_columns: List[str] = []
             for sample_id in sample_order:
                 fieldnames.append(sample_id)
@@ -512,7 +519,8 @@ def merge_count_tables(
                 record = merged_records[key]
                 row = {
                     "ID_WLG": record["ID_WLG"],
-                    "peptide": record["peptide"]
+                    "peptide": record["peptide"],
+                    "variable_seq": ";".join(sorted(record.get("variable_seqs", set())))
                 }
                 for sample_id in sample_order:
                     row[sample_id] = record["counts"].get(sample_id, 0)

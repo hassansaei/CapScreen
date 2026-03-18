@@ -175,6 +175,15 @@ def read_count_table(count_file: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
     # Read the count table
     counts = pd.read_csv(count_file, sep=',')
     
+    # Filter out unassigned peptides — they are not valid library members and
+    # would create duplicate index entries that break downstream analysis.
+    if 'ID_WLG' in counts.columns:
+        n_before = len(counts)
+        counts = counts[~counts['ID_WLG'].str.lower().eq('unassigned')]
+        n_removed = n_before - len(counts)
+        if n_removed > 0:
+            logger.info(f"Excluded {n_removed:,} unassigned variant(s) from statistical analysis")
+    
     # Set index to ID_WLG
     if 'ID_WLG' in counts.columns:
         counts.index = counts['ID_WLG']
@@ -186,7 +195,7 @@ def read_count_table(count_file: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
     rpm_columns = [col for col in counts.columns if col.endswith('_RPM')]
     
     # Create raw counts dataframe (drop RPM columns and metadata columns)
-    raw_counts = counts.drop(columns=['ID_WLG', 'peptide'] + rpm_columns, errors='ignore')
+    raw_counts = counts.drop(columns=['ID_WLG', 'peptide', 'variable_seq'] + rpm_columns, errors='ignore')
     
     # Create RPM counts dataframe (keep only RPM columns)
     rpm_counts = counts[['ID_WLG', 'peptide'] + rpm_columns].copy() if rpm_columns else pd.DataFrame()
