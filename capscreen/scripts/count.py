@@ -614,12 +614,43 @@ def main(
         
         # Deduplicate by (peptide, variable_seq) so each unique DNA variant is one row
         df_final = df_final.drop_duplicates(subset=['peptide', 'variable_seq'], keep='first')
-        df_final = df_final.sort_values(by='RPM', ascending=False)
-        df_final = df_final.reset_index(drop=True)
-        
-        logger.info("Step 4/4: Writing final count table to disk...")
-        df_final.to_csv(output_file, index=False)
-        logger.info(f"\nResults saved to {output_file}")
+
+        logger.info("Step 4/4: Writing final count tables to disk...")
+        mapped_reads = sam_stats['mapped_reads']
+
+        # Split assigned and unassigned
+        df_assigned = df_final[df_final['ID_WLG'] != 'Unassigned'].copy()
+        df_unassigned = df_final[df_final['ID_WLG'] == 'Unassigned'].copy()
+
+        # Aggregate assigned by (ID_WLG, peptide): sum counts, keep the
+        # variable_seq from the variant with the highest read count.
+        if not df_assigned.empty:
+            df_assigned = df_assigned.sort_values('count', ascending=False)
+            df_assigned = df_assigned.groupby(['ID_WLG', 'peptide'], as_index=False).agg({
+                'variable_seq': 'first',
+                'count': 'sum',
+                'insertions': 'first',
+                'deletions': 'first',
+                'matches': 'first'
+            })
+            df_assigned['RPM'] = df_assigned['count'] / mapped_reads * 1_000_000
+            df_assigned['log2_RPM'] = np.log2(df_assigned['RPM'] + 1)
+            df_assigned = df_assigned[['ID_WLG', 'peptide', 'variable_seq', 'count', 'RPM', 'log2_RPM', 'insertions', 'deletions', 'matches']]
+            df_assigned = df_assigned.sort_values('RPM', ascending=False).reset_index(drop=True)
+
+        # Write assigned counts (main output)
+        df_assigned.to_csv(output_file, index=False)
+        logger.info(f"Assigned counts ({len(df_assigned):,} variants) saved to {output_file}")
+
+        # Write unassigned counts to a separate file
+        unassigned_file = output_file.parent / f"{sample_name}.unassigned.counts.tsv"
+        if not df_unassigned.empty:
+            df_unassigned = df_unassigned.sort_values('RPM', ascending=False).reset_index(drop=True)
+            df_unassigned.to_csv(unassigned_file, index=False)
+            logger.info(f"Unassigned counts ({len(df_unassigned):,} variants) saved to {unassigned_file}")
+        else:
+            logger.info("No unassigned peptides found.")
+
         if log_file:
             logger.info(f"Log file saved to {log_file}")
         

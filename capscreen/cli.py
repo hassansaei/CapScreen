@@ -446,7 +446,7 @@ def merge_count_tables(
         logger.warning("No sample entries were provided for count merging.")
         return None
     
-    merged_records: Dict[tuple, Dict[str, Any]] = {}
+    merged_records: Dict[Tuple[str, str], Dict[str, Any]] = {}
     sample_order: List[str] = []
     
     for entry in sample_entries:
@@ -458,19 +458,17 @@ def merge_count_tables(
         try:
             with counts_path.open("r", newline='') as count_file:
                 reader = csv.DictReader(count_file)
-                required_cols = {"ID_WLG", "peptide", "variable_seq", "count", "RPM"}
+                required_cols = {"ID_WLG", "peptide", "count", "RPM"}
                 if not reader.fieldnames or not required_cols.issubset(set(reader.fieldnames)):
                     logger.error(f"Count file for sample {entry.sample_id} is missing required columns. Skipping.")
                     continue
                 for row in reader:
                     id_wlg = (row.get("ID_WLG") or "").strip()
+                    if not id_wlg or id_wlg.lower() == "unassigned":
+                        continue
                     peptide = row["peptide"]
                     variable_seq = (row.get("variable_seq") or "").strip()
-                    if not id_wlg or id_wlg.lower() == "unassigned":
-                        id_wlg = "Unassigned"
-                        key = (id_wlg, peptide, variable_seq)
-                    else:
-                        key = (id_wlg, peptide, "")
+                    key = (id_wlg, peptide)
                     record = merged_records.setdefault(
                         key,
                         {
