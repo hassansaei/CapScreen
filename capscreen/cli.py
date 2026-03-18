@@ -477,19 +477,17 @@ def merge_count_tables(
                         }
                     )
                     try:
-                        record["counts"][entry.sample_id] = int(row.get("count", 0) or 0)
+                        record["counts"][entry.sample_id] = record["counts"].get(entry.sample_id, 0) + int(row.get("count", 0) or 0)
                     except ValueError:
                         logger.warning(
                             f"Invalid count value in {counts_path} for variant {row['ID_WLG']}. Treating as 0."
                         )
-                        record["counts"][entry.sample_id] = 0
                     try:
-                        record["rpms"][entry.sample_id] = float(row.get("RPM", 0) or 0)
+                        record["rpms"][entry.sample_id] = record["rpms"].get(entry.sample_id, 0.0) + float(row.get("RPM", 0) or 0)
                     except ValueError:
                         logger.warning(
                             f"Invalid RPM value in {counts_path} for variant {row['ID_WLG']}. Treating as 0."
                         )
-                        record["rpms"][entry.sample_id] = 0.0
         except Exception as exc:
             logger.error(f"Failed to read count file for sample {entry.sample_id}: {exc}")
             continue

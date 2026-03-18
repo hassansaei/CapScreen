@@ -476,13 +476,15 @@ def merge_with_reference(df: pd.DataFrame, reference_file: Path) -> Tuple[pd.Dat
             - Merged DataFrame
             - Dictionary with merging statistics
     """
-    # Read reference file and keep only essential columns
-    ref_df = pd.read_csv(reference_file)[['peptide', 'ID_WLG']]
+    # Read reference file and keep only essential columns.
+    # Deduplicate by peptide so that a many-to-many merge does not inflate
+    # downstream counts when the reference maps multiple ID_WLG to one peptide.
+    ref_df = pd.read_csv(reference_file)[['peptide', 'ID_WLG']].drop_duplicates(subset=['peptide'], keep='first')
     
     # Get unique peptides before merging
     unique_peptides = df['peptide'].nunique()
     
-    # Merge on peptide sequence
+    # Merge on peptide sequence (now guaranteed one-to-many: one ref row per peptide)
     df_merged = pd.merge(df, ref_df, on='peptide', how='left')
     
     # Calculate statistics
@@ -502,25 +504,23 @@ def merge_with_reference(df: pd.DataFrame, reference_file: Path) -> Tuple[pd.Dat
     return df_merged, stats
 
 def calculate_counts(df: pd.DataFrame, mapped_reads: int) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    # Calculate peptide abundance (how many times each peptide appears)
-    peptide_counts = df['peptide'].value_counts()
-    df['count'] = df['peptide'].map(peptide_counts)
-    # Normalize RPM using mapped reads only (not total reads including unmapped)
+    # Count reads per unique (peptide, variable_seq) pair so that different DNA
+    # variants translating to the same peptide each get their own correct count.
+    df['count'] = df.groupby(['peptide', 'variable_seq'])['peptide'].transform('size')
     df['RPM'] = df['count'] / mapped_reads * 1_000_000
-    # Add log2(RPM + 1) transformation (avoids negative values; 0 RPM → 0)
     df['log2_RPM'] = np.log2(df['RPM'] + 1)
 
     # Reorder columns as desired
     df_out = df[['ID_WLG', 'peptide', 'variable_seq', 'count', 'RPM', 'log2_RPM', 'insertions', 'deletions', 'matches']].copy()
 
-    # Stats (optional, can be adjusted)
+    # Stats
     assigned = df_out[df_out['ID_WLG'].notna()]['count'].sum()
     unassigned = df_out[df_out['ID_WLG'].isna()]['count'].sum()
     stats = {
         'total': len(df_out),
         'assigned': assigned,
         'unassigned': unassigned,
-        'unique_variants': df_out['peptide'].nunique(),
+        'unique_variants': df_out[['peptide', 'variable_seq']].drop_duplicates().shape[0],
         'max_reads_per_variant': df_out['count'].max(),
         'min_reads_per_variant': df_out['count'].min(),
         'mean_reads_per_variant': df_out['count'].mean()
@@ -612,8 +612,8 @@ def main(
         logger.info(f"Unique variants found: {count_stats['unique_variants']:,}")
         logger.info(f"Reads per variant - Max: {count_stats['max_reads_per_variant']:,}, Min: {count_stats['min_reads_per_variant']:,}, Mean: {count_stats['mean_reads_per_variant']:.2f}")
         
-        # Prepare final output: drop duplicate peptides, sort by RPM, reset index
-        df_final = df_final.drop_duplicates(subset=['peptide'], keep='first')
+        # Deduplicate by (peptide, variable_seq) so each unique DNA variant is one row
+        df_final = df_final.drop_duplicates(subset=['peptide', 'variable_seq'], keep='first')
         df_final = df_final.sort_values(by='RPM', ascending=False)
         df_final = df_final.reset_index(drop=True)
         
