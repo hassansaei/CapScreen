@@ -16,7 +16,9 @@ This script performs a complete statistical analysis pipeline on CapScreen count
    - Computes target specificity metrics
 
 3. Correlation Analysis:
-   - Calculates Spearman and Pearson correlations for all pairwise sample comparisons
+   - Calculates Spearman (DESeq2 normalized counts) and Pearson
+     (log2 normalized + pseudocount; pseudocount from config analysis.lambda)
+     for all pairwise sample comparisons within each group
    - Generates correlation scatter plots within each group
 
 4. Principal Component Analysis (PCA):
@@ -519,34 +521,44 @@ def extract_normalized_counts(dds: DeseqDataSet) -> pd.DataFrame:
     return df_norm
 
 
-def calculate_correlation_statistics(dds: DeseqDataSet, df_norm: pd.DataFrame) -> pd.DataFrame:
+def calculate_correlation_statistics(
+    dds: DeseqDataSet,
+    df_norm: pd.DataFrame,
+    pseudocount: float = 0.01,
+) -> pd.DataFrame:
     """
     Calculate correlation statistics (Spearman and Pearson) for each group.
-    
+
+    Pearson is computed on log2(normalized counts + pseudocount) to reduce
+    skew and mean–variance effects; Spearman uses normalized counts directly
+    (ranks unchanged by monotonic scaling).
+
     Args:
         dds: DeseqDataSet object
         df_norm: Normalized counts dataframe (variants as rows, samples as columns)
-        
+        pseudocount: Added before log2 for Pearson (should match analysis.lambda in config)
+
     Returns:
         DataFrame with correlation statistics for each group
     """
     logger.info("Calculating correlation statistics...")
-    
+    df_log = np.log2(df_norm + pseudocount)
+
     corr_results = {}
     groups = dds.obs['group'].unique()
-    
+
     for g in groups:
         samples = dds.obs.index[dds.obs['group'] == g].tolist()
-        
+
         if len(samples) >= 2:  # at least 2 reps needed
             pair_s = []
             pair_p = []
-            
+
             for s1, s2 in combinations(samples, 2):
                 # Ensure both samples exist in df_norm (samples are columns after transpose)
                 if s1 in df_norm.columns and s2 in df_norm.columns:
                     s_val, _ = spearmanr(df_norm[s1], df_norm[s2])
-                    p_val, _ = pearsonr(df_norm[s1], df_norm[s2])
+                    p_val, _ = pearsonr(df_log[s1], df_log[s2])
                     pair_s.append(s_val)
                     pair_p.append(p_val)
             
@@ -569,36 +581,48 @@ def calculate_correlation_statistics(dds: DeseqDataSet, df_norm: pd.DataFrame) -
     return df_corr
 
 
-def create_correlation_scatter_plots(dds: DeseqDataSet, df_norm: pd.DataFrame, 
-                                     output_file: Path):
+def create_correlation_scatter_plots(
+    dds: DeseqDataSet,
+    df_norm: pd.DataFrame,
+    output_file: Path,
+    pseudocount: float = 0.01,
+):
     """
     Create scatter plots for all pairwise sample comparisons within each group.
-    
+
+    Points are log2(normalized + pseudocount); Pearson r in the title matches
+    that scale. Spearman r is still from ranks on normalized counts.
+
     Args:
         dds: DeseqDataSet object
         df_norm: Normalized counts dataframe (variants as rows, samples as columns)
         output_file: Path to save the PDF file
+        pseudocount: Added before log2 (should match analysis.lambda in config)
     """
     logger.info(f"Creating correlation scatter plots...")
-    
+    df_log = np.log2(df_norm + pseudocount)
+
     groups = dds.obs['group'].unique()
-    
+
     with PdfPages(output_file) as pdf:
         for g in groups:
             samples = dds.obs.index[dds.obs['group'] == g].tolist()
-            
+
             if len(samples) >= 2:
                 for s1, s2 in combinations(samples, 2):
                     # Ensure both samples exist in df_norm (samples are columns after transpose)
                     if s1 in df_norm.columns and s2 in df_norm.columns:
                         sp, _ = spearmanr(df_norm[s1], df_norm[s2])
-                        pr, _ = pearsonr(df_norm[s1], df_norm[s2])
-                        
+                        pr, _ = pearsonr(df_log[s1], df_log[s2])
+
                         fig, ax = plt.subplots()
-                        ax.scatter(df_norm[s1], df_norm[s2], color="darkblue", s=15)
-                        ax.set_title(f"{g} | Spearman r={sp:.2f} | Pearson r={pr:.2f}")
-                        ax.set_xlabel(s1)
-                        ax.set_ylabel(s2)
+                        ax.scatter(df_log[s1], df_log[s2], color="darkblue", s=15)
+                        ax.set_title(
+                            f"{g} | Spearman r={sp:.2f} | Pearson r={pr:.2f}\n"
+                            f"(Pearson on log2(norm+{pseudocount:g}))"
+                        )
+                        ax.set_xlabel(f"log2({s1} + {pseudocount:g})")
+                        ax.set_ylabel(f"log2({s2} + {pseudocount:g})")
                         fig.tight_layout()
                         pdf.savefig(fig)
                         plt.close(fig)
@@ -1705,8 +1729,9 @@ def run_statistical_analysis(
         group_palette = create_group_color_palette(all_groups)
         logger.info(f"Created color palette for {len(all_groups)} groups")
         
-        # Calculate correlation statistics
-        df_corr = calculate_correlation_statistics(dds, df_norm)
+        # Calculate correlation statistics (Pearson uses log2(norm + lambda), same as RPM pseudocount)
+        corr_pseudocount = config.get("analysis", {}).get("lambda", 0.01)
+        df_corr = calculate_correlation_statistics(dds, df_norm, pseudocount=corr_pseudocount)
         
         # Save correlation statistics
         corr_stats_file = output_dir / "correlation_statistics.tsv"
@@ -1715,7 +1740,7 @@ def run_statistical_analysis(
         
         # Create correlation scatter plots
         corr_plots_file = output_dir / "correlation_scatterPlot.pdf"
-        create_correlation_scatter_plots(dds, df_norm, corr_plots_file)
+        create_correlation_scatter_plots(dds, df_norm, corr_plots_file, pseudocount=corr_pseudocount)
         
         # Perform three PCA analyses
         # 1. PCA with all features
