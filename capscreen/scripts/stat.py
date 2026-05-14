@@ -98,7 +98,7 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
             },
             "analysis": {
                 "n_cpus": 8,
-                "lambda": 0.01,
+                "lambda": 1,
                 # Minimum total raw counts per variant (summed across samples) to keep for DESeq2.
                 # Set to 0 or null to disable pre-filtering.
                 "low_expression_threshold": 10,
@@ -1436,7 +1436,10 @@ def create_rpm_scatter_density_plots(rpm_counts: pd.DataFrame, meta: pd.DataFram
                                      config: Optional[Dict[str, Any]] = None):
     """
     Create scatter density plots for all replicate comparisons within each group using RPM counts.
-    
+
+    Values are plotted as log2(RPM + λ) where λ is ``analysis.lambda`` from config (default 0.01),
+    matching RPM enrichment pseudocount and avoiding huge negative log2 when RPM is zero.
+
     Args:
         rpm_counts: RPM counts dataframe (variants as rows, samples as columns)
         meta: Metadata dataframe
@@ -1493,10 +1496,12 @@ def create_rpm_scatter_density_plots(rpm_counts: pd.DataFrame, meta: pd.DataFram
                     x_rpm = rpm_counts_aligned[s1].to_numpy()
                     y_rpm = rpm_counts_aligned[s2].to_numpy()
                     
-                    # Apply log2 transformation (add epsilon to avoid log(0))
-                    epsilon = np.finfo(float).eps  # Machine epsilon for numerical stability
-                    x = np.log2(x_rpm + epsilon)
-                    y = np.log2(y_rpm + epsilon)
+                    # log2(RPM + pseudocount); use analysis.lambda (same as enrichment / Pearson fallback)
+                    if config is None:
+                        config = {}
+                    rpm_pseudo = float(config.get("analysis", {}).get("lambda", 0.01))
+                    x = np.log2(x_rpm + rpm_pseudo)
+                    y = np.log2(y_rpm + rpm_pseudo)
                     
                     # Remove NaN and Inf values
                     mask = np.isfinite(x) & np.isfinite(y)
@@ -1504,9 +1509,6 @@ def create_rpm_scatter_density_plots(rpm_counts: pd.DataFrame, meta: pd.DataFram
                     y = y[mask]
                     
                     if len(x) > 0:
-                        # Get config values
-                        if config is None:
-                            config = {}
                         plot_config = config.get("plots", {})
                         figsize = plot_config.get("figure_sizes", {}).get("rpm_scatter", [6, 4])
                         dpi = plot_config.get("dpi", {}).get("standard", 300)
