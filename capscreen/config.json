@@ -59,7 +59,7 @@
         },
         "analysis": {
             "n_cpus": 8,
-            "lambda": 0.01,
+            "lambda": 1,
             "low_expression_threshold": 10,
             "pca": {
                 "n_components": 2,

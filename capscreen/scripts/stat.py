@@ -7,6 +7,8 @@ This script performs a complete statistical analysis pipeline on CapScreen count
 1. Data Processing:
    - Reads merged count tables (raw counts and RPM counts)
    - Processes sample metadata to identify groups, biological and technical replicates
+   - Drops variants whose total raw counts summed across samples are below
+     analysis.low_expression_threshold (default 10) before DESeq2
    - Normalizes counts using DESeq2 (pydeseq2)
 
 2. RPM-based Enrichment Analysis:
@@ -17,7 +19,7 @@ This script performs a complete statistical analysis pipeline on CapScreen count
 
 3. Correlation Analysis:
    - Calculates Spearman (DESeq2 normalized counts) and Pearson
-     (log2 normalized + pseudocount; pseudocount from config analysis.lambda)
+     (DESeq2 VST; falls back to log2 normalized + pseudocount from analysis.lambda if VST fails)
      for all pairwise sample comparisons within each group
    - Generates correlation scatter plots within each group
 
@@ -97,6 +99,8 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
             "analysis": {
                 "n_cpus": 8,
                 "lambda": 0.01,
+                # Minimum total raw counts per variant (summed across samples) to keep for DESeq2.
+                # Set to 0 or null to disable pre-filtering.
                 "low_expression_threshold": 10,
                 "pca": {
                     "n_components": 2,
@@ -427,31 +431,57 @@ def _identify_groups_heuristic(meta: pd.DataFrame) -> Tuple[list, list, list]:
     return target_groups, background_groups, input_groups
 
 
-def create_deseq_dataset(counts: pd.DataFrame, meta: pd.DataFrame, 
-                        n_cpus: int = 8) -> DeseqDataSet:
+def create_deseq_dataset(
+    counts: pd.DataFrame,
+    meta: pd.DataFrame,
+    n_cpus: int = 8,
+    min_total_raw_counts: Optional[int] = 10,
+) -> DeseqDataSet:
     """
     Create and run DESeq2 dataset.
-    
+
+    Variants whose total raw counts across all samples are strictly below
+    ``min_total_raw_counts`` are removed before building the dataset (when
+    ``min_total_raw_counts`` is a positive integer).
+
     Args:
         counts: Raw counts dataframe (samples as rows, variants as columns)
         meta: Metadata dataframe
         n_cpus: Number of CPUs to use
-        
+        min_total_raw_counts: Keep only variants with sum(counts) >= this value
+            across samples. None or <= 0 disables filtering.
+
     Returns:
         DeseqDataSet object
     """
     logger.info("Creating DESeq2 dataset...")
-    
+
     # Align counts and metadata
     common_samples = counts.index.intersection(meta.index)
     if len(common_samples) == 0:
         raise ValueError("No common samples found between counts and metadata")
-    
+
     counts_aligned = counts.loc[common_samples]
     meta_aligned = meta.loc[common_samples]
-    
+
     logger.info(f"Aligned {len(common_samples)} samples")
-    
+
+    if min_total_raw_counts is not None and min_total_raw_counts > 0:
+        n_variants_before = counts_aligned.shape[1]
+        col_sums = counts_aligned.sum(axis=0)
+        keep = col_sums >= min_total_raw_counts
+        counts_aligned = counts_aligned.loc[:, keep]
+        n_kept = int(keep.sum())
+        logger.info(
+            f"Pre-filter for DESeq2: kept {n_kept:,}/{n_variants_before:,} variants "
+            f"with total raw count >= {min_total_raw_counts}"
+        )
+        if n_kept == 0:
+            raise ValueError(
+                "All variants were removed by the low-count pre-filter for DESeq2. "
+                "Lower analysis.low_expression_threshold or check merged counts."
+            )
+
     # Determine design factors
     # Always include group and bio_rep
     design_factors = ["group", "bio_rep"]
@@ -521,47 +551,82 @@ def extract_normalized_counts(dds: DeseqDataSet) -> pd.DataFrame:
     return df_norm
 
 
+def extract_vst_counts(dds: DeseqDataSet) -> pd.DataFrame:
+    """
+    Extract variance-stabilized counts from DeseqDataSet (after ``dds.vst()``).
+
+    Same orientation as :func:`extract_normalized_counts`: variants as rows,
+    samples as columns.
+
+    Args:
+        dds: DeseqDataSet with ``layers['vst_counts']`` populated.
+
+    Returns:
+        DataFrame of VST values.
+    """
+    logger.info("Extracting VST counts...")
+    if "vst_counts" not in dds.layers:
+        raise RuntimeError("VST counts not found; call dds.vst() before extract_vst_counts")
+
+    vst_arr = dds.layers["vst_counts"]
+    df_vst = pd.DataFrame(
+        vst_arr,
+        index=dds.obs_names,
+        columns=dds.var_names,
+    ).T
+
+    control_variants = df_vst.index[df_vst.index.str.contains("AAV", case=False, na=False)]
+    if len(control_variants) > 0:
+        logger.info(f"Removing control variants from VST matrix: {list(control_variants)}")
+        df_vst = df_vst.drop(control_variants)
+
+    logger.info(f"VST counts shape: {df_vst.shape}")
+    return df_vst
+
+
 def calculate_correlation_statistics(
     dds: DeseqDataSet,
     df_norm: pd.DataFrame,
-    pseudocount: float = 0.01,
+    df_pearson: pd.DataFrame,
 ) -> pd.DataFrame:
     """
     Calculate correlation statistics (Spearman and Pearson) for each group.
 
-    Pearson is computed on log2(normalized counts + pseudocount) to reduce
-    skew and mean–variance effects; Spearman uses normalized counts directly
-    (ranks unchanged by monotonic scaling).
+    Spearman uses DESeq2 normalized counts. Pearson uses ``df_pearson`` (typically
+    DESeq2 VST values aligned with ``df_norm``).
 
     Args:
         dds: DeseqDataSet object
-        df_norm: Normalized counts dataframe (variants as rows, samples as columns)
-        pseudocount: Added before log2 for Pearson (should match analysis.lambda in config)
+        df_norm: Normalized counts (variants as rows, samples as columns)
+        df_pearson: Matrix for Pearson (same index/columns as ``df_norm``), e.g. VST
 
     Returns:
         DataFrame with correlation statistics for each group
     """
     logger.info("Calculating correlation statistics...")
-    df_log = np.log2(df_norm + pseudocount)
+
+    common_variants = df_norm.index.intersection(df_pearson.index)
+    common_samples = df_norm.columns.intersection(df_pearson.columns)
+    df_norm_a = df_norm.loc[common_variants, common_samples]
+    df_pearson_a = df_pearson.loc[common_variants, common_samples]
 
     corr_results = {}
-    groups = dds.obs['group'].unique()
+    groups = dds.obs["group"].unique()
 
     for g in groups:
-        samples = dds.obs.index[dds.obs['group'] == g].tolist()
+        samples = dds.obs.index[dds.obs["group"] == g].tolist()
 
         if len(samples) >= 2:  # at least 2 reps needed
             pair_s = []
             pair_p = []
 
             for s1, s2 in combinations(samples, 2):
-                # Ensure both samples exist in df_norm (samples are columns after transpose)
-                if s1 in df_norm.columns and s2 in df_norm.columns:
-                    s_val, _ = spearmanr(df_norm[s1], df_norm[s2])
-                    p_val, _ = pearsonr(df_log[s1], df_log[s2])
+                if s1 in df_norm_a.columns and s2 in df_norm_a.columns:
+                    s_val, _ = spearmanr(df_norm_a[s1], df_norm_a[s2])
+                    p_val, _ = pearsonr(df_pearson_a[s1], df_pearson_a[s2])
                     pair_s.append(s_val)
                     pair_p.append(p_val)
-            
+
             if pair_s:  # Only add if we have correlations
                 corr_results[g] = {
                     "spearman_mean": np.mean(pair_s),
@@ -571,13 +636,13 @@ def calculate_correlation_statistics(
                     "pearson_mean": np.mean(pair_p),
                     "pearson_min": np.min(pair_p),
                     "pearson_max": np.max(pair_p),
-                    "pearson_sd": np.std(pair_p)
+                    "pearson_sd": np.std(pair_p),
                 }
-    
-    df_corr = pd.DataFrame.from_dict(corr_results, orient='index')
-    
+
+    df_corr = pd.DataFrame.from_dict(corr_results, orient="index")
+
     logger.info(f"Calculated correlations for {len(corr_results)} groups")
-    
+
     return df_corr
 
 
@@ -585,48 +650,54 @@ def create_correlation_scatter_plots(
     dds: DeseqDataSet,
     df_norm: pd.DataFrame,
     output_file: Path,
-    pseudocount: float = 0.01,
+    df_pearson: pd.DataFrame,
+    *,
+    pearson_space_label: str = "DESeq2 VST",
 ):
     """
     Create scatter plots for all pairwise sample comparisons within each group.
 
-    Points are log2(normalized + pseudocount); Pearson r in the title matches
-    that scale. Spearman r is still from ranks on normalized counts.
+    Points are drawn in the same space used for Pearson (``df_pearson``). Spearman
+    is still computed from normalized counts on the same variant set.
 
     Args:
         dds: DeseqDataSet object
-        df_norm: Normalized counts dataframe (variants as rows, samples as columns)
+        df_norm: Normalized counts (variants as rows, samples as columns)
         output_file: Path to save the PDF file
-        pseudocount: Added before log2 (should match analysis.lambda in config)
+        df_pearson: Values for Pearson and scatter axes (e.g. VST), aligned with df_norm
+        pearson_space_label: Short description for plot annotations
     """
-    logger.info(f"Creating correlation scatter plots...")
-    df_log = np.log2(df_norm + pseudocount)
+    logger.info("Creating correlation scatter plots...")
 
-    groups = dds.obs['group'].unique()
+    common_variants = df_norm.index.intersection(df_pearson.index)
+    common_samples = df_norm.columns.intersection(df_pearson.columns)
+    df_norm_a = df_norm.loc[common_variants, common_samples]
+    df_p_a = df_pearson.loc[common_variants, common_samples]
+
+    groups = dds.obs["group"].unique()
 
     with PdfPages(output_file) as pdf:
         for g in groups:
-            samples = dds.obs.index[dds.obs['group'] == g].tolist()
+            samples = dds.obs.index[dds.obs["group"] == g].tolist()
 
             if len(samples) >= 2:
                 for s1, s2 in combinations(samples, 2):
-                    # Ensure both samples exist in df_norm (samples are columns after transpose)
-                    if s1 in df_norm.columns and s2 in df_norm.columns:
-                        sp, _ = spearmanr(df_norm[s1], df_norm[s2])
-                        pr, _ = pearsonr(df_log[s1], df_log[s2])
+                    if s1 in df_norm_a.columns and s2 in df_norm_a.columns:
+                        sp, _ = spearmanr(df_norm_a[s1], df_norm_a[s2])
+                        pr, _ = pearsonr(df_p_a[s1], df_p_a[s2])
 
                         fig, ax = plt.subplots()
-                        ax.scatter(df_log[s1], df_log[s2], color="darkblue", s=15)
+                        ax.scatter(df_p_a[s1], df_p_a[s2], color="darkblue", s=15)
                         ax.set_title(
                             f"{g} | Spearman r={sp:.2f} | Pearson r={pr:.2f}\n"
-                            f"(Pearson on log2(norm+{pseudocount:g}))"
+                            f"(Pearson on {pearson_space_label})"
                         )
-                        ax.set_xlabel(f"log2({s1} + {pseudocount:g})")
-                        ax.set_ylabel(f"log2({s2} + {pseudocount:g})")
+                        ax.set_xlabel(f"{s1}\n({pearson_space_label})")
+                        ax.set_ylabel(f"{s2}\n({pearson_space_label})")
                         fig.tight_layout()
                         pdf.savefig(fig)
                         plt.close(fig)
-    
+
     logger.info(f"Saved correlation scatter plots to {output_file}")
 
 
@@ -1603,12 +1674,38 @@ def run_statistical_analysis(
         # Identify groups (with config support for explicit role definitions)
         target_groups, background_groups, input_groups = identify_groups(meta, config=config)
         
-        # Create DESeq2 dataset
+        # Create DESeq2 dataset (drop variants with low total raw counts first)
         n_cpus_val = n_cpus if n_cpus is not None else config.get("analysis", {}).get("n_cpus", 8)
-        dds = create_deseq_dataset(raw_counts, meta, n_cpus=n_cpus_val)
-        
+        analysis_cfg = config.get("analysis", {})
+        thr = analysis_cfg.get("low_expression_threshold", 10)
+        if thr is None:
+            thr = 10
+        try:
+            thr_i = int(thr)
+        except (TypeError, ValueError):
+            thr_i = 10
+        min_total_raw = thr_i if thr_i > 0 else None
+        dds = create_deseq_dataset(
+            raw_counts, meta, n_cpus=n_cpus_val, min_total_raw_counts=min_total_raw
+        )
+
         # Extract normalized counts (AAV2 control already removed in extract_normalized_counts)
         df_norm = extract_normalized_counts(dds)
+
+        # Pearson on DESeq2 VST (blind to design for dispersion trend); fallback if VST fails
+        corr_pseudocount = analysis_cfg.get("lambda", 0.01)
+        pearson_space_label = f"log2(norm+{corr_pseudocount:g})"
+        try:
+            logger.info("Fitting DESeq2 VST for Pearson replicate correlation...")
+            dds.vst(use_design=False)
+            df_pearson = extract_vst_counts(dds)
+            pearson_space_label = "DESeq2 VST"
+        except Exception as e:
+            logger.warning(
+                "VST failed (%s); Pearson correlation uses log2(normalized + lambda) instead.",
+                e,
+            )
+            df_pearson = np.log2(df_norm + corr_pseudocount)
         
         # Save normalized counts
         norm_counts_file = output_dir / "normalized_counts.tsv"
@@ -1729,18 +1826,19 @@ def run_statistical_analysis(
         group_palette = create_group_color_palette(all_groups)
         logger.info(f"Created color palette for {len(all_groups)} groups")
         
-        # Calculate correlation statistics (Pearson uses log2(norm + lambda), same as RPM pseudocount)
-        corr_pseudocount = config.get("analysis", {}).get("lambda", 0.01)
-        df_corr = calculate_correlation_statistics(dds, df_norm, pseudocount=corr_pseudocount)
-        
+        # Calculate correlation statistics (Spearman on normalized counts; Pearson on VST or fallback)
+        df_corr = calculate_correlation_statistics(dds, df_norm, df_pearson)
+
         # Save correlation statistics
         corr_stats_file = output_dir / "correlation_statistics.tsv"
         df_corr.to_csv(corr_stats_file, sep='\t')
         logger.info(f"Saved correlation statistics to {corr_stats_file}")
-        
+
         # Create correlation scatter plots
         corr_plots_file = output_dir / "correlation_scatterPlot.pdf"
-        create_correlation_scatter_plots(dds, df_norm, corr_plots_file, pseudocount=corr_pseudocount)
+        create_correlation_scatter_plots(
+            dds, df_norm, corr_plots_file, df_pearson, pearson_space_label=pearson_space_label
+        )
         
         # Perform three PCA analyses
         # 1. PCA with all features
