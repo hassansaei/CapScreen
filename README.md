@@ -106,7 +106,7 @@ docker run --rm \
     --sample-info /opt/capscreen/input/Sample_info.csv \
     --output-dir /opt/capscreen/output \
     --reference-file /opt/capscreen/input/reference_library.csv \
-    --merged-counts-output /opt/capscreen/output/merged.counts.tsv \
+    --merged-counts-output /opt/capscreen/output/merged.counts.csv \
     --config /opt/capscreen/capscreen/config.json \
     --threads 8 \
     --stat
@@ -146,7 +146,7 @@ The *reference_library.csv* is a user-specific file containing information about
 - `align`: Runs only QC and alignment steps.
 - `count`: Runs only the variant counting step from a sorted SAM file.
 - `report`: Generates only the HTML report for an existing sample directory.
-- `stat`: Runs statistical analysis on merged counts table (requires merged.counts.tsv and Sample_info.csv).
+- `stat`: Runs statistical analysis on merged counts table (requires merged.counts.csv and Sample_info.csv).
 
 #### Examples
 
@@ -159,7 +159,7 @@ docker run --rm \
   count \
     --sam-file /data/output/my_sample/my_sample.sorted.sam \
     --reference-file /data/reference/library.csv \
-    --output /data/output/my_sample/counts.tsv \
+    --output /data/output/my_sample/sample.counts.csv \
     --output-dir /data/output \
     --sample-name my_sample \
     --config /opt/capscreen/capscreen/config.json
@@ -172,7 +172,7 @@ docker run --rm \
   -v /path/to/output:/opt/capscreen/output \
   capscreen \
   stat \
-    --counts /opt/capscreen/input/merged.counts.tsv \
+    --counts /opt/capscreen/input/merged.counts.csv \
     --sample-info /opt/capscreen/input/Sample_info.csv \
     --output-dir /opt/capscreen/output/statistics \
     --n-cpus 8 \
@@ -245,7 +245,7 @@ The `statistical_analysis` section configures downstream analysis:
 
 - **Batch Mode**:
   - All per-sample outputs
-  - Merged counts table (merged.counts.tsv) with all samples
+  - Merged counts table (merged.counts.csv) with all samples
   - Sample_info.csv for statistical analysis
 
 - **Statistical Analysis** (when `--stat` is used):

@@ -167,7 +167,7 @@ def read_count_table(count_file: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
     Read merged count table and separate raw counts from RPM counts.
     
     Args:
-        count_file: Path to merged.counts.tsv file
+        count_file: Path to merged.counts.csv file
         
     Returns:
         Tuple of (raw_counts_df, rpm_counts_df)
@@ -1569,7 +1569,7 @@ def run_statistical_analysis(
     This function can be called programmatically from other modules.
     
     Args:
-        counts_file: Path to merged.counts.tsv file
+        counts_file: Path to merged.counts.csv file
         sample_info_file: Path to Sample_info.csv file
         output_dir: Output directory for results
         config_file: Path to config.json file (optional)
@@ -1817,7 +1817,7 @@ def main():
         '--counts',
         type=Path,
         required=True,
-        help='Path to merged.counts.tsv file'
+        help='Path to merged.counts.csv file'
     )
     
     parser.add_argument(

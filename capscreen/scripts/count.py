@@ -643,7 +643,7 @@ def main(
         logger.info(f"Assigned counts ({len(df_assigned):,} variants) saved to {output_file}")
 
         # Write unassigned counts to a separate file
-        unassigned_file = output_file.parent / f"{sample_name}.unassigned.counts.tsv"
+        unassigned_file = output_file.parent / f"{sample_name}.unassigned.counts.csv"
         if not df_unassigned.empty:
             df_unassigned = df_unassigned.sort_values('RPM', ascending=False).reset_index(drop=True)
             df_unassigned.to_csv(unassigned_file, index=False)
@@ -676,6 +676,6 @@ if __name__ == "__main__":
     
     # Set default output path if not provided
     if not args.output:
-        args.output = args.sam_file.parent / f"{args.sam_file.stem}.counts.tsv"
+        args.output = args.sam_file.parent / f"{args.sam_file.stem}.counts.csv"
     
     main(args.sam_file, args.reference_file, config, args.output)

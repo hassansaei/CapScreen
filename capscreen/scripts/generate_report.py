@@ -144,7 +144,7 @@ def generate_report(sample_dir, output=None):
     fastp_json = sample_dir / 'fastp.json'
     pipeline_log = sample_dir / f'{sample_name}.pipeline.log'
     pear_log = sample_dir / 'pear.pear.log'
-    counts_tsv = sample_dir / f'{sample_name}.counts.tsv'
+    counts_csv = sample_dir / f'{sample_name}.counts.csv'
 
     fastp_data = parse_fastp_json(fastp_json)
     pipeline_data = parse_pipeline_log(pipeline_log)
@@ -185,8 +185,8 @@ def generate_report(sample_dir, output=None):
     show_count_matrix = config.get('show_count_matrix', False)
     show_histogram = config.get('show_histogram', False)
     log2rpm_hist_path = None
-    if show_count_matrix and counts_tsv.exists():
-        df = pd.read_csv(counts_tsv, sep=None, engine='python')
+    if show_count_matrix and counts_csv.exists():
+        df = pd.read_csv(counts_csv, sep=None, engine='python')
         if 'ID_WLG' in df.columns:
             for col in ['insertions', 'deletions', 'matches', 'Unnamed: 0']:
                 if col in df.columns:

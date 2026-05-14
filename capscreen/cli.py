@@ -67,7 +67,7 @@ def run_statistical_analysis_with_stat_env(
     which has Python 3.9+ and all required dependencies (pydeseq2, etc.).
     
     Args:
-        counts_file: Path to merged.counts.tsv file
+        counts_file: Path to merged.counts.csv file
         sample_info_file: Path to Sample_info.csv file
         output_dir: Output directory for results
         config_file: Path to config.json file (optional)
@@ -451,7 +451,7 @@ def merge_count_tables(
     
     for entry in sample_entries:
         sample_order.append(entry.sample_id)
-        counts_path = output_dir / entry.sample_id / f"{entry.sample_id}.counts.tsv"
+        counts_path = output_dir / entry.sample_id / f"{entry.sample_id}.counts.csv"
         if not counts_path.exists():
             logger.warning(f"Count file not found for sample {entry.sample_id}: {counts_path}. Skipping.")
             continue
@@ -501,7 +501,7 @@ def merge_count_tables(
         logger.error("No count files could be read; merged counts table will not be created.")
         return None
     
-    output_path = output_path or (output_dir / "merged.counts.tsv")
+    output_path = output_path or (output_dir / "merged.counts.csv")
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open("w", newline='') as merged_file:
@@ -618,7 +618,7 @@ def sample_results_exist(output_dir: Path, sample_name: str, config: Optional[Di
     sample_dir = output_dir / sample_name
     
     # Check for final count table - if exists, skip entire pipeline
-    counts_file = sample_dir / f"{sample_name}.counts.tsv"
+    counts_file = sample_dir / f"{sample_name}.counts.csv"
     if counts_file.exists() and counts_file.stat().st_size > 0:
         logger.info(
             "Detected existing results for sample %s at %s. Skipping re-run.",
@@ -635,7 +635,7 @@ def sample_results_exist(output_dir: Path, sample_name: str, config: Optional[Di
             sample_name,
             sam_file
         )
-        # Don't return True here - we still want to run counting if count.tsv doesn't exist
+        # Don't return True here - we still want to run counting if counts.csv doesn't exist
     
     # Check for PEAR merge output - if exists, skip PEAR step (but will still run alignment)
     if config:
@@ -693,7 +693,7 @@ def execute_full_pipeline(
             logger.error(f"QC/Alignment failed for sample {sample_name}.")
             return False
     
-    output_file = sample_dir / f"{sample_name}.counts.tsv"
+    output_file = sample_dir / f"{sample_name}.counts.csv"
     
     # Use threads from parameter if provided, otherwise use config value
     # count_module.main will handle config fallback if n_threads is None
@@ -782,7 +782,7 @@ def main():
     count_parser = subparsers.add_parser("count", parents=[parent_parser], help="Run variant counting only")
     count_parser.add_argument("--sam-file", type=Path, required=True, help="Path to sorted SAM file")
     count_parser.add_argument("--reference-file", type=Path, required=True, help="Path to reference library file (CSV)")
-    count_parser.add_argument("--output", type=Path, help="Path to output file (TSV)")
+    count_parser.add_argument("--output", type=Path, help="Path to output file (CSV)")
 
     # report: HTML report only
     report_parser = subparsers.add_parser("report", parents=[parent_parser], help="Generate HTML report from an existing sample directory")
@@ -790,7 +790,7 @@ def main():
 
     # stat: statistical analysis
     stat_parser = subparsers.add_parser("stat", parents=[parent_parser], help="Run statistical analysis on merged counts")
-    stat_parser.add_argument("--counts", type=Path, required=True, help="Path to merged.counts.tsv file")
+    stat_parser.add_argument("--counts", type=Path, required=True, help="Path to merged.counts.csv file")
     stat_parser.add_argument("--sample-info", type=Path, required=True, help="Path to Sample_info.csv file")
     stat_parser.add_argument("--n-cpus", type=int, help="Number of CPUs to use for DESeq2")
 
@@ -920,7 +920,7 @@ def main():
                 append_sample_log_to_batch(batch_log_path, sample_log_file, entry.sample_id)
                 if not success:
                     logger.warning(f"Pipeline reported a failure for sample {entry.sample_id}. Checking for count file before proceeding.")
-                count_file = args.output_dir / entry.sample_id / f"{entry.sample_id}.counts.tsv"
+                count_file = args.output_dir / entry.sample_id / f"{entry.sample_id}.counts.csv"
                 if not count_file.exists():
                     logger.error(f"Count file not found for sample {entry.sample_id} at {count_file}. Moving on to next sample.")
                     continue
@@ -932,7 +932,7 @@ def main():
             )
             merged_output_path = args.merged_counts_output
             if merged_output_path is None:
-                merged_output_path = args.output_dir / "merged.counts.tsv"
+                merged_output_path = args.output_dir / "merged.counts.csv"
             merged_path = merge_count_tables(sample_entries, args.output_dir, merged_output_path)
             if merged_path:
                 logger.info(f"Merged counts table saved to {merged_path}")
@@ -1044,7 +1044,7 @@ def main():
         sys.exit(0)
     elif args.command == "count":
         # Use provided output file or default
-        output_file = args.output if args.output else args.sam_file.parent / f"{args.sam_file.stem}.counts.tsv"
+        output_file = args.output if args.output else args.sam_file.parent / f"{args.sam_file.stem}.counts.csv"
         # Use --threads if provided, otherwise use config value (count_module.main will handle config fallback)
         n_threads = args.threads if args.threads is not None else json_config.get('threads')
         try:
