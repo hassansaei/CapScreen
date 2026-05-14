@@ -37,8 +37,9 @@ This script performs a complete statistical analysis pipeline on CapScreen count
    - Calculates log2 fold changes, p-values, and FDR-adjusted p-values
 
 6. Visualization:
-   - Target enrichment scatter plots (with top enriched variants highlighted)
-   - Top target-specific variants bar plots
+   - Target enrichment scatter plots and top-variant bar plots for each requested
+     enrichment pair (default: all unordered pairs among non-input groups with
+     ``mean_log2Enrich_*`` columns; configurable via ``plots.enrichment_plot_pairing``)
    - RPM scatter density plots for replicate comparisons
    - Heatmaps for target-enriched peptides (from differential expression results)
 
@@ -141,7 +142,9 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
                     "point_size": 120,
                     "fontsize": 10
                 },
-                "fontsize": 10
+                "fontsize": 10,
+                # "target_background" = only target×background grid; "all_pairs" = every group pair
+                "enrichment_plot_pairing": "all_pairs",
             },
             "colors": {
                 "target": "#d62728",
@@ -1285,6 +1288,52 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
     return df_rpm_annot
 
 
+def iter_enrichment_scatter_bar_pairs(
+    groups_in_enrich: list,
+    plot_targets: list,
+    plot_backgrounds: list,
+    pairing: str,
+) -> list:
+    """
+    Build (group_y, group_x) tuples for enrichment scatter and bar plots.
+
+    Scatter uses y = mean log2 enrichment of ``group_y`` vs Input, x = that of ``group_x``.
+
+    Parameters
+    ----------
+    pairing:
+        - ``target_background`` — Cartesian product ``plot_targets`` × ``plot_backgrounds``
+          (skips pairs where both names are equal).
+        - ``all_pairs`` — all unordered pairs among ``groups_in_enrich`` (drops a group
+          whose name is only ``input``, case-insensitive).
+    """
+    mode = (pairing or "target_background").strip().lower().replace("-", "_")
+
+    if mode in ("all_pairs", "all", "complete"):
+        cand = sorted({g for g in groups_in_enrich if str(g).strip().lower() != "input"})
+        if len(cand) < 2:
+            return []
+        pairs = list(combinations(cand, 2))
+        logger.info(
+            f"Enrichment plot pairing '{mode}': {len(pairs)} unordered group pair(s) among {cand}"
+        )
+        return pairs
+
+    if mode not in ("target_background", "legacy", "default"):
+        logger.warning(
+            f"Unknown plots.enrichment_plot_pairing '{pairing}'; using 'target_background'."
+        )
+    pairs = []
+    for t in plot_targets:
+        for b in plot_backgrounds:
+            if t != b:
+                pairs.append((t, b))
+    logger.info(
+        f"Enrichment plot pairing 'target_background': {len(pairs)} target×background pair(s)"
+    )
+    return pairs
+
+
 def plot_target_enrichment_scatter(df_rpm_annot: pd.DataFrame, output_file: Path,
                                    target_group: str = "Target", 
                                    background_group: str = "Bead-Fc",
@@ -1372,7 +1421,10 @@ def plot_target_enrichment_scatter(df_rpm_annot: pd.DataFrame, output_file: Path
     # Set labels
     plt.xlabel(f"{background_group} log2 enrichment vs Input", fontsize=fontsize)
     plt.ylabel(f"{target_group} log2 enrichment vs Input", fontsize=fontsize)
-    plt.title("Target-specific peptide enrichment", fontsize=fontsize)
+    plt.title(
+        f"{target_group} vs {background_group}\n(log2 enrichment vs Input)",
+        fontsize=fontsize,
+    )
     
     plt.tight_layout()
     plt.savefig(output_file, dpi=dpi, bbox_inches='tight')
@@ -1454,9 +1506,15 @@ def plot_top_target_specific_variants(df_rpm_annot: pd.DataFrame, output_file: P
     )
     
     # Set labels
-    plt.xlabel(f"Target − {background_group} log2 enrichment", fontsize=fontsize)
+    plt.xlabel(
+        f"{target_group} − {background_group} (Δ log2 enrichment vs Input)",
+        fontsize=fontsize,
+    )
     plt.ylabel("Peptide", fontsize=fontsize)
-    plt.title(f"Top {len(top_variants)} Target-specific peptides", fontsize=fontsize)
+    plt.title(
+        f"Top {len(top_variants)} variants (higher in {target_group})",
+        fontsize=fontsize,
+    )
     
     # Invert y-axis so highest values are at the top
     plt.gca().invert_yaxis()
@@ -1801,26 +1859,32 @@ def run_statistical_analysis(
                 df_rpm_annot.to_csv(rpm_enrichment_file, sep='\t')
                 logger.info(f"Saved RPM enrichment analysis to {rpm_enrichment_file}")
                 
-                # Create target enrichment scatter plots and bar plots for ALL target-background pairs
+                # Enrichment scatter + bar plots for each requested group pair
                 if df_rpm_annot is not None:
-                    # Find all target and background groups from the enrichment columns
-                    enrich_cols = [col for col in df_rpm_annot.columns if col.startswith("mean_log2Enrich_")]
+                    enrich_cols = [
+                        col for col in df_rpm_annot.columns if col.startswith("mean_log2Enrich_")
+                    ]
                     if enrich_cols:
-                        # Extract group names from column names
-                        groups_in_enrich = [col.replace("mean_log2Enrich_", "") for col in enrich_cols]
-                        
-                        # Use config-based group identification if available, otherwise use heuristics
+                        groups_in_enrich = [
+                            col.replace("mean_log2Enrich_", "") for col in enrich_cols
+                        ]
+
                         config_groups = config.get("group_roles", None) if config else None
-                        
+                        plot_targets: list = []
+                        plot_backgrounds: list = []
+
                         if config_groups:
-                            # Use explicit configuration
-                            plot_targets = [g for g in config_groups.get("target", []) if g in groups_in_enrich]
-                            plot_backgrounds = [g for g in config_groups.get("background", []) if g in groups_in_enrich]
-                            
-                            # For unclassified groups, use heuristics
+                            plot_targets = [
+                                g for g in config_groups.get("target", []) if g in groups_in_enrich
+                            ]
+                            plot_backgrounds = [
+                                g for g in config_groups.get("background", [])
+                                if g in groups_in_enrich
+                            ]
                             classified = set(plot_targets + plot_backgrounds)
-                            unclassified = [g for g in groups_in_enrich if g not in classified]
-                            
+                            unclassified = [
+                                g for g in groups_in_enrich if g not in classified
+                            ]
                             for g in unclassified:
                                 role = _classify_group_heuristic(g)
                                 if role == "target":
@@ -1828,52 +1892,95 @@ def run_statistical_analysis(
                                 elif role == "background":
                                     plot_backgrounds.append(g)
                         else:
-                            # Fall back to heuristics
-                            plot_targets = [g for g in groups_in_enrich if _classify_group_heuristic(g) == "target"]
-                            plot_backgrounds = [g for g in groups_in_enrich if _classify_group_heuristic(g) == "background"]
-                        
-                        # Create plots for each target-background pair
-                        if plot_targets and plot_backgrounds:
-                            scatter_top_n = config.get("plots", {}).get("scatter_highlight_top_n", 60)
-                            bar_top_n = config.get("plots", {}).get("bar_plot_top_n", 30)
-                            
-                            plot_count = 0
-                            for plot_target in plot_targets:
-                                for plot_background in plot_backgrounds:
-                                    # Create safe filenames
-                                    safe_target = plot_target.replace(" ", "_").replace("/", "_").replace("-", "_")
-                                    safe_background = plot_background.replace(" ", "_").replace("/", "_").replace("-", "_")
-                                    
-                                    # Scatter plot
-                                    scatter_file = output_dir / f"target_enrichment_scatter_{safe_target}_vs_{safe_background}.png"
-                                    try:
-                                        plot_target_enrichment_scatter(
-                                            df_rpm_annot, scatter_file,
-                                            target_group=plot_target,
-                                            background_group=plot_background,
-                                            top_n=scatter_top_n,
-                                            config=config
-                                        )
-                                        plot_count += 1
-                                    except Exception as e:
-                                        logger.warning(f"Failed to create scatter plot for {plot_target} vs {plot_background}: {e}")
-                                    
-                                    # Bar plot
-                                    bar_plot_file = output_dir / f"top_target_specific_variants_{safe_target}_vs_{safe_background}.png"
-                                    try:
-                                        plot_top_target_specific_variants(
-                                            df_rpm_annot, bar_plot_file,
-                                            target_group=plot_target,
-                                            background_group=plot_background,
-                                            top_n=bar_top_n,
-                                            config=config
-                                        )
-                                    except Exception as e:
-                                        logger.warning(f"Failed to create bar plot for {plot_target} vs {plot_background}: {e}")
-                            
-                            logger.info(f"Created {plot_count} scatter plots and bar plots for {len(plot_targets)} target(s) vs {len(plot_backgrounds)} background(s)")
+                            plot_targets = [
+                                g
+                                for g in groups_in_enrich
+                                if _classify_group_heuristic(g) == "target"
+                            ]
+                            plot_backgrounds = [
+                                g
+                                for g in groups_in_enrich
+                                if _classify_group_heuristic(g) == "background"
+                            ]
+
+                        plot_cfg = config.get("plots", {}) or {}
+                        enrich_pairing = plot_cfg.get("enrichment_plot_pairing", "all_pairs")
+                        pair_list = iter_enrichment_scatter_bar_pairs(
+                            groups_in_enrich,
+                            plot_targets,
+                            plot_backgrounds,
+                            enrich_pairing,
+                        )
+
+                        if pair_list:
+                            scatter_top_n = plot_cfg.get("scatter_highlight_top_n", 60)
+                            bar_top_n = plot_cfg.get("bar_plot_top_n", 30)
+
+                            scatter_ok = 0
+                            bar_ok = 0
+                            for group_y, group_x in pair_list:
+                                safe_y = (
+                                    group_y.replace(" ", "_")
+                                    .replace("/", "_")
+                                    .replace("-", "_")
+                                )
+                                safe_x = (
+                                    group_x.replace(" ", "_")
+                                    .replace("/", "_")
+                                    .replace("-", "_")
+                                )
+                                scatter_file = (
+                                    output_dir
+                                    / f"target_enrichment_scatter_{safe_y}_vs_{safe_x}.png"
+                                )
+                                try:
+                                    plot_target_enrichment_scatter(
+                                        df_rpm_annot,
+                                        scatter_file,
+                                        target_group=group_y,
+                                        background_group=group_x,
+                                        top_n=scatter_top_n,
+                                        config=config,
+                                    )
+                                    scatter_ok += 1
+                                except Exception as e:
+                                    logger.warning(
+                                        f"Failed to create scatter plot for {group_y} vs {group_x}: {e}"
+                                    )
+
+                                bar_plot_file = (
+                                    output_dir
+                                    / f"top_target_specific_variants_{safe_y}_vs_{safe_x}.png"
+                                )
+                                try:
+                                    plot_top_target_specific_variants(
+                                        df_rpm_annot,
+                                        bar_plot_file,
+                                        target_group=group_y,
+                                        background_group=group_x,
+                                        top_n=bar_top_n,
+                                        config=config,
+                                    )
+                                    bar_ok += 1
+                                except Exception as e:
+                                    logger.warning(
+                                        f"Failed to create bar plot for {group_y} vs {group_x}: {e}"
+                                    )
+
+                            logger.info(
+                                "Created %d enrichment scatter plot(s) and %d bar plot(s) "
+                                "(pairing=%s).",
+                                scatter_ok,
+                                bar_ok,
+                                enrich_pairing,
+                            )
                         else:
-                            logger.warning("Could not determine target/background groups for scatter plots")
+                            logger.warning(
+                                "No enrichment scatter/bar pairs to plot "
+                                "(check plots.enrichment_plot_pairing and group columns)."
+                            )
+                    else:
+                        logger.warning("No mean_log2Enrich_* columns for enrichment plots")
                 
             except Exception as e:
                 logger.warning(f"Failed to perform RPM enrichment analysis: {e}")

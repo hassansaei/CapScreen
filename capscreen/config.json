@@ -96,7 +96,8 @@
                 "point_size": 120,
                 "fontsize": 10
             },
-            "fontsize": 10
+            "fontsize": 10,
+            "enrichment_plot_pairing": "all_pairs"
         },
         "colors": {
             "target": "#d62728",
