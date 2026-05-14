@@ -69,7 +69,8 @@
         },
         "differential_expression": {
             "padj_threshold": 0.05,
-            "log2fc_threshold": 1.0
+            "log2fc_threshold": 1.0,
+            "pairing": "target_background"
         },
         "plots": {
             "scatter_highlight_top_n": 60,

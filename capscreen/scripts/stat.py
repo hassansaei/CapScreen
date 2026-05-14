@@ -29,7 +29,11 @@ This script performs a complete statistical analysis pipeline on CapScreen count
    - PCA excluding input samples
 
 5. Differential Expression Analysis:
-   - OLS regression-based differential expression (target vs background groups)
+   - OLS regression-based differential expression between two groups at a time
+   - Pairing mode ``target_background`` (default): WT/KO-style prefix matching, else all
+     target×background combinations; mode ``all_pairs_non_input``: every unordered pair
+     among configured target and background groups (excluding input); mode
+     ``all_meta_non_input``: every unordered pair among all metadata groups except input
    - Calculates log2 fold changes, p-values, and FDR-adjusted p-values
 
 6. Visualization:
@@ -110,7 +114,9 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
             },
             "differential_expression": {
                 "padj_threshold": 0.05,
-                "log2fc_threshold": 1.0
+                "log2fc_threshold": 1.0,
+                # "target_background" | "all_pairs_non_input" | "all_meta_non_input"
+                "pairing": "target_background",
             },
             "plots": {
                 "scatter_highlight_top_n": 60,
@@ -828,17 +834,71 @@ def pair_wt_ko_groups(target_groups: list, background_groups: list) -> list:
     return pairs
 
 
+def build_differential_expression_pairs(
+    meta: pd.DataFrame,
+    target_groups: list,
+    background_groups: list,
+    input_groups: list,
+    pairing: str,
+) -> list:
+    """
+    Build (group_a, group_b) pairs for pairwise OLS differential expression.
+
+    Parameters
+    ----------
+    pairing:
+        - ``target_background`` — :func:`pair_wt_ko_groups` (prefix-matched WT/KO or full
+          target×background grid).
+        - ``all_pairs_non_input`` — all unordered pairs among groups that appear in
+          ``target_groups`` or ``background_groups`` and in ``meta``, excluding
+          ``input_groups`` (includes target–target and background–background).
+        - ``all_meta_non_input`` — all unordered pairs among every ``meta['group']``
+          value except those in ``input_groups``.
+
+    The coefficient in each run is for the **first** group vs the **second** (reference).
+    """
+    mode = (pairing or "target_background").strip().lower().replace("-", "_")
+    meta_group_set = set(meta["group"].unique())
+    input_set = set(input_groups or [])
+
+    if mode in ("all_pairs_non_input", "all_non_input", "all_pairs"):
+        cand = sorted((set(target_groups or []) | set(background_groups or [])) & meta_group_set)
+        cand = [g for g in cand if g not in input_set]
+        pairs = list(combinations(cand, 2)) if len(cand) >= 2 else []
+        logger.info(
+            f"DE pairing mode '{mode}': {len(pairs)} unordered pair(s) among "
+            f"{len(cand)} non-input group(s): {cand}"
+        )
+        return pairs
+
+    if mode in ("all_meta_non_input", "all_groups_non_input"):
+        cand = sorted(g for g in meta_group_set if g not in input_set)
+        pairs = list(combinations(cand, 2)) if len(cand) >= 2 else []
+        logger.info(
+            f"DE pairing mode '{mode}': {len(pairs)} unordered pair(s) among "
+            f"all metadata groups except input: {cand}"
+        )
+        return pairs
+
+    if mode not in ("target_background", "legacy", "default"):
+        logger.warning(
+            f"Unknown differential_expression.pairing '{pairing}'; "
+            "using 'target_background'."
+        )
+    return pair_wt_ko_groups(target_groups, background_groups)
+
+
 def perform_differential_expression(df_norm: pd.DataFrame, meta: pd.DataFrame,
                                     target_group: str, background_group: str) -> pd.DataFrame:
     """
     Perform differential expression analysis using OLS regression.
-    
+
     Args:
         df_norm: Normalized counts dataframe (variants as rows, samples as columns)
         meta: Metadata dataframe
-        target_group: Name of target group
-        background_group: Name of background group
-        
+        target_group: First group (contrast); coefficient is effect of this vs reference
+        background_group: Second group (reference level for the binary indicator)
+
     Returns:
         DataFrame with differential expression results (log2FC, pval, padj)
     """
@@ -1872,31 +1932,39 @@ def run_statistical_analysis(
                 title=f"PCA - Top {pca_top_n} Features (No Input Samples)",
                 group_palette=group_palette, config=config)
         
-        # Perform differential expression analysis for all matched pairs
-        # Try to pair WT and KO groups by prefix (e.g., CD47_WT vs CD47_KO)
-        de_pairs = pair_wt_ko_groups(target_groups, background_groups)
-        
+        # Differential expression: pairing mode from config (see build_differential_expression_pairs)
+        de_cfg = config.get("differential_expression", {}) or {}
+        pairing = de_cfg.get("pairing", "target_background")
+        de_pairs = build_differential_expression_pairs(
+            meta, target_groups, background_groups, input_groups, pairing
+        )
+
         if de_pairs:
-            logger.info(f"Performing differential expression for {len(de_pairs)} pair(s)...")
-            for de_target, de_background in de_pairs:
+            logger.info(f"Performing differential expression for {len(de_pairs)} pair(s) (pairing={pairing})...")
+            for group_a, group_b in de_pairs:
                 try:
-                    logger.info(f"Running DE: {de_target} vs {de_background}")
+                    logger.info(f"Running DE: {group_a} vs {group_b}")
                     de_results = perform_differential_expression(
-                        df_norm, meta, de_target, de_background
+                        df_norm, meta, group_a, group_b
                     )
-                    
+
                     # Save differential expression results
-                    safe_target = de_target.replace(" ", "_").replace("/", "_").replace("-", "_")
-                    safe_background = de_background.replace(" ", "_").replace("/", "_").replace("-", "_")
-                    de_file = output_dir / f"DE_{safe_target}_vs_{safe_background}.tsv"
+                    safe_a = group_a.replace(" ", "_").replace("/", "_").replace("-", "_")
+                    safe_b = group_b.replace(" ", "_").replace("/", "_").replace("-", "_")
+                    de_file = output_dir / f"DE_{safe_a}_vs_{safe_b}.tsv"
                     de_results.to_csv(de_file, sep='\t')
                     logger.info(f"Saved differential expression results to {de_file}")
-                    
+
                 except Exception as e:
-                    logger.warning(f"Failed to perform differential expression analysis for {de_target} vs {de_background}: {e}")
+                    logger.warning(
+                        f"Failed to perform differential expression analysis for "
+                        f"{group_a} vs {group_b}: {e}"
+                    )
         else:
-            logger.warning("Skipping differential expression analysis: "
-                              "Could not determine target and background group pairs")
+            logger.warning(
+                "Skipping differential expression analysis: no group pairs to compare "
+                "(check differential_expression.pairing and group_roles / metadata)."
+            )
         
         logger.info("Statistical analysis completed successfully!")
         return True
