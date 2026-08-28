@@ -41,7 +41,18 @@
 
         <tr><th colspan="2">SAM File Processing Statistics</th></tr>
         {% for k, v in pipeline.stats.items() %}
-        <tr><td>{{ k.replace('_', ' ').capitalize() }}</td><td>{{ v }}</td></tr>
+        <tr>
+            <td>
+                {% if k == 'outer_5p_flank_mismatches' %}Outer 5' flank mismatches
+                {% elif k == 'outer_3p_flank_mismatches' %}Outer 3' flank mismatches
+                {% elif k == 'leftover_5p_flank_corrected' %}Leftover 5' flank corrected
+                {% elif k == 'leftover_3p_flank_corrected' %}Leftover 3' flank corrected
+                {% elif k == 'primer_spacer_n_trimmed' %}Primer spacer N trimmed
+                {% elif k == 'flank_mismatches_corrected' %}Flank mismatches found and corrected
+                {% else %}{{ k.replace('_', ' ').capitalize() }}{% endif %}
+            </td>
+            <td>{{ v }}</td>
+        </tr>
         {% endfor %}
 
         <tr><th colspan="2">Reference capsid Library Statistics</th></tr>

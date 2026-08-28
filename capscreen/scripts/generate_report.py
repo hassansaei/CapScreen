@@ -54,6 +54,18 @@ def parse_pipeline_log(filepath):
             stats['reads_with_flanking'] = msg.split(':')[-1].strip()
         elif 'Valid peptides after translation:' in msg:
             stats['valid_peptides'] = msg.split(':')[-1].strip()
+        elif "Outer 5' flank mismatches:" in msg:
+            stats['outer_5p_flank_mismatches'] = msg.split(':', 1)[-1].strip()
+        elif "Outer 3' flank mismatches:" in msg:
+            stats['outer_3p_flank_mismatches'] = msg.split(':', 1)[-1].strip()
+        elif "Leftover 5' flank corrected:" in msg:
+            stats['leftover_5p_flank_corrected'] = msg.split(':', 1)[-1].strip()
+        elif "Leftover 3' flank corrected:" in msg:
+            stats['leftover_3p_flank_corrected'] = msg.split(':', 1)[-1].strip()
+        elif 'Primer spacer N trimmed:' in msg:
+            stats['primer_spacer_n_trimmed'] = msg.split(':', 1)[-1].strip()
+        elif 'Reads with flank mismatches found and corrected:' in msg:
+            stats['flank_mismatches_corrected'] = msg.split(':', 1)[-1].strip()
         elif 'Unique peptides in reference:' in msg:
             merging_stats['unique_peptides_in_reference'] = msg.split(':')[-1].strip().replace(',', '')
         elif 'Peptides in reference but not in input:' in msg:

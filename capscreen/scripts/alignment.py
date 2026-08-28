@@ -13,9 +13,17 @@ from typing import Any, Dict, Optional, Tuple, List
 logger = logging.getLogger("FastQProcessor")
 
 
-def run_command(command: list, step_name: str, log_file: Optional[Path] = None) -> bool:
+def run_command(
+    command: list,
+    step_name: str,
+    log_file: Optional[Path] = None,
+    log_output: bool = False
+) -> bool:
     """
     Run a shell command and log its output.
+
+    If log_output is True, stdout/stderr are written at INFO so tool reports
+    (for example Cutadapt match counts) appear in the pipeline log.
     """
     logger.info(f"[{step_name}] Running command: {' '.join(shlex.quote(str(s)) for s in command)}")
 
@@ -27,10 +35,11 @@ def run_command(command: list, step_name: str, log_file: Optional[Path] = None) 
             check=True
         )
 
+        out_level = logging.INFO if log_output else logging.DEBUG
         if process.stdout:
-            logger.debug(f"[{step_name}] STDOUT:\n{process.stdout.strip()}")
+            logger.log(out_level, f"[{step_name}] STDOUT:\n{process.stdout.strip()}")
         if process.stderr:
-            logger.debug(f"[{step_name}] STDERR:\n{process.stderr.strip()}")
+            logger.log(out_level, f"[{step_name}] STDERR:\n{process.stderr.strip()}")
 
         logger.info(f"[{step_name}] Successfully completed.")
         return True
@@ -164,13 +173,18 @@ def run_cutadapt_umi(
 ) -> Optional[Path]:
     """
     Run Cutadapt to extract the variable region between flanking sequences
-    and then re-attach the flanks to each read. This is done to remove the UMI sequences from the reads
+    and then re-attach the flanks to each read.
+
+    Uses a linked 5'+3' adapter so both flanks must match. Substitutions up
+    to flanking_sequences.max_mismatches are allowed at both ends. The
+    Illumina R1/R2 primer N spacer (primer_n) sits outside the flanks and is
+    removed with the adapters.
 
     Workflow:
-      1. Use Cutadapt to trim everything outside the configured flanks
-         on the PEAR-assembled reads (and discard reads without both flanks).
-      2. Re-add the known flanks (from the config) to each trimmed read so
-         downstream steps that expect flanking sequences still work.
+      1. Trim everything outside the configured flanks on PEAR-assembled
+         reads and discard reads without both flanks.
+      2. Re-add the canonical flanks so downstream alignment and counting
+         still see flanking sequences.
     """
     flanking_cfg = config.get("flanking_sequences") or {}
     flank_5p = flanking_cfg.get("flank_5p")
@@ -183,21 +197,42 @@ def run_cutadapt_umi(
         )
         return None
 
+    max_mm = int(flanking_cfg.get("max_mismatches", 2))
+    if max_mm < 0:
+        max_mm = 0
+    primer_n = int(flanking_cfg.get("primer_n", 1))
+    min_flank = min(len(flank_5p), len(flank_3p))
+    error_rate = (max_mm / min_flank) if min_flank else 0.1
+    min_overlap = max(1, min_flank - max_mm)
+
+    # Linked adapter requires both flanks. Prefix/suffix bases (Illumina R1/R2
+    # N spacer) sit outside the flanks and are removed with the adapters.
+    linked = "{0}...{1}".format(flank_5p, flank_3p)
     trimmed_fastq = sample_dir / "pear.trimmed.fastq"
     cutadapt_cmd = [
         "cutadapt",
-        "-g", flank_5p,
-        "-a", flank_3p,
+        "-e", "{0:.4f}".format(error_rate),
+        "-O", str(min_overlap),
+        "--no-indels",
+        "-g", linked,
         "--discard-untrimmed",
         "-o", str(trimmed_fastq),
         str(assembled_fastq),
     ]
 
-    # Use multiple cores if available (Cutadapt uses -j/--cores)
     if threads and threads > 1:
         cutadapt_cmd[1:1] = ["-j", str(threads)]
 
-    if not run_command(cutadapt_cmd, "CUTADAPT_UMI"):
+    logger.info(
+        "Cutadapt linked-flank trim: max_mismatches=%s (error_rate=%.4f, min_overlap=%s), "
+        "primer_n=%s allowed outside both 5' (R1) and 3' (R2) flanks",
+        max_mm,
+        error_rate,
+        min_overlap,
+        primer_n
+    )
+
+    if not run_command(cutadapt_cmd, "CUTADAPT_UMI", log_output=True):
         return None
 
     # Re-add flanks to each read so that downstream steps (alignment + counting)

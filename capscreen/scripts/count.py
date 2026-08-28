@@ -47,25 +47,291 @@ def setup_logging(output_dir: Path = None, sample_name: str = None, log_file: Pa
 
     return logger
 
-def extract_variable_region(seq: str, flank_5p: str, flank_3p: str) -> str:
-    """
-    Extract variable region between flanking sequences.
-    
-    Args:
-        seq (str): Full sequence
-        flank_5p (str): 5' flanking sequence
-        flank_3p (str): 3' flanking sequence
-        
-    Returns:
-        str: Extracted variable region or None if flanks not found
-    """
-    start = seq.find(flank_5p)
-    end = seq.find(flank_3p)
+DEFAULT_MAX_MISMATCHES = 2
+DEFAULT_PRIMER_N = 1
+DEFAULT_MAX_VARIABLE_NT = 120
 
-    if start != -1 and end != -1:
-        start += len(flank_5p)
-        return seq[start:end]
-    return None
+
+def _flank_params(config: Dict) -> Tuple[str, str, int, int, int]:
+    """Return flank sequences and matching parameters from config."""
+    fs = config['flanking_sequences']
+    max_mm = int(fs.get('max_mismatches', DEFAULT_MAX_MISMATCHES))
+    primer_n = int(fs.get('primer_n', DEFAULT_PRIMER_N))
+    max_variable_nt = int(fs.get('max_variable_nt', DEFAULT_MAX_VARIABLE_NT))
+    if max_mm < 0:
+        max_mm = 0
+    if primer_n < 0:
+        primer_n = 0
+    if max_variable_nt < 1:
+        max_variable_nt = DEFAULT_MAX_VARIABLE_NT
+    return fs['flank_5p'], fs['flank_3p'], max_mm, primer_n, max_variable_nt
+
+
+def _hamming_le(a: str, b: str, max_mm: int) -> Optional[int]:
+    """Return Hamming distance if it is at most max_mm, else None."""
+    if len(a) != len(b):
+        return None
+    mm = 0
+    for x, y in zip(a, b):
+        if x != y:
+            mm += 1
+            if mm > max_mm:
+                return None
+    return mm
+
+
+def _find_flank(
+    seq: str,
+    pattern: str,
+    max_mm: int,
+    start: int = 0,
+    end: Optional[int] = None,
+    rightmost: bool = False
+) -> Optional[Tuple[int, int]]:
+    """
+    Find pattern in seq allowing up to max_mm substitutions.
+
+    Prefers an exact match. Otherwise returns the match with the fewest
+    mismatches (leftmost, or rightmost if requested).
+    """
+    n = len(pattern)
+    if n == 0 or len(seq) < n:
+        return None
+    last = (len(seq) if end is None else end) - n
+    if last < start:
+        return None
+
+    best = None
+    positions = range(last, start - 1, -1) if rightmost else range(start, last + 1)
+    for i in positions:
+        mm = _hamming_le(seq[i:i + n], pattern, max_mm)
+        if mm is None:
+            continue
+        if mm == 0:
+            return (i, 0)
+        if best is None or mm < best[1]:
+            best = (i, mm)
+    return best
+
+
+def _strip_leftover_flanks(
+    seq: str,
+    flank_5p: str,
+    flank_3p: str,
+    max_mm: int,
+    primer_n: int
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Remove untrimmed 5'/3' copies of the flanks from an extracted insert.
+
+    Allows up to primer_n random bases (Illumina primer N spacer) outside
+    each leftover flank. The 3' search looks near the end of the sequence
+    so extra bases after a mismatched 3' flank are removed with it.
+    """
+    info = {
+        'leftover_5p_mm': None,
+        'leftover_3p_mm': None,
+        'primer_n_5p': False,
+        'primer_n_3p': False
+    }
+    if not seq:
+        return seq, info
+
+    n5 = len(flank_5p)
+    if n5 and len(seq) >= n5:
+        for skip in range(min(primer_n, len(seq) - n5) + 1):
+            mm = _hamming_le(seq[skip:skip + n5], flank_5p, max_mm)
+            if mm is None:
+                continue
+            info['leftover_5p_mm'] = mm
+            info['primer_n_5p'] = skip > 0
+            seq = seq[skip + n5:]
+            break
+
+    n3 = len(flank_3p)
+    if n3 and len(seq) >= n3:
+        extra_tail = primer_n + 16
+        window_start = max(0, len(seq) - n3 - extra_tail)
+        best = None
+        for i in range(window_start, len(seq) - n3 + 1):
+            mm = _hamming_le(seq[i:i + n3], flank_3p, max_mm)
+            if mm is None:
+                continue
+            if best is None or mm < best[1] or (mm == best[1] and i < best[0]):
+                best = (i, mm)
+        if best is not None:
+            pos, mm = best
+            info['leftover_3p_mm'] = mm
+            info['primer_n_3p'] = (len(seq) - (pos + n3)) > 0 and (len(seq) - (pos + n3)) <= primer_n
+            seq = seq[:pos]
+    return seq, info
+
+
+def extract_variable_region(
+    seq: str,
+    flank_5p: str,
+    flank_3p: str,
+    max_mismatches: int = DEFAULT_MAX_MISMATCHES,
+    primer_n: int = DEFAULT_PRIMER_N,
+    max_variable_nt: int = DEFAULT_MAX_VARIABLE_NT
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    """
+    Extract the variable region between 5' and 3' flanks.
+
+    Flanks may differ from the configured sequences by up to max_mismatches
+    substitutions. After the outer flanks are removed, leftover inner copies
+    (untrimmed mismatched flanks) and primer N spacers at both ends are
+    stripped when the insert is longer than max_variable_nt.
+    """
+    info = {
+        'mm_5p': None,
+        'mm_3p': None,
+        'leftover_5p_mm': None,
+        'leftover_3p_mm': None,
+        'primer_n_5p': False,
+        'primer_n_3p': False,
+        'corrected': False
+    }
+    if not seq or not flank_5p or not flank_3p:
+        return None, info
+
+    seq = seq.upper()
+    flank_5p = flank_5p.upper()
+    flank_3p = flank_3p.upper()
+
+    start = seq.find(flank_5p)
+    end = seq.rfind(flank_3p)
+    if start != -1 and end != -1 and end >= start + len(flank_5p):
+        interior = seq[start + len(flank_5p):end]
+        info['mm_5p'] = 0
+        info['mm_3p'] = 0
+    else:
+        hit5 = _find_flank(seq, flank_5p, max_mismatches, start=0, rightmost=False)
+        if hit5 is None:
+            return None, info
+        start, mm5 = hit5
+        interior_start = start + len(flank_5p)
+        hit3 = _find_flank(
+            seq, flank_3p, max_mismatches, start=interior_start, rightmost=True
+        )
+        if hit3 is None:
+            return None, info
+        end, mm3 = hit3
+        if end < interior_start:
+            return None, info
+        interior = seq[interior_start:end]
+        info['mm_5p'] = mm5
+        info['mm_3p'] = mm3
+
+    if len(interior) > max_variable_nt:
+        interior, leftover = _strip_leftover_flanks(
+            interior, flank_5p, flank_3p, max_mismatches, primer_n
+        )
+        info['leftover_5p_mm'] = leftover['leftover_5p_mm']
+        info['leftover_3p_mm'] = leftover['leftover_3p_mm']
+        info['primer_n_5p'] = leftover['primer_n_5p']
+        info['primer_n_3p'] = leftover['primer_n_3p']
+        info['corrected'] = (
+            leftover['leftover_5p_mm'] is not None
+            or leftover['leftover_3p_mm'] is not None
+            or leftover['primer_n_5p']
+            or leftover['primer_n_3p']
+        )
+
+    if info['mm_5p'] or info['mm_3p']:
+        info['corrected'] = True
+
+    return interior, info
+
+
+def _new_flank_counters(max_mm: int) -> Dict[str, Any]:
+    size = max_mm + 1
+    return {
+        'outer_5p': [0] * size,
+        'outer_3p': [0] * size,
+        'outer_5p_not_found': 0,
+        'leftover_5p': [0] * size,
+        'leftover_3p': [0] * size,
+        'primer_n_5p': 0,
+        'primer_n_3p': 0,
+        'corrected': 0
+    }
+
+
+def _record_flank_info(counters: Dict[str, Any], info: Dict[str, Any], found: bool) -> None:
+    if not found:
+        counters['outer_5p_not_found'] += 1
+        return
+    mm5 = info.get('mm_5p')
+    mm3 = info.get('mm_3p')
+    if mm5 is not None and mm5 < len(counters['outer_5p']):
+        counters['outer_5p'][mm5] += 1
+    if mm3 is not None and mm3 < len(counters['outer_3p']):
+        counters['outer_3p'][mm3] += 1
+    leftover5 = info.get('leftover_5p_mm')
+    leftover3 = info.get('leftover_3p_mm')
+    if leftover5 is not None and leftover5 < len(counters['leftover_5p']):
+        counters['leftover_5p'][leftover5] += 1
+    if leftover3 is not None and leftover3 < len(counters['leftover_3p']):
+        counters['leftover_3p'][leftover3] += 1
+    if info.get('primer_n_5p'):
+        counters['primer_n_5p'] += 1
+    if info.get('primer_n_3p'):
+        counters['primer_n_3p'] += 1
+    if info.get('corrected'):
+        counters['corrected'] += 1
+
+
+def _format_mm_hist(counts: List[int]) -> str:
+    parts = []
+    for i, n in enumerate(counts):
+        if not n:
+            continue
+        label = "mismatch" if i == 1 else "mismatches"
+        parts.append("{0} {1}: {2:,}".format(i, label, n))
+    return '; '.join(parts) if parts else 'none'
+
+
+def _log_flank_stats(
+    logger: logging.Logger,
+    counters: Dict[str, Any],
+    max_mm: int,
+    primer_n: int,
+    mapped_reads: int
+) -> None:
+    logger.info(
+        "Flank matching settings: max_mismatches=%s, primer_n=%s (applied to 5' and 3' ends)",
+        max_mm,
+        primer_n
+    )
+    logger.info("Outer 5' flank mismatches: %s; not found=%s", _format_mm_hist(counters['outer_5p']), f"{counters['outer_5p_not_found']:,}")
+    logger.info("Outer 3' flank mismatches: %s", _format_mm_hist(counters['outer_3p']))
+
+    n5 = sum(counters['leftover_5p'])
+    n3 = sum(counters['leftover_3p'])
+    logger.info(
+        "Leftover 5' flank corrected: %s reads (%s)",
+        f"{n5:,}",
+        _format_mm_hist(counters['leftover_5p'])
+    )
+    logger.info(
+        "Leftover 3' flank corrected: %s reads (%s)",
+        f"{n3:,}",
+        _format_mm_hist(counters['leftover_3p'])
+    )
+    logger.info(
+        "Primer spacer N trimmed: 5' %s reads; 3' %s reads",
+        f"{counters['primer_n_5p']:,}",
+        f"{counters['primer_n_3p']:,}"
+    )
+    pct = (counters['corrected'] / mapped_reads * 100) if mapped_reads else 0.0
+    logger.info(
+        "Reads with flank mismatches found and corrected: %s / %s (%.2f%%)",
+        f"{counters['corrected']:,}",
+        f"{mapped_reads:,}",
+        pct
+    )
+
 
 def translate(seq: str) -> str:
     """
@@ -110,12 +376,19 @@ def process_sam_file(sam_file: Path, config: Dict, n_threads: Optional[int] = No
             - DataFrame with processed sequences
             - Dictionary with processing statistics
     """
-    # Get flanking sequences from config
-    flank_5p = config['flanking_sequences']['flank_5p']
-    flank_3p = config['flanking_sequences']['flank_3p']
-    
+    flank_5p, flank_3p, max_mm, primer_n, max_variable_nt = _flank_params(config)
+    flank_counters = _new_flank_counters(max_mm)
+    if logger:
+        logger.info(
+            "Variable-region extraction: 5' and 3' flanks allow up to %s mismatches; "
+            "primer_n=%s (Illumina R1/R2 N spacer); leftover flanks trimmed above %s nt",
+            max_mm,
+            primer_n,
+            max_variable_nt
+        )
+
     # Memory-efficient chunked processing parameters
-    chunk_size = 500_000  # Process 100k valid reads per chunk
+    chunk_size = 500_000
     progress_interval = 1_000_000
     
     # Initialize counters
@@ -207,9 +480,18 @@ def process_sam_file(sam_file: Path, config: Dict, n_threads: Optional[int] = No
                 
                 mapped_reads += 1
                 seq = parts[9]
-                variable_seq = extract_variable_region(seq, flank_5p, flank_3p)
+                variable_seq, flank_info = extract_variable_region(
+                    seq,
+                    flank_5p,
+                    flank_3p,
+                    max_mismatches=max_mm,
+                    primer_n=primer_n,
+                    max_variable_nt=max_variable_nt
+                )
                 if variable_seq is None:
+                    _record_flank_info(flank_counters, flank_info, found=False)
                     continue
+                _record_flank_info(flank_counters, flank_info, found=True)
                 reads_with_flanks += 1
                 
                 peptide = translate(variable_seq)
@@ -311,7 +593,10 @@ def process_sam_file(sam_file: Path, config: Dict, n_threads: Optional[int] = No
         'mapping_rate': mapped_reads / total_reads if total_reads > 0 else 0,
         'flank_detection_rate': reads_with_flanks / mapped_reads if mapped_reads > 0 else 0,
         'translation_success_rate': valid_peptides / reads_with_flanks if reads_with_flanks > 0 else 0,
-        'variant_stats': variant_stats
+        'variant_stats': variant_stats,
+        'flank_counters': flank_counters,
+        'max_mismatches': max_mm,
+        'primer_n': primer_n
     }
     
     return df, stats
@@ -581,6 +866,13 @@ def main(
         logger.info(f"Unmapped reads: {sam_stats['unmapped_reads']:,}")
         logger.info(f"Reads with flanking sequences: {sam_stats['reads_with_flanks']:,} ({sam_stats['flank_detection_rate']:.2%})")
         logger.info(f"Valid peptides after translation: {sam_stats['valid_peptides']:,} ({sam_stats['translation_success_rate']:.2%})")
+        _log_flank_stats(
+            logger,
+            sam_stats['flank_counters'],
+            sam_stats['max_mismatches'],
+            sam_stats['primer_n'],
+            sam_stats['mapped_reads']
+        )
         
         logger.info("Step 2/4: Merging reads with reference library...")
         df_merged, merge_stats = merge_with_reference(df, reference_file)

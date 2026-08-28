@@ -41,7 +41,10 @@
     "flanking_sequences": {
         "flank_5p": "TTGAAAAGGTCATGATTACA",
         "flank_3p": "CAAGCAGCTACCGCAGATGT",
-        "description": "Flanking sequences for variable region extraction"
+        "max_mismatches": 2,
+        "primer_n": 1,
+        "max_variable_nt": 120,
+        "description": "Flanking sequences for variable region extraction. max_mismatches allows substitutions in both 5' and 3' flanks. primer_n is the degenerate N between each Illumina adapter (R1/R2) and the target-specific sequence. Inserts longer than max_variable_nt are checked for leftover inner flanks."
     },
     "output": {
         "create_subdirectories": true,
