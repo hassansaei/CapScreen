@@ -51,6 +51,31 @@ def get_stat_python_executable() -> Optional[Path]:
     return None
 
 
+def _stat_exit_reason(returncode: int) -> str:
+    """Human-readable reason for a non-zero stat subprocess exit."""
+    if returncode == 0:
+        return ""
+    if returncode < 0:
+        sig = -returncode
+        if sig == 9:
+            return (
+                "Statistical analysis was killed (SIGKILL). This usually means the "
+                "container or host ran out of memory during DESeq2. Increase Docker "
+                "memory (8-16 GB recommended) and re-run capscreen stat."
+            )
+        return f"Statistical analysis was killed by signal {sig}."
+    if returncode == 137:
+        return (
+            "Statistical analysis exited with code 137 (killed). This usually means "
+            "the container ran out of memory during DESeq2. Increase Docker memory "
+            "(8-16 GB recommended) and re-run capscreen stat."
+        )
+    return (
+        f"Statistical analysis exited with code {returncode}. "
+        "See STAT STEP FAILED lines above (or statistical_analysis/stat.log) for the step and reason."
+    )
+
+
 def run_statistical_analysis_with_stat_env(
     counts_file: Path,
     sample_info_file: Path,
@@ -58,33 +83,22 @@ def run_statistical_analysis_with_stat_env(
     config_file: Optional[Path] = None,
     n_cpus: Optional[int] = None,
     verbose: bool = False,
-    logger_instance: Optional[logging.Logger] = None
+    logger_instance: Optional[logging.Logger] = None,
+    log_file: Optional[Path] = None,
 ) -> bool:
     """
     Run statistical analysis using the capscreen-stat conda environment.
-    
-    This function uses subprocess to call stat.py with the stat environment's Python,
-    which has Python 3.9+ and all required dependencies (pydeseq2, etc.).
-    
-    Args:
-        counts_file: Path to merged.counts.csv file
-        sample_info_file: Path to Sample_info.csv file
-        output_dir: Output directory for results
-        config_file: Path to config.json file (optional)
-        n_cpus: Number of CPUs to use (optional)
-        verbose: Enable verbose logging
-        logger_instance: Optional logger instance
-        
-    Returns:
-        True if analysis completed successfully, False otherwise
+
+    Streams child stdout/stderr into the pipeline logger so each stat step and
+    any failure reason appear in the batch log.
     """
+    log = logger_instance or logger
     stat_python = get_stat_python_executable()
-    
+    stat_log = Path(log_file) if log_file else (output_dir / "stat.log")
+
     if stat_python is None:
-        # Fall back to trying direct import (might work if in stat env already)
         if STAT_MODULE_AVAILABLE and stat_module:
-            if logger_instance:
-                logger_instance.warning("Stat environment not found, trying direct import...")
+            log.warning("Stat environment not found, trying direct import...")
             try:
                 return stat_module.run_statistical_analysis(
                     counts_file=counts_file,
@@ -93,84 +107,74 @@ def run_statistical_analysis_with_stat_env(
                     config_file=config_file,
                     n_cpus=n_cpus,
                     verbose=verbose,
-                    logger_instance=logger_instance
+                    logger_instance=log,
+                    log_file=stat_log,
                 )
             except Exception as e:
-                if logger_instance:
-                    logger_instance.error(f"Direct import failed: {e}")
+                log.error("Direct import of statistical analysis failed: %s: %s", type(e).__name__, e, exc_info=True)
                 return False
-        else:
-            if logger_instance:
-                logger_instance.error("Cannot run statistical analysis: capscreen-stat environment not found and stat module not available")
-            return False
-    
-    # Build command to run stat.py as a module using the stat environment's Python
-    # First try to find the file path via import (most reliable)
+        log.error(
+            "Cannot run statistical analysis: capscreen-stat environment not found "
+            "and stat module is not available in this Python."
+        )
+        return False
+
     stat_script_path = None
     try:
         import capscreen.scripts.stat as stat_module_file
-        if hasattr(stat_module_file, '__file__'):
+        if hasattr(stat_module_file, "__file__") and stat_module_file.__file__:
             stat_script_path = Path(stat_module_file.__file__)
     except Exception:
         pass
-    
-    # Use module execution if we can't find the file, otherwise use direct file execution
+
+    # -u: unbuffered child stdout so step logs appear immediately
     if stat_script_path and stat_script_path.exists():
-        # Use direct file execution (more explicit)
-        cmd = [
-            str(stat_python),
-            str(stat_script_path),
-            "--counts", str(counts_file),
-            "--sample-info", str(sample_info_file),
-            "--output-dir", str(output_dir),
-        ]
+        cmd = [str(stat_python), "-u", str(stat_script_path)]
     else:
-        # Fallback to module execution
-        cmd = [
-            str(stat_python),
-            "-m", "capscreen.scripts.stat",
+        cmd = [str(stat_python), "-u", "-m", "capscreen.scripts.stat"]
+
+    cmd.extend(
+        [
             "--counts", str(counts_file),
             "--sample-info", str(sample_info_file),
             "--output-dir", str(output_dir),
+            "--log-file", str(stat_log),
         ]
-    
+    )
     if config_file:
         cmd.extend(["--config", str(config_file)])
-    
     if n_cpus:
         cmd.extend(["--n-cpus", str(n_cpus)])
-    
     if verbose:
         cmd.append("--verbose")
-    
-    # Run the command
+
+    log.info("Running statistical analysis using stat environment: %s", stat_python)
+    log.info("Stat step log: %s", stat_log)
+    log.debug("Command: %s", " ".join(cmd))
+
     try:
-        if logger_instance:
-            logger_instance.info(f"Running statistical analysis using stat environment: {stat_python}")
-            logger_instance.debug(f"Command: {' '.join(cmd)}")
-        
-        result = subprocess.run(
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        process = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            check=False
+            bufsize=1,
+            env=env,
         )
-        
-        # Log output
-        if logger_instance:
-            if result.stdout:
-                logger_instance.info(result.stdout)
-            if result.stderr:
-                if result.returncode != 0:
-                    logger_instance.error(result.stderr)
-                else:
-                    logger_instance.debug(result.stderr)
-        
-        return result.returncode == 0
-        
+        assert process.stdout is not None
+        for line in process.stdout:
+            text = line.rstrip("\n")
+            if text:
+                log.info(text)
+        returncode = process.wait()
+        if returncode != 0:
+            log.error(_stat_exit_reason(returncode))
+            return False
+        return True
     except Exception as e:
-        if logger_instance:
-            logger_instance.error(f"Failed to run statistical analysis: {e}", exc_info=True)
+        log.error("Failed to launch statistical analysis: %s: %s", type(e).__name__, e, exc_info=True)
         return False
 
 # Global Logger
@@ -229,6 +233,21 @@ def detach_log_file_handler(logger_instance: logging.Logger, handler: Optional[l
         handler.flush()
         logger_instance.removeHandler(handler)
         handler.close()
+
+
+def attach_log_file_handler(logger_instance: logging.Logger, log_path: Path) -> Optional[logging.Handler]:
+    """
+    Attach a file handler in append mode (used after per-sample logs are written).
+    """
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(log_path, mode="a")
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        logger_instance.addHandler(handler)
+        return handler
+    except Exception as exc:
+        logger_instance.error(f"Failed to reattach batch log {log_path}: {exc}", exc_info=True)
+        return None
 
 def append_sample_log_to_batch(
     batch_log_path: Optional[Path],
@@ -925,6 +944,9 @@ def main():
                     logger.error(f"Count file not found for sample {entry.sample_id} at {count_file}. Moving on to next sample.")
                     continue
                 completed_samples += 1
+            if batch_log_path:
+                log_file_handler = attach_log_file_handler(logger, batch_log_path)
+                logger.info("Reattached batch log for merge, QC, and statistical analysis: %s", batch_log_path)
             logger.info(
                 "Pipeline completed successfully for %d sample(s); skipped %d sample(s) with existing results.",
                 completed_samples,
@@ -966,8 +988,7 @@ def main():
                     if args.sample_info and args.sample_info.exists():
                         sample_info_path = args.sample_info
                         logger.info(f"Using original Sample_info.csv at {sample_info_path} (all columns preserved)")
-                        
-                        # Run statistical analysis using stat environment
+                        stat_log_path = stat_output_dir / "stat.log"
                         try:
                             success = run_statistical_analysis_with_stat_env(
                                 counts_file=merged_path,
@@ -976,13 +997,18 @@ def main():
                                 config_file=args.config,
                                 n_cpus=args.threads,
                                 verbose=(args.log_level == "DEBUG"),
-                                logger_instance=logger
+                                logger_instance=logger,
+                                log_file=stat_log_path,
                             )
                             stat_success = success
                             if success:
                                 logger.info(f"Statistical analysis completed. Results saved to {stat_output_dir}")
                             else:
-                                logger.warning("Statistical analysis completed with warnings or errors.")
+                                logger.error(
+                                    "Statistical analysis failed. Step-by-step reasons are in this log "
+                                    "and in %s",
+                                    stat_log_path,
+                                )
                         except Exception as e:
                             logger.error(f"Statistical analysis failed: {e}", exc_info=True)
                             stat_success = False
@@ -994,7 +1020,8 @@ def main():
             if stat_success is True:
                 stat_status = "Completed"
             elif stat_success is False:
-                stat_status = "Failed"
+                stat_log_hint = args.output_dir / "statistical_analysis" / "stat.log"
+                stat_status = f"Failed (see STAT STEP FAILED lines above and {stat_log_hint})"
             elif getattr(args, 'stat', False):
                 stat_status = "Skipped (merged counts table not available)"
             else:
@@ -1089,6 +1116,7 @@ def main():
         # Run statistical analysis using stat environment
         try:
             n_cpus_val = getattr(args, 'n_cpus', None) or args.threads
+            stat_log_path = args.output_dir / "stat.log"
             success = run_statistical_analysis_with_stat_env(
                 counts_file=args.counts,
                 sample_info_file=args.sample_info,
@@ -1096,13 +1124,14 @@ def main():
                 config_file=args.config,
                 n_cpus=n_cpus_val,
                 verbose=(args.log_level == "DEBUG"),
-                logger_instance=logger
+                logger_instance=logger,
+                log_file=stat_log_path,
             )
             if success:
                 logger.info("Statistical analysis completed successfully.")
                 sys.exit(0)
             else:
-                logger.error("Statistical analysis failed.")
+                logger.error("Statistical analysis failed. See STAT STEP FAILED lines and %s", stat_log_path)
                 sys.exit(1)
         except Exception as e:
             logger.error(f"Statistical analysis failed: {e}", exc_info=True)

@@ -165,14 +165,55 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
     return config
 
 
-def setup_logging(verbose: bool = False):
-    """Set up logging configuration."""
+def setup_logging(verbose: bool = False, log_file: Optional[Path] = None):
+    """Set up logging to stdout and optionally a dedicated stat log file."""
     level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s [%(levelname)s] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    root = logging.getLogger()
+    root.setLevel(level)
+    has_stream = any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in root.handlers
     )
+    if not has_stream:
+        stream = logging.StreamHandler(sys.stdout)
+        stream.setFormatter(fmt)
+        stream.setLevel(level)
+        root.addHandler(stream)
+    if log_file:
+        _attach_stat_log_file(root, Path(log_file), fmt, level)
+
+
+def _attach_stat_log_file(
+    logger_obj: logging.Logger,
+    log_file: Path,
+    fmt: Optional[logging.Formatter] = None,
+    level: int = logging.INFO,
+) -> None:
+    log_file = Path(log_file)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    abs_path = str(log_file.resolve())
+    for handler in logger_obj.handlers:
+        if isinstance(handler, logging.FileHandler) and getattr(handler, "baseFilename", None) == abs_path:
+            return
+    if fmt is None:
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    file_handler = logging.FileHandler(log_file, mode="a")
+    file_handler.setFormatter(fmt)
+    file_handler.setLevel(level)
+    logger_obj.addHandler(file_handler)
+
+
+def _stat_failure_reason(step: str, exc: BaseException) -> str:
+    """One-line reason for a failed STAT step."""
+    name = type(exc).__name__
+    msg = str(exc).strip() or "(no error message)"
+    if isinstance(exc, MemoryError) or "Unable to allocate" in msg:
+        return (
+            f"{name}: {msg}. Out of memory during '{step}'. "
+            "Increase Docker/host RAM (8-16 GB recommended) and re-run capscreen stat."
+        )
+    return f"{name}: {msg}"
 
 
 def read_count_table(count_file: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -465,15 +506,38 @@ def create_deseq_dataset(
     """
     logger.info("Creating DESeq2 dataset...")
 
-    # Align counts and metadata
+    count_samples = list(counts.index)
+    meta_samples = list(meta.index)
     common_samples = counts.index.intersection(meta.index)
     if len(common_samples) == 0:
-        raise ValueError("No common samples found between counts and metadata")
+        raise ValueError(
+            "No common samples found between counts and metadata. "
+            f"Count-table samples ({len(count_samples)}): {count_samples[:20]}. "
+            f"Sample_info IDs ({len(meta_samples)}): {meta_samples[:20]}. "
+            "Names must match sample_id exactly (case-sensitive)."
+        )
+
+    only_counts = sorted(set(map(str, count_samples)) - set(map(str, meta_samples)))
+    only_meta = sorted(set(map(str, meta_samples)) - set(map(str, count_samples)))
+    if only_counts or only_meta:
+        logger.warning(
+            "Sample name mismatch: in counts but not Sample_info: %s; "
+            "in Sample_info but not counts: %s",
+            only_counts or "none",
+            only_meta or "none",
+        )
 
     counts_aligned = counts.loc[common_samples]
     meta_aligned = meta.loc[common_samples]
 
-    logger.info(f"Aligned {len(common_samples)} samples")
+    logger.info("Aligned %d/%d count samples with Sample_info", len(common_samples), len(count_samples))
+
+    if not counts_aligned.columns.is_unique:
+        dups = counts_aligned.columns[counts_aligned.columns.duplicated()].unique().tolist()
+        raise ValueError(
+            f"Duplicate variant IDs in the count table ({len(dups)} duplicates). "
+            f"Examples: {dups[:10]}"
+        )
 
     if min_total_raw_counts is not None and min_total_raw_counts > 0:
         n_variants_before = counts_aligned.shape[1]
@@ -508,18 +572,21 @@ def create_deseq_dataset(
     
     logger.info(f"DESeq2 design factors: {design_factors}")
     
-    # Create DESeqDataSet
-    dds = DeseqDataSet(
-        counts=counts_aligned,
-        metadata=meta_aligned,
-        design_factors=design_factors,
-        refit_cooks=True,
-        n_cpus=n_cpus
-    )
-    
-    # Run DESeq2
-    logger.info("Running DESeq2...")
-    dds.deseq2()
+    try:
+        dds = DeseqDataSet(
+            counts=counts_aligned,
+            metadata=meta_aligned,
+            design_factors=design_factors,
+            refit_cooks=True,
+            n_cpus=n_cpus
+        )
+        logger.info("Running DESeq2...")
+        dds.deseq2()
+    except Exception as e:
+        raise RuntimeError(
+            f"DESeq2 failed (design={design_factors}, samples={len(common_samples)}, "
+            f"variants={counts_aligned.shape[1]}): {e}"
+        ) from e
     logger.info("DESeq2 completed")
     
     return dds
@@ -739,6 +806,14 @@ def perform_pca(df_norm: pd.DataFrame, meta: pd.DataFrame,
         df_norm_aligned = df_norm_aligned[samples_to_keep]
         meta_aligned = meta_aligned.loc[samples_to_keep]
         logger.info(f"Excluded input samples. Remaining samples: {len(samples_to_keep)}")
+
+    n_samples = int(df_norm_aligned.shape[1])
+    if n_samples < 2:
+        why = " after excluding input groups" if exclude_input else ""
+        raise ValueError(
+            f"PCA requires at least 2 samples, found {n_samples}{why}. "
+            f"Remaining samples: {list(df_norm_aligned.columns)}"
+        )
     
     # Get config values
     if config is None:
@@ -750,6 +825,11 @@ def perform_pca(df_norm: pd.DataFrame, meta: pd.DataFrame,
     
     # Filter low-enriched peptides (variants as rows, sum across samples)
     df_norm_aligned = df_norm_aligned.loc[df_norm_aligned.sum(axis=1) > low_expr_threshold]
+    if df_norm_aligned.shape[0] < 1:
+        raise ValueError(
+            "PCA has no variants left after low-expression filtering. "
+            "Lower analysis.low_expression_threshold."
+        )
     
     # Log transform
     log_counts = np.log2(df_norm_aligned + 1)
@@ -763,6 +843,15 @@ def perform_pca(df_norm: pd.DataFrame, meta: pd.DataFrame,
     
     # PCA: transpose so samples are rows, variants are columns
     X = log_counts.T  # samples x features
+    max_components = min(X.shape[0], X.shape[1])
+    if n_components > max_components:
+        logger.warning(
+            "PCA n_components=%s exceeds maximum possible %s; using %s",
+            n_components,
+            max_components,
+            max_components,
+        )
+        n_components = max_components
     X_scaled = StandardScaler(with_mean=True, with_std=True).fit_transform(X)
     
     # Perform PCA
@@ -772,8 +861,8 @@ def perform_pca(df_norm: pd.DataFrame, meta: pd.DataFrame,
     # Create results dataframe
     pca_df = pd.DataFrame(
         pcs,
-        index=X.index,  # sample names
-        columns=["PC1", "PC2"]
+        index=X.index,
+        columns=[f"PC{i + 1}" for i in range(pcs.shape[1])],
     )
     
     # Merge with metadata
@@ -1735,7 +1824,10 @@ def plot_pca(pca: PCA, pca_df: pd.DataFrame, output_file: Path,
     sns.scatterplot(**plot_kwargs)
     
     plt.xlabel(f"PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)", fontsize=fontsize)
-    plt.ylabel(f"PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)", fontsize=fontsize)
+    if pca.explained_variance_ratio_.size > 1 and "PC2" in pca_df.columns:
+        plt.ylabel(f"PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)", fontsize=fontsize)
+    else:
+        plt.ylabel("PC2", fontsize=fontsize)
     plt.legend(title="", bbox_to_anchor=(1.05, 1), loc="upper left")
     plt.tight_layout()
     
@@ -1752,7 +1844,8 @@ def run_statistical_analysis(
     config_file: Optional[Path] = None,
     n_cpus: Optional[int] = None,
     verbose: bool = False,
-    logger_instance: Optional[logging.Logger] = None
+    logger_instance: Optional[logging.Logger] = None,
+    log_file: Optional[Path] = None,
 ) -> bool:
     """
     Run statistical analysis on CapScreen count data.
@@ -1767,6 +1860,7 @@ def run_statistical_analysis(
         n_cpus: Number of CPUs to use for DESeq2 (optional)
         verbose: Enable verbose logging (default: False)
         logger_instance: Optional logger instance to use (if None, uses module logger)
+        log_file: Optional path for a dedicated stat step log
         
     Returns:
         True if analysis completed successfully, False otherwise
@@ -1775,10 +1869,14 @@ def run_statistical_analysis(
     if logger_instance is not None:
         global logger
         logger = logger_instance
-    
-    # Set up logging if not already configured
-    if not logger.handlers:
-        setup_logging(verbose)
+        if log_file:
+            _attach_stat_log_file(
+                logger,
+                Path(log_file),
+                level=logging.DEBUG if verbose else logging.INFO,
+            )
+    else:
+        setup_logging(verbose, log_file=log_file)
     
     # Load configuration
     config = load_config(config_file)
@@ -1786,13 +1884,33 @@ def run_statistical_analysis(
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    step = "initialization"
     try:
-        # Read data
+        step = "read count table"
+        logger.info("STAT STEP START: %s", step)
         raw_counts, rpm_counts = read_count_table(counts_file)
+        logger.info(
+            "STAT STEP OK: %s (raw %s, RPM %s)",
+            step,
+            raw_counts.shape,
+            rpm_counts.shape if not rpm_counts.empty else "empty",
+        )
+
+        step = "read sample info"
+        logger.info("STAT STEP START: %s", step)
         meta = read_sample_info(sample_info_file)
-        
-        # Identify groups (with config support for explicit role definitions)
+        logger.info("STAT STEP OK: %s (%d samples, groups=%s)", step, len(meta), sorted(meta["group"].unique()))
+
+        step = "identify groups"
+        logger.info("STAT STEP START: %s", step)
         target_groups, background_groups, input_groups = identify_groups(meta, config=config)
+        logger.info(
+            "STAT STEP OK: %s (target=%s, background=%s, input=%s)",
+            step,
+            target_groups,
+            background_groups,
+            input_groups,
+        )
         
         # Create DESeq2 dataset (drop variants with low total raw counts first)
         n_cpus_val = n_cpus if n_cpus is not None else config.get("analysis", {}).get("n_cpus", 8)
@@ -1805,47 +1923,61 @@ def run_statistical_analysis(
         except (TypeError, ValueError):
             thr_i = 10
         min_total_raw = thr_i if thr_i > 0 else None
+        step = "DESeq2 normalization"
+        logger.info("STAT STEP START: %s (n_cpus=%s, min_total_raw=%s)", step, n_cpus_val, min_total_raw)
         dds = create_deseq_dataset(
             raw_counts, meta, n_cpus=n_cpus_val, min_total_raw_counts=min_total_raw
         )
+        logger.info("STAT STEP OK: %s", step)
 
-        # Extract normalized counts (AAV2 control already removed in extract_normalized_counts)
+        step = "extract normalized counts"
+        logger.info("STAT STEP START: %s", step)
         df_norm = extract_normalized_counts(dds)
+        logger.info("STAT STEP OK: %s (shape %s)", step, df_norm.shape)
 
         # Pearson on DESeq2 VST (blind to design for dispersion trend); fallback if VST fails
         corr_pseudocount = analysis_cfg.get("lambda", 0.01)
         pearson_space_label = f"log2(norm+{corr_pseudocount:g})"
+        step = "DESeq2 VST"
+        logger.info("STAT STEP START: %s", step)
         try:
             logger.info("Fitting DESeq2 VST for Pearson replicate correlation...")
             dds.vst(use_design=False)
             df_pearson = extract_vst_counts(dds)
             pearson_space_label = "DESeq2 VST"
+            logger.info("STAT STEP OK: %s", step)
         except Exception as e:
             logger.warning(
-                "VST failed (%s); Pearson correlation uses log2(normalized + lambda) instead.",
-                e,
+                "STAT STEP FAILED: %s: %s (continuing with log2(normalized + lambda))",
+                step,
+                _stat_failure_reason(step, e),
             )
             df_pearson = np.log2(df_norm + corr_pseudocount)
         
         # Save normalized counts
+        step = "save normalized counts"
+        logger.info("STAT STEP START: %s", step)
         norm_counts_file = output_dir / "normalized_counts.tsv"
         df_norm.to_csv(norm_counts_file, sep='\t')
-        logger.info(f"Saved normalized counts to {norm_counts_file}")
+        logger.info("STAT STEP OK: %s (%s)", step, norm_counts_file)
         
         # Create RPM scatter density plots for replicate comparisons
+        step = "RPM scatter plots"
         if not rpm_counts.empty:
-            logger.info("Creating scatter density plots for RPM counts...")
+            logger.info("STAT STEP START: %s", step)
             try:
                 create_rpm_scatter_density_plots(rpm_counts, meta, output_dir, config=config)
+                logger.info("STAT STEP OK: %s", step)
             except Exception as e:
-                logger.warning(f"Failed to create RPM scatter density plots: {e}")
+                logger.warning("STAT STEP FAILED: %s: %s (continuing)", step, _stat_failure_reason(step, e))
         else:
-            logger.warning("RPM counts not available, skipping scatter density plots")
+            logger.warning("STAT STEP SKIPPED: %s: RPM counts not available", step)
         
         # Perform RPM-based enrichment analysis
         df_rpm_annot = None
+        step = "RPM enrichment analysis"
         if not rpm_counts.empty and input_groups:
-            logger.info("Performing RPM-based enrichment analysis...")
+            logger.info("STAT STEP START: %s", step)
             try:
                 lambda_val = config.get("analysis", {}).get("lambda", 0.01)
                 df_rpm_annot = compute_rpm_enrichment_analysis(
@@ -1981,56 +2113,60 @@ def run_statistical_analysis(
                             )
                     else:
                         logger.warning("No mean_log2Enrich_* columns for enrichment plots")
+                logger.info("STAT STEP OK: %s", step)
                 
             except Exception as e:
-                logger.warning(f"Failed to perform RPM enrichment analysis: {e}")
+                logger.warning("STAT STEP FAILED: %s: %s (continuing)", step, _stat_failure_reason(step, e))
         else:
             if rpm_counts.empty:
-                logger.warning("RPM counts not available, skipping enrichment analysis")
+                logger.warning("STAT STEP SKIPPED: %s: RPM counts not available", step)
             if not input_groups:
-                logger.warning("No input groups identified, skipping RPM enrichment analysis")
+                logger.warning("STAT STEP SKIPPED: %s: no input groups identified", step)
         
         # Create fixed color palette for groups (for consistent colors across all PCA plots)
         all_groups = meta['group'].unique().tolist()
         group_palette = create_group_color_palette(all_groups)
         logger.info(f"Created color palette for {len(all_groups)} groups")
         
-        # Calculate correlation statistics (Spearman on normalized counts; Pearson on VST or fallback)
+        step = "correlation statistics"
+        logger.info("STAT STEP START: %s", step)
         df_corr = calculate_correlation_statistics(dds, df_norm, df_pearson)
-
-        # Save correlation statistics
         corr_stats_file = output_dir / "correlation_statistics.tsv"
         df_corr.to_csv(corr_stats_file, sep='\t')
-        logger.info(f"Saved correlation statistics to {corr_stats_file}")
+        logger.info("STAT STEP OK: %s (%s)", step, corr_stats_file)
 
-        # Create correlation scatter plots
+        step = "correlation scatter plots"
+        logger.info("STAT STEP START: %s", step)
         corr_plots_file = output_dir / "correlation_scatterPlot.pdf"
         create_correlation_scatter_plots(
             dds, df_norm, corr_plots_file, df_pearson, pearson_space_label=pearson_space_label
         )
+        logger.info("STAT STEP OK: %s (%s)", step, corr_plots_file)
         
-        # Perform three PCA analyses
-        # 1. PCA with all features
-        logger.info("Performing PCA with all features...")
+        pca_top_n = config.get("analysis", {}).get("pca", {}).get("top_n_features", 500)
+
+        step = "PCA all features"
+        logger.info("STAT STEP START: %s", step)
         pca_all, pca_df_all = perform_pca(df_norm, meta, top_n_features=None, 
                                           exclude_input=False, config=config)
         plot_pca(pca_all, pca_df_all, 
                 output_dir / "pca_all_features.png",
                 title="PCA - All Features",
                 group_palette=group_palette, config=config)
+        logger.info("STAT STEP OK: %s (%d samples)", step, len(pca_df_all))
         
-        # 2. PCA with top variable features
-        pca_top_n = config.get("analysis", {}).get("pca", {}).get("top_n_features", 500)
-        logger.info(f"Performing PCA with top {pca_top_n} variable features...")
+        step = f"PCA top {pca_top_n} features"
+        logger.info("STAT STEP START: %s", step)
         pca_top500, pca_df_top500 = perform_pca(df_norm, meta, top_n_features=pca_top_n,
                                                 exclude_input=False, config=config)
         plot_pca(pca_top500, pca_df_top500,
                 output_dir / "pca_top500_features.png",
                 title=f"PCA - Top {pca_top_n} Variable Features",
                 group_palette=group_palette, config=config)
+        logger.info("STAT STEP OK: %s", step)
         
-        # 3. PCA without input samples
-        logger.info("Performing PCA without input samples...")
+        step = "PCA without input samples"
+        logger.info("STAT STEP START: %s", step)
         pca_no_input, pca_df_no_input = perform_pca(df_norm, meta, top_n_features=pca_top_n,
                                                     exclude_input=True,
                                                     input_groups=input_groups, config=config)
@@ -2038,46 +2174,55 @@ def run_statistical_analysis(
                 output_dir / "pca_no_input_samples.png",
                 title=f"PCA - Top {pca_top_n} Features (No Input Samples)",
                 group_palette=group_palette, config=config)
+        logger.info("STAT STEP OK: %s (%d samples)", step, len(pca_df_no_input))
         
         # Differential expression: pairing mode from config (see build_differential_expression_pairs)
         de_cfg = config.get("differential_expression", {}) or {}
         pairing = de_cfg.get("pairing", "target_background")
+        step = "differential expression"
+        logger.info("STAT STEP START: %s (pairing=%s)", step, pairing)
         de_pairs = build_differential_expression_pairs(
             meta, target_groups, background_groups, input_groups, pairing
         )
 
         if de_pairs:
-            logger.info(f"Performing differential expression for {len(de_pairs)} pair(s) (pairing={pairing})...")
+            logger.info("Performing differential expression for %d pair(s) (pairing=%s)...", len(de_pairs), pairing)
+            de_ok = 0
             for group_a, group_b in de_pairs:
                 try:
-                    logger.info(f"Running DE: {group_a} vs {group_b}")
+                    logger.info("Running DE: %s vs %s", group_a, group_b)
                     de_results = perform_differential_expression(
                         df_norm, meta, group_a, group_b
                     )
 
-                    # Save differential expression results
                     safe_a = group_a.replace(" ", "_").replace("/", "_").replace("-", "_")
                     safe_b = group_b.replace(" ", "_").replace("/", "_").replace("-", "_")
                     de_file = output_dir / f"DE_{safe_a}_vs_{safe_b}.tsv"
                     de_results.to_csv(de_file, sep='\t')
-                    logger.info(f"Saved differential expression results to {de_file}")
+                    logger.info("Saved differential expression results to %s", de_file)
+                    de_ok += 1
 
                 except Exception as e:
                     logger.warning(
-                        f"Failed to perform differential expression analysis for "
-                        f"{group_a} vs {group_b}: {e}"
+                        "STAT STEP FAILED: differential expression %s vs %s: %s (continuing)",
+                        group_a,
+                        group_b,
+                        _stat_failure_reason(f"DE {group_a} vs {group_b}", e),
                     )
+            logger.info("STAT STEP OK: %s (%d/%d pairs succeeded)", step, de_ok, len(de_pairs))
         else:
             logger.warning(
-                "Skipping differential expression analysis: no group pairs to compare "
-                "(check differential_expression.pairing and group_roles / metadata)."
+                "STAT STEP SKIPPED: %s: no group pairs to compare "
+                "(check differential_expression.pairing and group_roles / metadata).",
+                step,
             )
         
         logger.info("Statistical analysis completed successfully!")
         return True
         
     except Exception as e:
-        logger.error(f"Error during statistical analysis: {e}", exc_info=True)
+        reason = _stat_failure_reason(step, e)
+        logger.error("STAT STEP FAILED: %s: %s", step, reason, exc_info=True)
         return False
 
 
@@ -2128,20 +2273,25 @@ def main():
         default=None,
         help='Path to config.json file (default: looks for config.json in current directory)'
     )
+    parser.add_argument(
+        '--log-file',
+        type=Path,
+        default=None,
+        help='Write stat step logs to this file (in addition to stdout)'
+    )
     
     args = parser.parse_args()
     
-    # Set up logging
-    setup_logging(args.verbose)
+    setup_logging(args.verbose, log_file=args.log_file)
     
-    # Run analysis
     success = run_statistical_analysis(
         counts_file=args.counts,
         sample_info_file=args.sample_info,
         output_dir=args.output_dir,
         config_file=args.config,
         n_cpus=args.n_cpus,
-        verbose=args.verbose
+        verbose=args.verbose,
+        log_file=args.log_file,
     )
     
     sys.exit(0 if success else 1)
