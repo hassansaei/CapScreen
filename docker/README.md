@@ -3,7 +3,7 @@
 
 ```{bash}
 
-docker build --platform linux/amd64  --no-cache -t capscreen:1.0.0.alpha.10 -f docker/DockerFile . 
+docker build --platform linux/amd64  --no-cache -t capscreen:latest -f docker/DockerFile . 
 
 ```
 

@@ -530,7 +530,20 @@ def create_deseq_dataset(
     counts_aligned = counts.loc[common_samples]
     meta_aligned = meta.loc[common_samples]
 
-    logger.info("Aligned %d/%d count samples with Sample_info", len(common_samples), len(count_samples))
+    logger.info("Aligned %d/%d count samples with Sample_info: %s", len(common_samples), len(count_samples), list(common_samples))
+    if "group" in meta_aligned.columns:
+        logger.info("Aligned group counts: %s", meta_aligned["group"].value_counts().to_dict())
+        if meta_aligned["group"].nunique() == 1:
+            only_group = str(meta_aligned["group"].iloc[0])
+            logger.warning(
+                "DESeq2 includes only group %r (%d samples). Tissue sample_id values "
+                "in Sample_info likely do not match merged.counts.csv column names "
+                "(match is case-sensitive). Re-merge counts after renaming sample_id, "
+                "or restore sample_id to the names in the merged table. The group "
+                "column can be changed independently of sample_id.",
+                only_group,
+                len(common_samples),
+            )
 
     if not counts_aligned.columns.is_unique:
         dups = counts_aligned.columns[counts_aligned.columns.duplicated()].unique().tolist()
@@ -812,7 +825,9 @@ def perform_pca(df_norm: pd.DataFrame, meta: pd.DataFrame,
         why = " after excluding input groups" if exclude_input else ""
         raise ValueError(
             f"PCA requires at least 2 samples, found {n_samples}{why}. "
-            f"Remaining samples: {list(df_norm_aligned.columns)}"
+            f"Remaining samples: {list(df_norm_aligned.columns)}. "
+            "If this is the no-input PCA, tissue sample_id values in Sample_info "
+            "did not match merged count column names (case-sensitive)."
         )
     
     # Get config values
@@ -2167,14 +2182,24 @@ def run_statistical_analysis(
         
         step = "PCA without input samples"
         logger.info("STAT STEP START: %s", step)
-        pca_no_input, pca_df_no_input = perform_pca(df_norm, meta, top_n_features=pca_top_n,
-                                                    exclude_input=True,
-                                                    input_groups=input_groups, config=config)
-        plot_pca(pca_no_input, pca_df_no_input,
-                output_dir / "pca_no_input_samples.png",
-                title=f"PCA - Top {pca_top_n} Features (No Input Samples)",
-                group_palette=group_palette, config=config)
-        logger.info("STAT STEP OK: %s (%d samples)", step, len(pca_df_no_input))
+        try:
+            pca_no_input, pca_df_no_input = perform_pca(df_norm, meta, top_n_features=pca_top_n,
+                                                        exclude_input=True,
+                                                        input_groups=input_groups, config=config)
+            plot_pca(pca_no_input, pca_df_no_input,
+                    output_dir / "pca_no_input_samples.png",
+                    title=f"PCA - Top {pca_top_n} Features (No Input Samples)",
+                    group_palette=group_palette, config=config)
+            logger.info("STAT STEP OK: %s (%d samples)", step, len(pca_df_no_input))
+        except Exception as e:
+            logger.warning(
+                "STAT STEP FAILED: %s: %s (continuing). "
+                "If remaining samples is 0, only Input sample_id values matched "
+                "merged.counts.csv. Keep sample_id identical to count-table column "
+                "names (case-sensitive) and re-merge if you renamed folders.",
+                step,
+                _stat_failure_reason(step, e),
+            )
         
         # Differential expression: pairing mode from config (see build_differential_expression_pairs)
         de_cfg = config.get("differential_expression", {}) or {}
