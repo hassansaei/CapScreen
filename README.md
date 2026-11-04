@@ -1,3 +1,7 @@
+<p align="left">
+  <img src="docs/capscreen-logo.jpg" alt="CapScreen, AAV capsid library screening" width="280">
+</p>
+
 # CapScreen
 
 [![DOI](https://zenodo.org/badge/1004327193.svg)](https://doi.org/10.5281/zenodo.18895265)
