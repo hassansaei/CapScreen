@@ -5,3 +5,9 @@
 *.png
 .DS_Store
 
+# Agent tooling and rules
+.agent-style/
+.cursor/
+AGENTS.md
+CLAUDE.md
+
