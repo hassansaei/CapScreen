@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Advance the CapScreen alpha version inside a release commit.
+
+feat, fix, perf, and refactor commits increment 1.0.0-alpha.N in
+capscreen/version.py and amend that file into the commit just created.
+A breaking change (! or a BREAKING CHANGE footer) does the same for
+any commit type. Other types leave the version unchanged.
+"""
+
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+BUMP_TYPES = {"feat", "fix", "perf", "refactor"}
+SUBJECT_RE = re.compile(r"^(?P<type>[a-z]+)(?:\([^)]*\))?(?P<breaking>!)?: ")
+VERSION_RE = re.compile(
+    r"^(__version__\s*=\s*)([\"'])(\d+\.\d+\.\d+)-alpha\.(\d+)\2",
+    re.M,
+)
+BREAKING_RE = re.compile(r"(?m)^BREAKING[ -]CHANGE\s*:")
+
+
+def git(*args, check=True, env=None):
+    return subprocess.run(
+        ["git", *args],
+        cwd=REPO,
+        check=check,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def message_parts(text):
+    lines = [line for line in text.splitlines() if not line.startswith("#")]
+    body_text = "\n".join(lines).strip()
+    if not body_text:
+        return "", ""
+    subject, _, body = body_text.partition("\n")
+    return subject.strip(), body
+
+
+def should_bump(subject, body):
+    if subject.startswith("Merge "):
+        return False
+    match = SUBJECT_RE.match(subject)
+    if match is None:
+        return False
+    breaking = bool(match.group("breaking")) or BREAKING_RE.search(body) is not None
+    return breaking or match.group("type") in BUMP_TYPES
+
+
+def version_in(text):
+    match = VERSION_RE.search(text)
+    if match is None:
+        return None
+    return f"{match.group(3)}-alpha.{match.group(4)}"
+
+
+def main():
+    if os.environ.get("CAPSCREEN_VERSION_BUMP") == "1":
+        return
+    if git("rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).returncode == 0:
+        return
+
+    text = git("log", "-1", "--format=%B").stdout
+    subject, body = message_parts(text)
+    if not should_bump(subject, body):
+        return
+
+    head = git("show", "HEAD:capscreen/version.py", check=False)
+    if head.returncode != 0:
+        sys.exit("post-commit: this commit does not contain capscreen/version.py")
+    current = version_in(head.stdout)
+    if current is None:
+        sys.exit(
+            'post-commit: capscreen/version.py must contain '
+            '__version__ = "1.0.0-alpha.N"'
+        )
+
+    parent = git("rev-parse", "--verify", "HEAD^", check=False)
+    if parent.returncode == 0:
+        previous = git("show", "HEAD^:capscreen/version.py", check=False)
+        if previous.returncode != 0 or version_in(previous.stdout) != current:
+            return
+
+    version_path = REPO / "capscreen" / "version.py"
+    worktree = version_in(version_path.read_text())
+    if worktree is not None and worktree != current:
+        print(
+            "post-commit: left the version unchanged because "
+            "capscreen/version.py has uncommitted edits",
+            file=sys.stderr,
+        )
+        return
+
+    base, alpha = current.rsplit(".", 1)
+    updated = f"{base}.{int(alpha) + 1}"
+    source = version_path.read_text()
+    version_path.write_text(
+        VERSION_RE.sub(
+            lambda match: f"{match.group(1)}{match.group(2)}{updated}{match.group(2)}",
+            source,
+            count=1,
+        )
+    )
+
+    env = os.environ.copy()
+    env.pop("GIT_INDEX_FILE", None)
+    env["CAPSCREEN_VERSION_BUMP"] = "1"
+    git("add", "--", "capscreen/version.py", env=env)
+    amended = git("commit", "--amend", "--no-edit", env=env, check=False)
+    if amended.returncode != 0:
+        sys.stderr.write(amended.stderr)
+        sys.exit(amended.returncode)
+    print(f"version: {current} -> {updated}", file=sys.stderr)
+
+
+REPO = Path(
+    subprocess.check_output(
+        ["git", "rev-parse", "--show-toplevel"],
+        text=True,
+    ).strip()
+)
+
+
+if __name__ == "__main__":
+    main()
