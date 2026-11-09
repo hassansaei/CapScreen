@@ -73,14 +73,19 @@
         "differential_expression": {
             "padj_threshold": 0.05,
             "log2fc_threshold": 1.0,
-            "pairing": "target_background"
+            "comparison_mode": "auto",
+            "input_group": "Input",
+            "min_replicates": 2,
+            "min_count": 10,
+            "drop_if_any_group_low": false,
+            "log2rpm_pseudocount": 1
         },
         "plots": {
             "dpi": {
                 "standard": 300
             },
             "figure_sizes": {
-                "pca": [6, 5]
+                "pca": [7.5, 6.5]
             },
             "pca": {
                 "point_size": 120,

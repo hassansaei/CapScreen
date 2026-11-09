@@ -2,65 +2,46 @@
 """
 Comprehensive statistical analysis script for CapScreen data.
 
-This script performs a complete statistical analysis pipeline on CapScreen count data:
+This script performs QC and DESeq2 analysis on CapScreen count data.
 
-1. Data Processing:
-   - Reads merged count tables (raw counts and RPM counts)
-   - Processes sample metadata to identify groups, biological and technical replicates
-   - Drops variants whose total raw counts summed across samples are below
-     analysis.low_expression_threshold (default 10) before DESeq2
-   - Normalizes counts using DESeq2 (pydeseq2)
+1. Variant metrics, following the screening notebooks:
+   - RPM and log2(RPM + 1) from the full library, then a per-group low-count filter
+   - CV of RPM across biological replicates
 
-2. RPM-based Enrichment Analysis:
-   - Computes mean RPM across technical replicates per biological replicate
-   - Calculates log2 enrichment vs input groups
-   - Aggregates enrichment statistics (mean, SD, CV) across experiments
-   - Computes target specificity metrics
+2. QC plots and tables, written to ``output_dir/qc``:
+   - log2(RPM) Pearson scatter plots and a replicate-correlation table
+   - CV density histograms and an AAV2 RPM contamination bar plot
+   - Blind VST sample-sample Pearson heatmap
+   - PCA on blind VST after dropping the Input group (all positive-variance
+     variants, and the top variable variants)
 
-3. Correlation Analysis:
-   - Calculates Spearman (DESeq2 normalized counts) and Pearson
-     (DESeq2 VST; falls back to log2 normalized + pseudocount from analysis.lambda if VST fails)
-     for all pairwise sample comparisons within each group
-   - Generates correlation scatter plots within each group
+3. DESeq2, written to ``output_dir/deseq2``:
+   - Contrasts are inferred from ``sample_info`` group names
+   - Each contrast is fit on the two groups only, with design ``~ group``
+   - Wald statistics, log2 fold changes, and BH-adjusted p-values
 
-4. Principal Component Analysis (PCA):
-   - PCA with all features
-   - PCA with top variable features (configurable)
-   - PCA excluding input samples
-
-5. Differential Expression Analysis:
-   - OLS regression-based differential expression between two groups at a time
-   - Pairing mode ``target_background`` (default): WT/KO-style prefix matching, else all
-     target×background combinations; mode ``all_pairs_non_input``: every unordered pair
-     among configured target and background groups (excluding input); mode
-     ``all_meta_non_input``: every unordered pair among all metadata groups except input
-   - Calculates log2 fold changes, p-values, and FDR-adjusted p-values
-
-6. Visualization (written to ``output_dir/qc``):
-   - Correlation scatter plots and correlation statistics
-   - PCA with all features, top variable features, and excluding input samples
-
-All analysis parameters are configurable via config.json file.
+Enrichment analysis is intentionally not run here.
 """
 
 import argparse
 import json
 import logging
+import re
 import sys
 from pathlib import Path
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
 
-import pandas as pd
-import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import seaborn as sns
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
 from itertools import combinations
-from scipy.stats import spearmanr, pearsonr
 from matplotlib.backends.backend_pdf import PdfPages
-import statsmodels.api as sm
-from statsmodels.stats.multitest import multipletests
+from matplotlib.colors import LinearSegmentedColormap
+from scipy.stats import pearsonr
+from sklearn.decomposition import PCA
 
 from pydeseq2.dds import DeseqDataSet
 from pydeseq2.ds import DeseqStats
@@ -110,8 +91,13 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
             "differential_expression": {
                 "padj_threshold": 0.05,
                 "log2fc_threshold": 1.0,
-                # "target_background" | "all_pairs_non_input" | "all_meta_non_input"
-                "pairing": "target_background",
+                # auto | aavr | pd_target | oa_opa | fasma_fasta
+                "comparison_mode": "auto",
+                "input_group": "Input",
+                "min_replicates": 2,
+                "min_count": 10,
+                "drop_if_any_group_low": False,
+                "log2rpm_pseudocount": 1,
             },
             "plots": {
                 "dpi": {
@@ -258,20 +244,36 @@ def read_sample_info(sample_info_file: Path) -> pd.DataFrame:
         DataFrame with sample metadata
     """
     logger.info(f"Reading sample info from {sample_info_file}")
-    
-    meta = pd.read_csv(sample_info_file, sep=',', index_col=0)
-    
-    # Select relevant columns
-    required_cols = ['group', 'tech_rep', 'bio_rep', 'batch_seq']
+
+    meta = pd.read_csv(sample_info_file, sep=",")
+    if "sample_id" not in meta.columns:
+        meta = meta.rename(columns={meta.columns[0]: "sample_id"})
+    meta["sample_id"] = meta["sample_id"].astype(str)
+    if meta["sample_id"].duplicated().any():
+        n_dup = int(meta["sample_id"].duplicated().sum())
+        logger.warning("Dropping %d duplicate sample_id row(s); keeping the first", n_dup)
+        meta = meta.drop_duplicates("sample_id", keep="first")
+
+    required_cols = ["sample_id", "group", "tech_rep", "bio_rep", "batch_seq"]
     missing_cols = [col for col in required_cols if col not in meta.columns]
     if missing_cols:
         logger.warning(f"Missing columns in sample info: {missing_cols}")
-    
-    meta = meta.loc[:, [col for col in required_cols if col in meta.columns]]
-    
+    if "group" not in meta.columns or "bio_rep" not in meta.columns:
+        raise ValueError("sample_info must contain group and bio_rep columns")
+    missing_group = meta["group"].isna() | meta["group"].astype(str).str.strip().eq("")
+    if missing_group.any():
+        logger.warning("Dropping %d sample_info row(s) with an empty group", int(missing_group.sum()))
+        meta = meta.loc[~missing_group].copy()
+    if meta.empty:
+        raise ValueError("sample_info has no rows with a group label")
+
+    keep = [col for col in required_cols if col in meta.columns]
+    meta = meta.loc[:, keep].copy()
+    meta = meta.set_index("sample_id", drop=False)
+    meta.index.name = "sample_id"
+
     logger.info(f"Sample info shape: {meta.shape}")
-    logger.info(f"Groups found: {sorted(meta['group'].unique())}")
-    
+    logger.info(f"Groups found: {sorted(meta['group'].astype(str).unique())}")
     return meta
 
 
@@ -451,639 +453,6 @@ def _identify_groups_heuristic(meta: pd.DataFrame) -> Tuple[list, list, list]:
     logger.info(f"Background groups: {background_groups}")
     
     return target_groups, background_groups, input_groups
-
-
-def create_deseq_dataset(
-    counts: pd.DataFrame,
-    meta: pd.DataFrame,
-    n_cpus: int = 8,
-    min_total_raw_counts: Optional[int] = 10,
-) -> DeseqDataSet:
-    """
-    Create and run DESeq2 dataset.
-
-    Variants whose total raw counts across all samples are strictly below
-    ``min_total_raw_counts`` are removed before building the dataset (when
-    ``min_total_raw_counts`` is a positive integer).
-
-    Args:
-        counts: Raw counts dataframe (samples as rows, variants as columns)
-        meta: Metadata dataframe
-        n_cpus: Number of CPUs to use
-        min_total_raw_counts: Keep only variants with sum(counts) >= this value
-            across samples. None or <= 0 disables filtering.
-
-    Returns:
-        DeseqDataSet object
-    """
-    logger.info("Creating DESeq2 dataset...")
-
-    count_samples = list(counts.index)
-    meta_samples = list(meta.index)
-    common_samples = counts.index.intersection(meta.index)
-    if len(common_samples) == 0:
-        raise ValueError(
-            "No common samples found between counts and metadata. "
-            f"Count-table samples ({len(count_samples)}): {count_samples[:20]}. "
-            f"Sample_info IDs ({len(meta_samples)}): {meta_samples[:20]}. "
-            "Names must match sample_id exactly (case-sensitive)."
-        )
-
-    only_counts = sorted(set(map(str, count_samples)) - set(map(str, meta_samples)))
-    only_meta = sorted(set(map(str, meta_samples)) - set(map(str, count_samples)))
-    if only_counts or only_meta:
-        logger.warning(
-            "Sample name mismatch: in counts but not Sample_info: %s; "
-            "in Sample_info but not counts: %s",
-            only_counts or "none",
-            only_meta or "none",
-        )
-
-    counts_aligned = counts.loc[common_samples]
-    meta_aligned = meta.loc[common_samples]
-
-    logger.info("Aligned %d/%d count samples with Sample_info: %s", len(common_samples), len(count_samples), list(common_samples))
-    if "group" in meta_aligned.columns:
-        logger.info("Aligned group counts: %s", meta_aligned["group"].value_counts().to_dict())
-        if meta_aligned["group"].nunique() == 1:
-            only_group = str(meta_aligned["group"].iloc[0])
-            logger.warning(
-                "DESeq2 includes only group %r (%d samples). Tissue sample_id values "
-                "in Sample_info likely do not match merged.counts.csv column names "
-                "(match is case-sensitive). Re-merge counts after renaming sample_id, "
-                "or restore sample_id to the names in the merged table. The group "
-                "column can be changed independently of sample_id.",
-                only_group,
-                len(common_samples),
-            )
-
-    if not counts_aligned.columns.is_unique:
-        dups = counts_aligned.columns[counts_aligned.columns.duplicated()].unique().tolist()
-        raise ValueError(
-            f"Duplicate variant IDs in the count table ({len(dups)} duplicates). "
-            f"Examples: {dups[:10]}"
-        )
-
-    if min_total_raw_counts is not None and min_total_raw_counts > 0:
-        n_variants_before = counts_aligned.shape[1]
-        col_sums = counts_aligned.sum(axis=0)
-        keep = col_sums >= min_total_raw_counts
-        counts_aligned = counts_aligned.loc[:, keep]
-        n_kept = int(keep.sum())
-        logger.info(
-            f"Pre-filter for DESeq2: kept {n_kept:,}/{n_variants_before:,} variants "
-            f"with total raw count >= {min_total_raw_counts}"
-        )
-        if n_kept == 0:
-            raise ValueError(
-                "All variants were removed by the low-count pre-filter for DESeq2. "
-                "Lower analysis.low_expression_threshold or check merged counts."
-            )
-
-    # Determine design factors
-    # Always include group and bio_rep
-    design_factors = ["group", "bio_rep"]
-    
-    # Add batch_seq if there are multiple batches
-    if "batch_seq" in meta_aligned.columns:
-        unique_batches = meta_aligned["batch_seq"].nunique()
-        if unique_batches > 1:
-            design_factors.append("batch_seq")
-            logger.info(f"Multiple batches detected ({unique_batches} unique batches). Adding batch_seq to design.")
-        else:
-            logger.info(f"Single batch detected. Not including batch_seq in design.")
-    else:
-        logger.warning("batch_seq column not found in metadata. Proceeding without batch correction.")
-    
-    logger.info(f"DESeq2 design factors: {design_factors}")
-    
-    try:
-        dds = DeseqDataSet(
-            counts=counts_aligned,
-            metadata=meta_aligned,
-            design_factors=design_factors,
-            refit_cooks=True,
-            n_cpus=n_cpus
-        )
-        logger.info("Running DESeq2...")
-        dds.deseq2()
-    except Exception as e:
-        raise RuntimeError(
-            f"DESeq2 failed (design={design_factors}, samples={len(common_samples)}, "
-            f"variants={counts_aligned.shape[1]}): {e}"
-        ) from e
-    logger.info("DESeq2 completed")
-    
-    return dds
-
-
-def extract_normalized_counts(dds: DeseqDataSet) -> pd.DataFrame:
-    """
-    Extract normalized counts from DESeqDataSet.
-    
-    Args:
-        dds: DeseqDataSet object
-        
-    Returns:
-        DataFrame with normalized counts (variants as rows, samples as columns)
-    """
-    logger.info("Extracting normalized counts...")
-    
-    norm_counts = dds.layers["normed_counts"]
-    
-    df_norm = pd.DataFrame(
-        norm_counts,
-        index=dds.obs_names,      # variant IDs (ID_WLG) - rows
-        columns=dds.var_names     # sample IDs (columns)
-    )
-    
-    # Transpose to have variants as rows, samples as columns
-    # (After transpose: rows=variants from dds.obs_names, cols=samples from dds.var_names)
-    df_norm = df_norm.T
-    
-    # Remove AAV2 or other control variants if they exist in the index
-    control_variants = df_norm.index[df_norm.index.str.contains('AAV', case=False, na=False)]
-    if len(control_variants) > 0:
-        logger.info(f"Removing control variants: {list(control_variants)}")
-        df_norm = df_norm.drop(control_variants)
-    
-    logger.info(f"Normalized counts shape: {df_norm.shape}")
-    
-    return df_norm
-
-
-def extract_vst_counts(dds: DeseqDataSet) -> pd.DataFrame:
-    """
-    Extract variance-stabilized counts from DeseqDataSet (after ``dds.vst()``).
-
-    Same orientation as :func:`extract_normalized_counts`: variants as rows,
-    samples as columns.
-
-    Args:
-        dds: DeseqDataSet with ``layers['vst_counts']`` populated.
-
-    Returns:
-        DataFrame of VST values.
-    """
-    logger.info("Extracting VST counts...")
-    if "vst_counts" not in dds.layers:
-        raise RuntimeError("VST counts not found; call dds.vst() before extract_vst_counts")
-
-    vst_arr = dds.layers["vst_counts"]
-    df_vst = pd.DataFrame(
-        vst_arr,
-        index=dds.obs_names,
-        columns=dds.var_names,
-    ).T
-
-    control_variants = df_vst.index[df_vst.index.str.contains("AAV", case=False, na=False)]
-    if len(control_variants) > 0:
-        logger.info(f"Removing control variants from VST matrix: {list(control_variants)}")
-        df_vst = df_vst.drop(control_variants)
-
-    logger.info(f"VST counts shape: {df_vst.shape}")
-    return df_vst
-
-
-def calculate_correlation_statistics(
-    dds: DeseqDataSet,
-    df_norm: pd.DataFrame,
-    df_pearson: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Calculate correlation statistics (Spearman and Pearson) for each group.
-
-    Spearman uses DESeq2 normalized counts. Pearson uses ``df_pearson`` (typically
-    DESeq2 VST values aligned with ``df_norm``).
-
-    Args:
-        dds: DeseqDataSet object
-        df_norm: Normalized counts (variants as rows, samples as columns)
-        df_pearson: Matrix for Pearson (same index/columns as ``df_norm``), e.g. VST
-
-    Returns:
-        DataFrame with correlation statistics for each group
-    """
-    logger.info("Calculating correlation statistics...")
-
-    common_variants = df_norm.index.intersection(df_pearson.index)
-    common_samples = df_norm.columns.intersection(df_pearson.columns)
-    df_norm_a = df_norm.loc[common_variants, common_samples]
-    df_pearson_a = df_pearson.loc[common_variants, common_samples]
-
-    corr_results = {}
-    groups = dds.obs["group"].unique()
-
-    for g in groups:
-        samples = dds.obs.index[dds.obs["group"] == g].tolist()
-
-        if len(samples) >= 2:  # at least 2 reps needed
-            pair_s = []
-            pair_p = []
-
-            for s1, s2 in combinations(samples, 2):
-                if s1 in df_norm_a.columns and s2 in df_norm_a.columns:
-                    s_val, _ = spearmanr(df_norm_a[s1], df_norm_a[s2])
-                    p_val, _ = pearsonr(df_pearson_a[s1], df_pearson_a[s2])
-                    pair_s.append(s_val)
-                    pair_p.append(p_val)
-
-            if pair_s:  # Only add if we have correlations
-                corr_results[g] = {
-                    "spearman_mean": np.mean(pair_s),
-                    "spearman_min": np.min(pair_s),
-                    "spearman_max": np.max(pair_s),
-                    "spearman_sd": np.std(pair_s),
-                    "pearson_mean": np.mean(pair_p),
-                    "pearson_min": np.min(pair_p),
-                    "pearson_max": np.max(pair_p),
-                    "pearson_sd": np.std(pair_p),
-                }
-
-    df_corr = pd.DataFrame.from_dict(corr_results, orient="index")
-
-    logger.info(f"Calculated correlations for {len(corr_results)} groups")
-
-    return df_corr
-
-
-def create_correlation_scatter_plots(
-    dds: DeseqDataSet,
-    df_norm: pd.DataFrame,
-    output_file: Path,
-    df_pearson: pd.DataFrame,
-    *,
-    pearson_space_label: str = "DESeq2 VST",
-):
-    """
-    Create scatter plots for all pairwise sample comparisons within each group.
-
-    Points are drawn in the same space used for Pearson (``df_pearson``). Spearman
-    is still computed from normalized counts on the same variant set.
-
-    Args:
-        dds: DeseqDataSet object
-        df_norm: Normalized counts (variants as rows, samples as columns)
-        output_file: Path to save the PDF file
-        df_pearson: Values for Pearson and scatter axes (e.g. VST), aligned with df_norm
-        pearson_space_label: Short description for plot annotations
-    """
-    logger.info("Creating correlation scatter plots...")
-
-    common_variants = df_norm.index.intersection(df_pearson.index)
-    common_samples = df_norm.columns.intersection(df_pearson.columns)
-    df_norm_a = df_norm.loc[common_variants, common_samples]
-    df_p_a = df_pearson.loc[common_variants, common_samples]
-
-    groups = dds.obs["group"].unique()
-
-    with PdfPages(output_file) as pdf:
-        for g in groups:
-            samples = dds.obs.index[dds.obs["group"] == g].tolist()
-
-            if len(samples) >= 2:
-                for s1, s2 in combinations(samples, 2):
-                    if s1 in df_norm_a.columns and s2 in df_norm_a.columns:
-                        sp, _ = spearmanr(df_norm_a[s1], df_norm_a[s2])
-                        pr, _ = pearsonr(df_p_a[s1], df_p_a[s2])
-
-                        fig, ax = plt.subplots()
-                        ax.scatter(df_p_a[s1], df_p_a[s2], color="darkblue", s=15)
-                        ax.set_title(
-                            f"{g} | Spearman r={sp:.2f} | Pearson r={pr:.2f}\n"
-                            f"(Pearson on {pearson_space_label})"
-                        )
-                        ax.set_xlabel(f"{s1}\n({pearson_space_label})")
-                        ax.set_ylabel(f"{s2}\n({pearson_space_label})")
-                        fig.tight_layout()
-                        pdf.savefig(fig)
-                        plt.close(fig)
-
-    logger.info(f"Saved correlation scatter plots to {output_file}")
-
-
-def perform_pca(df_norm: pd.DataFrame, meta: pd.DataFrame, 
-                top_n_features: Optional[int] = None,
-                exclude_input: bool = False,
-                input_groups: Optional[list] = None,
-                config: Optional[Dict[str, Any]] = None) -> Tuple[PCA, pd.DataFrame]:
-    """
-    Perform PCA analysis on normalized counts.
-    
-    Args:
-        df_norm: Normalized counts dataframe (variants as rows, samples as columns)
-        meta: Metadata dataframe
-        top_n_features: Number of top variable features to use (None = all features)
-        exclude_input: Whether to exclude input samples
-        input_groups: List of input group names (used if exclude_input=True)
-        
-    Returns:
-        Tuple of (PCA object, DataFrame with PC coordinates and metadata)
-    """
-    # Align metadata (samples are columns in df_norm, so we need to align with columns)
-    common_samples = df_norm.columns.intersection(meta.index)
-    df_norm_aligned = df_norm[common_samples]  # Select columns (samples)
-    meta_aligned = meta.loc[common_samples]
-    
-    # Filter out input samples if requested (before filtering variants)
-    if exclude_input and input_groups:
-        samples_to_keep = meta_aligned[~meta_aligned['group'].isin(input_groups)].index
-        df_norm_aligned = df_norm_aligned[samples_to_keep]
-        meta_aligned = meta_aligned.loc[samples_to_keep]
-        logger.info(f"Excluded input samples. Remaining samples: {len(samples_to_keep)}")
-
-    n_samples = int(df_norm_aligned.shape[1])
-    if n_samples < 2:
-        why = " after excluding input groups" if exclude_input else ""
-        raise ValueError(
-            f"PCA requires at least 2 samples, found {n_samples}{why}. "
-            f"Remaining samples: {list(df_norm_aligned.columns)}. "
-            "If this is the no-input PCA, tissue sample_id values in Sample_info "
-            "did not match merged count column names (case-sensitive)."
-        )
-    
-    # Get config values
-    if config is None:
-        config = {}
-    low_expr_threshold = config.get("analysis", {}).get("low_expression_threshold", 10)
-    pca_config = config.get("analysis", {}).get("pca", {})
-    n_components = pca_config.get("n_components", 2)
-    random_state = pca_config.get("random_state", 0)
-    
-    # Filter low-enriched peptides (variants as rows, sum across samples)
-    df_norm_aligned = df_norm_aligned.loc[df_norm_aligned.sum(axis=1) > low_expr_threshold]
-    if df_norm_aligned.shape[0] < 1:
-        raise ValueError(
-            "PCA has no variants left after low-expression filtering. "
-            "Lower analysis.low_expression_threshold."
-        )
-    
-    # Log transform
-    log_counts = np.log2(df_norm_aligned + 1)
-    
-    # Select top variable features if specified (variants are rows, so axis=1)
-    if top_n_features is not None:
-        feature_var = log_counts.var(axis=1, ddof=1)  # Variance across samples for each variant
-        top_features = feature_var.nlargest(top_n_features).index
-        log_counts = log_counts.loc[top_features]
-        logger.info(f"Using top {top_n_features} variable features")
-    
-    # PCA: transpose so samples are rows, variants are columns
-    X = log_counts.T  # samples x features
-    max_components = min(X.shape[0], X.shape[1])
-    if n_components > max_components:
-        logger.warning(
-            "PCA n_components=%s exceeds maximum possible %s; using %s",
-            n_components,
-            max_components,
-            max_components,
-        )
-        n_components = max_components
-    X_scaled = StandardScaler(with_mean=True, with_std=True).fit_transform(X)
-    
-    # Perform PCA
-    pca = PCA(n_components=n_components, random_state=random_state)
-    pcs = pca.fit_transform(X_scaled)
-    
-    # Create results dataframe
-    pca_df = pd.DataFrame(
-        pcs,
-        index=X.index,
-        columns=[f"PC{i + 1}" for i in range(pcs.shape[1])],
-    )
-    
-    # Merge with metadata
-    pca_df = pca_df.join(meta_aligned)
-    
-    logger.info(f"PCA variance explained: PC1={pca.explained_variance_ratio_[0]:.3f}, "
-                f"PC2={pca.explained_variance_ratio_[1]:.3f}")
-    
-    return pca, pca_df
-
-
-def pair_wt_ko_groups(target_groups: list, background_groups: list) -> list:
-    """
-    Pair WT and KO groups by their prefix (e.g., CD47_WT with CD47_KO).
-    
-    Args:
-        target_groups: List of target group names (typically WT groups)
-        background_groups: List of background group names (typically KO groups)
-        
-    Returns:
-        List of tuples (target_group, background_group) for matched pairs
-    """
-    pairs = []
-    
-    # Extract WT groups and their prefixes
-    wt_groups = [g for g in target_groups if '_WT' in g or g.endswith('WT')]
-    ko_groups = [g for g in background_groups if '_KO' in g or g.endswith('KO')]
-    
-    if wt_groups and ko_groups:
-        # Try to match by prefix
-        for wt_group in wt_groups:
-            # Extract prefix (everything before _WT or WT)
-            if '_WT' in wt_group:
-                prefix = wt_group.rsplit('_WT', 1)[0]
-            elif wt_group.endswith('WT'):
-                prefix = wt_group[:-2].rstrip('_')
-            else:
-                continue
-            
-            # Find matching KO group
-            for ko_group in ko_groups:
-                if '_KO' in ko_group:
-                    ko_prefix = ko_group.rsplit('_KO', 1)[0]
-                elif ko_group.endswith('KO'):
-                    ko_prefix = ko_group[:-2].rstrip('_')
-                else:
-                    continue
-                
-                if prefix == ko_prefix:
-                    pairs.append((wt_group, ko_group))
-                    logger.info(f"Matched pair: {wt_group} vs {ko_group} (prefix: {prefix})")
-                    break
-    
-    # If no pairs found by prefix matching, return all combinations
-    if not pairs:
-        logger.info("No prefix-matched pairs found. Using all target-background combinations.")
-        for target in target_groups:
-            for background in background_groups:
-                pairs.append((target, background))
-    
-    return pairs
-
-
-def build_differential_expression_pairs(
-    meta: pd.DataFrame,
-    target_groups: list,
-    background_groups: list,
-    input_groups: list,
-    pairing: str,
-) -> list:
-    """
-    Build (group_a, group_b) pairs for pairwise OLS differential expression.
-
-    Parameters
-    ----------
-    pairing:
-        - ``target_background`` — :func:`pair_wt_ko_groups` (prefix-matched WT/KO or full
-          target×background grid).
-        - ``all_pairs_non_input`` — all unordered pairs among groups that appear in
-          ``target_groups`` or ``background_groups`` and in ``meta``, excluding
-          ``input_groups`` (includes target–target and background–background).
-        - ``all_meta_non_input`` — all unordered pairs among every ``meta['group']``
-          value except those in ``input_groups``.
-
-    The coefficient in each run is for the **first** group vs the **second** (reference).
-    """
-    mode = (pairing or "target_background").strip().lower().replace("-", "_")
-    meta_group_set = set(meta["group"].unique())
-    input_set = set(input_groups or [])
-
-    if mode in ("all_pairs_non_input", "all_non_input", "all_pairs"):
-        cand = sorted((set(target_groups or []) | set(background_groups or [])) & meta_group_set)
-        cand = [g for g in cand if g not in input_set]
-        pairs = list(combinations(cand, 2)) if len(cand) >= 2 else []
-        logger.info(
-            f"DE pairing mode '{mode}': {len(pairs)} unordered pair(s) among "
-            f"{len(cand)} non-input group(s): {cand}"
-        )
-        return pairs
-
-    if mode in ("all_meta_non_input", "all_groups_non_input"):
-        cand = sorted(g for g in meta_group_set if g not in input_set)
-        pairs = list(combinations(cand, 2)) if len(cand) >= 2 else []
-        logger.info(
-            f"DE pairing mode '{mode}': {len(pairs)} unordered pair(s) among "
-            f"all metadata groups except input: {cand}"
-        )
-        return pairs
-
-    if mode not in ("target_background", "legacy", "default"):
-        logger.warning(
-            f"Unknown differential_expression.pairing '{pairing}'; "
-            "using 'target_background'."
-        )
-    return pair_wt_ko_groups(target_groups, background_groups)
-
-
-def perform_differential_expression(df_norm: pd.DataFrame, meta: pd.DataFrame,
-                                    target_group: str, background_group: str) -> pd.DataFrame:
-    """
-    Perform differential expression analysis using OLS regression.
-
-    Args:
-        df_norm: Normalized counts dataframe (variants as rows, samples as columns)
-        meta: Metadata dataframe
-        target_group: First group (contrast); coefficient is effect of this vs reference
-        background_group: Second group (reference level for the binary indicator)
-
-    Returns:
-        DataFrame with differential expression results (log2FC, pval, padj)
-    """
-    logger.info(f"Performing differential expression: {target_group} vs {background_group}")
-    
-    # 1) Subset to target vs background groups
-    groups_de = [target_group, background_group]
-    meta_de = meta[meta["group"].isin(groups_de)].copy()
-    samples_de = meta_de.index
-    
-    if len(samples_de) == 0:
-        raise ValueError(f"No samples found for groups {groups_de}")
-    
-    logger.info(f"Found {len(samples_de)} samples for comparison")
-    
-    # 2) Build response matrix (ensure numeric + finite)
-    # df_norm has variants as rows, samples as columns
-    Y = df_norm[samples_de].apply(pd.to_numeric, errors="coerce")
-    Y = np.log2(Y + 1)
-    
-    # Drop peptides with any NaN/Inf
-    Y = Y.replace([np.inf, -np.inf], np.nan).dropna(axis=0)
-    
-    logger.info(f"Using {len(Y)} peptides for analysis")
-    
-    # 3) Design matrix (ensure numeric + aligned)
-    X = pd.DataFrame(index=samples_de)
-    X[target_group] = (meta_de.loc[samples_de, "group"] == target_group).astype(int).astype(float)
-    
-    # Add biological replicate dummies (drop first to avoid multicollinearity)
-    bio = pd.get_dummies(meta_de.loc[samples_de, "bio_rep"].astype(str), 
-                         prefix="bio", drop_first=True)
-    bio = bio.astype(float)
-    X = pd.concat([X, bio], axis=1)
-    
-    # Add batch dummies if multiple batches exist (drop first to avoid multicollinearity)
-    if "batch_seq" in meta_de.columns:
-        unique_batches = meta_de.loc[samples_de, "batch_seq"].nunique()
-        if unique_batches > 1:
-            batch = pd.get_dummies(meta_de.loc[samples_de, "batch_seq"].astype(str), 
-                                   prefix="batch", drop_first=True)
-            batch = batch.astype(float)
-            X = pd.concat([X, batch], axis=1)
-            logger.info(f"Added batch correction to differential expression model ({unique_batches} batches)")
-    
-    X = sm.add_constant(X).astype(float)
-    
-    # Final sanity checks
-    assert np.isfinite(X.to_numpy()).all(), "Design matrix contains non-finite values"
-    assert np.isfinite(Y.to_numpy()).all(), "Response matrix contains non-finite values"
-    
-    # 4) Fit per peptide
-    results = []
-    X_np = X.to_numpy()
-    target_col = list(X.columns).index(target_group)
-    
-    logger.info("Fitting OLS models for each peptide...")
-    for pep in Y.index:
-        y = Y.loc[pep].to_numpy(dtype=float)
-        try:
-            fit = sm.OLS(y, X_np, missing="drop").fit()
-            coef = fit.params[target_col]
-            pval = fit.pvalues[target_col]
-            results.append((pep, coef, pval))
-        except Exception as e:
-            logger.warning(f"Failed to fit model for {pep}: {e}")
-            continue
-    
-    # Refactored: Changed column name from "peptide" to "ID_WLG" for consistency
-    # Sourcery-AI suggestion: Use ID_WLG as identifier since Y.index contains variant IDs, not sequences
-    # Create results dataframe
-    # Note: Y.index contains ID_WLG values (variant identifiers), not peptide sequences
-    if len(results) == 0:
-        logger.warning("No results from differential expression analysis")
-        return pd.DataFrame(columns=["ID_WLG", f"log2FC_{target_group}_vs_{background_group}", "pval", "padj"])
-    
-    res = pd.DataFrame(results, columns=["ID_WLG", f"log2FC_{target_group}_vs_{background_group}", "pval"])
-    res = res.set_index("ID_WLG")
-    
-    # Calculate adjusted p-values (only if we have valid p-values)
-    if len(res) > 0 and res["pval"].notna().any():
-        try:
-            # Filter out NaN p-values for FDR correction
-            valid_mask = res["pval"].notna()
-            if valid_mask.sum() > 0:
-                padj_values = np.full(len(res), np.nan)
-                padj_values[valid_mask] = multipletests(res.loc[valid_mask, "pval"].values, method="fdr_bh")[1]
-                res["padj"] = padj_values
-            else:
-                res["padj"] = np.nan
-                logger.warning("All p-values are NaN, cannot calculate padj")
-        except Exception as e:
-            logger.error(f"Error calculating adjusted p-values: {e}")
-            res["padj"] = np.nan
-    else:
-        res["padj"] = np.nan
-        logger.warning("No valid p-values for FDR correction")
-    
-    # Sort by adjusted p-value (NaN values will be at the end)
-    res_sorted = res.sort_values("padj", na_position='last')
-    
-    n_sig = res_sorted["padj"].notna() & (res_sorted["padj"] < 0.05)
-    logger.info(f"Completed differential expression analysis. "
-                f"Found {n_sig.sum()} significant peptides (padj < 0.05) out of {len(res_sorted)} total")
-    
-    return res_sorted
 
 
 def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame,
@@ -1364,88 +733,731 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
     return df_rpm_annot
 
 
-def create_group_color_palette(all_groups: list) -> dict:
-    """
-    Create a fixed color palette for groups to ensure consistency across plots.
-    
-    Args:
-        all_groups: List of all unique group names
-        
-    Returns:
-        Dictionary mapping group names to colors
-    """
-    # Use a consistent color palette (tab10 for up to 10 groups, then extend)
-    base_colors = sns.color_palette("tab10", n_colors=10)
-    
-    # If more than 10 groups, extend with additional colors
-    if len(all_groups) > 10:
-        extended_colors = sns.color_palette("Set3", n_colors=len(all_groups) - 10)
-        colors = base_colors + extended_colors
-    else:
-        colors = base_colors[:len(all_groups)]
-    
-    # Create mapping: sort groups for consistency
-    sorted_groups = sorted(all_groups)
-    palette = {group: colors[i] for i, group in enumerate(sorted_groups)}
-    
-    return palette
+def r_make_names(name: str) -> str:
+    """Approximate R ``make.names`` for group labels used in column names."""
+    cleaned = re.sub(r"[^A-Za-z0-9_]", ".", str(name))
+    if not cleaned or cleaned[0].isdigit():
+        cleaned = "X" + cleaned
+    return cleaned
 
 
-def plot_pca(pca: PCA, pca_df: pd.DataFrame, output_file: Path, 
-             title: str = "PCA Plot", group_palette: Optional[dict] = None,
-             config: Optional[Dict[str, Any]] = None):
+def _rep_sort_key(value):
+    try:
+        return (0, float(value))
+    except (TypeError, ValueError):
+        return (1, str(value))
+
+
+def _is_human_ntng1_group(group: str) -> bool:
+    return str(group).endswith("-NTNG1") and not str(group).endswith("-Ntng1")
+
+
+def _is_mouse_ntng1_group(group: str) -> bool:
+    return str(group).endswith("-Ntng1")
+
+
+def sanitize_group_label(group: str) -> str:
+    """Case-safe file label. Human NTNG1 and mouse Ntng1 stay distinct."""
+    group = str(group)
+    if group == "Human-NTNG1":
+        return "Human.NTNG1"
+    if group == "Mouse-Ntng1":
+        return "Mouse.Ntng1"
+    if _is_human_ntng1_group(group):
+        group = group[: -len("-NTNG1")] + "-Human.NTNG1"
+    elif _is_mouse_ntng1_group(group):
+        group = group[: -len("-Ntng1")] + "-Mouse.Ntng1"
+    group = group.replace("-", ".")
+    return re.sub(r"[^A-Za-z0-9._]", "_", group)
+
+
+def de_result_filename(y_group: str, x_group: str) -> str:
+    return f"DE_{sanitize_group_label(y_group)}_vs_{sanitize_group_label(x_group)}.tsv"
+
+
+def _aavr_baseline_group(group: str) -> Optional[str]:
+    if str(group).startswith("AAVR-WT-"):
+        return "AAVR-WT"
+    if str(group).startswith("AAVR-KO-"):
+        return "AAVR-KO"
+    return None
+
+
+def build_enrichment_comparisons(
+    sample_info: pd.DataFrame,
+    group_col: str = "group",
+    input_group: str = "Input",
+    mode: str = "auto",
+) -> pd.DataFrame:
     """
-    Create and save PCA plot.
-    
-    Args:
-        pca: PCA object
-        pca_df: DataFrame with PC coordinates and metadata
-        output_file: Path to save the plot
-        title: Plot title
-        group_palette: Dictionary mapping group names to colors (for consistency)
+    Build y-versus-x contrasts from sample_info group names.
+
+    ``auto`` selects aavr, pd_target, oa_opa, or fasma_fasta from those names.
+    y_group is the numerator of the DESeq2 contrast and x_group is the reference.
     """
-    logger.info(f"Creating PCA plot: {title}")
-    
-    # Get config values
-    if config is None:
-        config = {}
-    plot_config = config.get("plots", {})
-    figsize = plot_config.get("figure_sizes", {}).get("pca", [6, 5])
-    dpi = plot_config.get("dpi", {}).get("standard", 300)
-    pca_plot_config = plot_config.get("pca", {})
-    point_size = pca_plot_config.get("point_size", 120)
-    fontsize = pca_plot_config.get("fontsize", 10)
-    
-    # PCA plot
-    plt.figure(figsize=tuple(figsize), dpi=dpi)
-    
-    # Use fixed palette if provided
-    plot_kwargs = {
-        "data": pca_df,
-        "x": "PC1",
-        "y": "PC2",
-        "hue": "group",
-        "style": "bio_rep",
-        "s": point_size
-    }
-    
-    if group_palette is not None:
-        plot_kwargs["palette"] = group_palette
-    
-    sns.scatterplot(**plot_kwargs)
-    
-    plt.xlabel(f"PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)", fontsize=fontsize)
-    if pca.explained_variance_ratio_.size > 1 and "PC2" in pca_df.columns:
-        plt.ylabel(f"PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)", fontsize=fontsize)
+    mode = (mode or "auto").strip().lower().replace("-", "_")
+    allowed = {"auto", "aavr", "pd_target", "oa_opa", "fasma_fasta"}
+    if mode not in allowed:
+        raise ValueError(f"Unknown comparison mode '{mode}'. Expected one of {sorted(allowed)}")
+
+    groups = [g for g in pd.unique(sample_info[group_col].astype(str)) if g and g != input_group]
+    if not groups:
+        raise ValueError("No groups found in sample_info after excluding Input.")
+
+    if mode == "auto":
+        group_set = set(groups)
+        if any(g.startswith("AAVR-") for g in groups):
+            mode = "aavr"
+        elif group_set & {"Target", "human_Target", "mouse_Target", "Human-NTNG1", "Mouse-Ntng1"}:
+            mode = "pd_target"
+        elif any(g.startswith(("OA-", "OPA-")) for g in groups):
+            mode = "oa_opa"
+        elif any(g.startswith("FASMA-") for g in groups) and any(g.startswith("FASTA-") for g in groups):
+            mode = "fasma_fasta"
+        else:
+            raise ValueError(
+                "Could not infer comparison mode from group names: "
+                + ", ".join(groups)
+            )
+    logger.info("Comparison mode '%s' from groups: %s", mode, groups)
+
+    pairs: List[Tuple[str, str]] = []
+
+    def add(y_group: str, x_group: str) -> None:
+        if not y_group or not x_group or y_group == x_group:
+            return
+        if y_group in groups and x_group in groups and (y_group, x_group) not in pairs:
+            pairs.append((y_group, x_group))
+
+    if mode == "aavr":
+        for bait in groups:
+            if not bait.startswith("AAVR-"):
+                continue
+            if _is_human_ntng1_group(bait) or _is_mouse_ntng1_group(bait):
+                baseline = _aavr_baseline_group(bait)
+                if baseline:
+                    add(bait, baseline)
+        add("AAVR-WT-NTNG1", "AAVR-KO-NTNG1")
+        add("AAVR-WT-Ntng1", "AAVR-KO-Ntng1")
+        add("AAVR-WT", "AAVR-KO")
+        add("AAVR-WT-NTNG1", "AAVR-WT-Ntng1")
+        add("AAVR-KO-NTNG1", "AAVR-KO-Ntng1")
+    elif mode == "pd_target":
+        targets = [g for g in ("Target", "human_Target", "mouse_Target", "Human-NTNG1", "Mouse-Ntng1") if g in groups]
+        controls = [g for g in ("Fc", "Bead", "Bead-Fc") if g in groups]
+        if not targets:
+            raise ValueError(
+                "pd_target mode needs Target, human_Target, mouse_Target, Human-NTNG1, or Mouse-Ntng1"
+            )
+        for target in targets:
+            for control in controls:
+                add(target, control)
+    elif mode == "oa_opa":
+        parsed = []
+        for group in groups:
+            if not group.startswith(("OA-", "OPA-")):
+                continue
+            parts = group.split("-")
+            if len(parts) != 3:
+                continue
+            parsed.append((group, parts[0], parts[1], parts[2]))
+        if not parsed:
+            raise ValueError("oa_opa mode needs groups starting with OA- or OPA-")
+        for group, model, genotype, fraction in parsed:
+            if fraction == "POS":
+                add(group, f"{model}-{genotype}-NEG")
+            if genotype == "WT":
+                add(group, f"{model}-KO-{fraction}")
+            if model == "OA":
+                add(group, f"OPA-{genotype}-{fraction}")
+    elif mode == "fasma_fasta":
+        parsed = []
+        for group in groups:
+            if not group.startswith(("FASMA-", "FASTA-")):
+                continue
+            library, _, tissue = group.partition("-")
+            if tissue:
+                parsed.append((group, library, tissue))
+        if not parsed:
+            raise ValueError("fasma_fasta mode needs groups starting with FASMA- or FASTA-")
+        tissues = []
+        for _, _, tissue in parsed:
+            if tissue not in tissues:
+                tissues.append(tissue)
+        for tissue in tissues:
+            y_hits = [g for g, library, tiss in parsed if library == "FASMA" and tiss == tissue]
+            x_hits = [g for g, library, tiss in parsed if library == "FASTA" and tiss == tissue]
+            if len(y_hits) == 1 and len(x_hits) == 1:
+                add(y_hits[0], x_hits[0])
+        other = [t for t in tissues if t != "kidney"]
+        for library in ("FASMA", "FASTA"):
+            y_hits = [g for g, lib, tiss in parsed if lib == library and tiss == "kidney"]
+            if len(y_hits) != 1:
+                continue
+            for tissue in other:
+                x_hits = [g for g, lib, tiss in parsed if lib == library and tiss == tissue]
+                if len(x_hits) == 1:
+                    add(y_hits[0], x_hits[0])
+
+    if not pairs:
+        raise ValueError(
+            f"No comparison pairs could be built for mode '{mode}' with groups: {', '.join(groups)}"
+        )
+    out = pd.DataFrame(pairs, columns=["y_group", "x_group"])
+    out["mode"] = mode
+    logger.info("Inferred %d DESeq2 contrast(s)", len(out))
+    return out
+
+
+def load_merged_counts(count_file: Path) -> pd.DataFrame:
+    """Read merged counts with one row per variant. Unassigned rows are removed."""
+    logger.info("Reading count table from %s", count_file)
+    counts = pd.read_csv(count_file, sep=",")
+    if "ID_WLG" not in counts.columns:
+        raise ValueError("merged counts must contain an ID_WLG column")
+    n_before = len(counts)
+    counts = counts.loc[~counts["ID_WLG"].astype(str).str.lower().eq("unassigned")].copy()
+    n_removed = n_before - len(counts)
+    if n_removed:
+        logger.info("Excluded %d unassigned variant(s)", n_removed)
+    if counts["ID_WLG"].astype(str).duplicated().any():
+        raise ValueError("Duplicate ID_WLG values in the merged count table")
+    logger.info("Count table shape: %s", counts.shape)
+    return counts
+
+
+def _group_is_low(values: np.ndarray, min_count: float) -> np.ndarray:
+    """True when every finite replicate count is strictly between 0 and min_count."""
+    finite = np.isfinite(values)
+    low = finite & (values > 0) & (values < min_count)
+    n_finite = finite.sum(axis=1)
+    return (n_finite > 0) & (low.sum(axis=1) == n_finite)
+
+
+def update_variant_metrics(
+    df: pd.DataFrame,
+    sample_info: pd.DataFrame,
+    min_count: float = 10,
+    drop_if_any_group_low: bool = False,
+    pseudocount: float = 1.0,
+    min_rpm_post: Optional[float] = None,
+    rpm_post_filter_mode: str = "any",
+) -> pd.DataFrame:
+    """
+    Attach RPM and log2(RPM + pseudocount), then drop low-count variants.
+
+    RPM is computed from the full table before row filtering. A group is low
+    only when every replicate count is greater than 0 and below ``min_count``.
+    With ``drop_if_any_group_low=False``, a variant is removed only when every
+    group is low.
+    """
+    sample_ids = [sid for sid in sample_info["sample_id"].astype(str) if sid in df.columns]
+    if not sample_ids:
+        raise ValueError("No sample_id from sample_info matched columns in the count table")
+    missing = sorted(set(sample_info["sample_id"].astype(str)) - set(sample_ids))
+    if missing:
+        logger.warning("sample_id values with no count column: %s", missing)
+
+    raw = df[sample_ids].apply(pd.to_numeric, errors="coerce")
+    n_na = int(raw.isna().sum().sum())
+    if n_na:
+        logger.warning("Replacing %d missing count value(s) with 0", n_na)
+        raw = raw.fillna(0)
+    lib_sizes = raw.sum(axis=0).replace(0, np.nan)
+    rpm = raw.div(lib_sizes, axis=1) * 1e6
+    log2_rpm = np.log2(rpm + pseudocount)
+
+    info = sample_info.loc[sample_info["sample_id"].astype(str).isin(sample_ids), ["sample_id", "group"]]
+    low_flags = []
+    for _, sub in info.groupby("group", sort=False):
+        cols = [sid for sid in sub["sample_id"].astype(str) if sid in raw.columns]
+        low_flags.append(_group_is_low(raw[cols].to_numpy(dtype=float), min_count))
+    low_mat = np.column_stack(low_flags)
+    if drop_if_any_group_low:
+        drop = low_mat.any(axis=1)
     else:
-        plt.ylabel("PC2", fontsize=fontsize)
-    plt.legend(title="", bbox_to_anchor=(1.05, 1), loc="upper left")
-    plt.tight_layout()
-    
-    plt.savefig(output_file, dpi=dpi, bbox_inches='tight')
-    plt.close()
-    
-    logger.info(f"Saved PCA plot to {output_file}")
+        drop = low_mat.all(axis=1)
+
+    keep = ~drop
+    out = df.loc[keep].copy()
+    rpm = rpm.loc[keep]
+    log2_rpm = log2_rpm.loc[keep]
+    for sid in sample_ids:
+        out[f"{sid}_RPM"] = rpm[sid].to_numpy()
+        out[f"{sid}_log2RPM"] = log2_rpm[sid].to_numpy()
+
+    if min_rpm_post is not None:
+        rpm_cols = [f"{sid}_RPM" for sid in sample_ids]
+        rpm_values = out[rpm_cols].to_numpy(dtype=float)
+        if rpm_post_filter_mode == "all":
+            post_keep = np.isfinite(rpm_values).all(axis=1) & (rpm_values >= min_rpm_post).all(axis=1)
+        else:
+            post_keep = (np.nan_to_num(rpm_values, nan=-np.inf) >= min_rpm_post).any(axis=1)
+        out = out.loc[post_keep].copy()
+
+    logger.info(
+        "Low-count filter (min_count=%s, drop_if_any_group_low=%s): kept %d/%d variants",
+        min_count,
+        drop_if_any_group_low,
+        len(out),
+        len(df),
+    )
+    return out
+
+
+def _first_sample_per_biorep(sample_info: pd.DataFrame, group: str) -> pd.DataFrame:
+    """One sample_info row per biological replicate, the first row for that replicate."""
+    sub = sample_info.loc[sample_info["group"].astype(str) == str(group)].copy()
+    reps = sorted(sub["bio_rep"].unique(), key=_rep_sort_key)
+    rows = []
+    for rep in reps:
+        hit = sub.loc[sub["bio_rep"] == rep]
+        if len(hit):
+            rows.append(hit.iloc[0])
+    if not rows:
+        return sub.iloc[0:0]
+    return pd.DataFrame(rows)
+
+
+def add_cv_rpm_by_group(df: pd.DataFrame, sample_info: pd.DataFrame, prefix: str = "CV_RPM") -> pd.DataFrame:
+    """Add one CV column per group. CV is sd(RPM) / mean(RPM) across biological replicates."""
+    out = df.copy()
+    for group in pd.unique(sample_info["group"].astype(str)):
+        chosen = _first_sample_per_biorep(sample_info, group)
+        rpm_cols = [f"{sid}_RPM" for sid in chosen["sample_id"].astype(str) if f"{sid}_RPM" in out.columns]
+        if len(rpm_cols) < 2:
+            logger.warning("Group '%s': need at least 2 biological replicates for CV; skipping", group)
+            continue
+        values = out[rpm_cols].to_numpy(dtype=float)
+        n_finite = np.isfinite(values).sum(axis=1)
+        mean = np.divide(np.nansum(values, axis=1), n_finite, out=np.full(len(values), np.nan), where=n_finite > 0)
+        centered = values - mean[:, None]
+        sq = np.nansum(np.where(np.isfinite(centered), centered ** 2, 0.0), axis=1)
+        std = np.sqrt(np.divide(sq, n_finite - 1, out=np.full(len(values), np.nan), where=n_finite > 1))
+        cv = np.divide(std, mean, out=np.full(len(values), np.nan), where=np.isfinite(mean) & (mean != 0))
+        cv[(n_finite < 2) | ~np.isfinite(mean) | (mean == 0) | ~np.isfinite(std)] = np.nan
+        out[f"{prefix}_{r_make_names(group)}"] = cv
+    return out
+
+
+def calc_pearson_biorep_by_group(df: pd.DataFrame, sample_info: pd.DataFrame) -> pd.DataFrame:
+    """Pearson correlation of log2(RPM) between biological replicates, one row per group."""
+    rows = []
+    pair_names = []
+    for group in pd.unique(sample_info["group"].astype(str)):
+        chosen = _first_sample_per_biorep(sample_info, group)
+        if len(chosen) < 2:
+            continue
+        cols = []
+        labels = []
+        for _, row in chosen.iterrows():
+            col = f"{row['sample_id']}_log2RPM"
+            if col not in df.columns:
+                continue
+            cols.append(col)
+            labels.append(f"bio{row['bio_rep']}")
+        if len(cols) < 2:
+            continue
+        mat = df[cols].apply(pd.to_numeric, errors="coerce")
+        mat.columns = labels
+        if len(mat) < 3:
+            continue
+        row_vals = {"group": group}
+        for left, right in combinations(labels, 2):
+            name = f"{left}_vs_{right}"
+            pair = mat[[left, right]].dropna()
+            if len(pair) < 3 or pair[left].nunique() < 2 or pair[right].nunique() < 2:
+                row_vals[name] = np.nan
+            else:
+                row_vals[name] = float(pearsonr(pair[left], pair[right])[0])
+            if name not in pair_names:
+                pair_names.append(name)
+        rows.append(row_vals)
+    if not rows:
+        logger.warning("No groups with at least 2 biological replicates for log2RPM correlation")
+        return pd.DataFrame(columns=["group"])
+    out = pd.DataFrame(rows)
+    for name in pair_names:
+        if name not in out.columns:
+            out[name] = np.nan
+    return out[["group"] + pair_names]
+
+
+def plot_log2rpm_pearson_pdf(df: pd.DataFrame, sample_info: pd.DataFrame, out_pdf: Path) -> int:
+    """Scatter log2(RPM) for every biological-replicate pair within each group."""
+    n_pages = 0
+    with PdfPages(out_pdf) as pdf:
+        for group in pd.unique(sample_info["group"].astype(str)):
+            chosen = _first_sample_per_biorep(sample_info, group)
+            usable = []
+            for _, row in chosen.iterrows():
+                col = f"{row['sample_id']}_log2RPM"
+                if col in df.columns:
+                    usable.append((col, row["bio_rep"], row["sample_id"]))
+            for (c1, b1, s1), (c2, b2, s2) in combinations(usable, 2):
+                pair = df[[c1, c2]].apply(pd.to_numeric, errors="coerce").dropna()
+                if len(pair) < 3:
+                    continue
+                x = pair[c1].to_numpy(dtype=float)
+                y = pair[c2].to_numpy(dtype=float)
+                r_val, p_val = pearsonr(x, y)
+                fig, ax = plt.subplots(figsize=(7, 6))
+                ax.scatter(x, y, s=8, alpha=0.35, c="#2C7FB8", linewidths=0)
+                if np.nanstd(x) > 0:
+                    slope, intercept = np.polyfit(x, y, 1)
+                    xs = np.linspace(np.nanmin(x), np.nanmax(x), 100)
+                    ax.plot(xs, slope * xs + intercept, color="#D95F0E", lw=0.7)
+                ax.set_title(f"{group} | bio{b1} vs bio{b2}")
+                ax.set_xlabel(f"{s1} log2(RPM+1)")
+                ax.set_ylabel(f"{s2} log2(RPM+1)")
+                ax.text(
+                    0.02,
+                    0.98,
+                    f"Pearson r = {r_val:.3f}, p = {p_val:.2e}, n = {len(pair)}",
+                    transform=ax.transAxes,
+                    va="top",
+                    fontsize=9,
+                )
+                fig.tight_layout()
+                pdf.savefig(fig)
+                plt.close(fig)
+                n_pages += 1
+    if n_pages == 0 and out_pdf.exists():
+        out_pdf.unlink()
+        logger.warning("No log2RPM replicate pairs to plot")
+    else:
+        logger.info("Saved %d log2RPM Pearson scatter page(s) to %s", n_pages, out_pdf)
+    return n_pages
+
+
+def plot_cv_histogram_pdf(df: pd.DataFrame, out_pdf: Path, cv_high_threshold: float = 0.5, bins: int = 60) -> int:
+    """One density histogram per CV_RPM column."""
+    cv_cols = sorted(col for col in df.columns if str(col).startswith("CV_RPM_"))
+    if not cv_cols:
+        logger.warning("No CV_RPM columns to plot")
+        return 0
+    n_pages = 0
+    with PdfPages(out_pdf) as pdf:
+        for col in cv_cols:
+            values = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+            values = values[np.isfinite(values)]
+            if len(values) < 2:
+                logger.warning("Skipping %s: fewer than 2 finite values", col)
+                continue
+            n_high = int((values > cv_high_threshold).sum())
+            pct = 100.0 * n_high / len(values)
+            title = str(col)[len("CV_RPM_"):].replace("_", " ").replace(".", " ")
+            fig, ax = plt.subplots(figsize=(7, 5))
+            ax.hist(values, bins=bins, density=True, color="#4575b4", edgecolor="white", linewidth=0.25)
+            ax.set_title(f"CV of RPM across replicates — {title}")
+            ax.set_xlabel("CV (SD / mean RPM)")
+            ax.set_ylabel("Density")
+            ax.text(
+                0.98,
+                0.98,
+                f"n = {len(values)} | CV > {cv_high_threshold:g}: {n_high} ({pct:.1f}%)",
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=9,
+            )
+            fig.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+            n_pages += 1
+    if n_pages == 0 and out_pdf.exists():
+        out_pdf.unlink()
+        logger.warning("No CV histograms were written")
+    else:
+        logger.info("Saved CV histograms to %s", out_pdf)
+    return n_pages
+
+
+def plot_aav2_rpm_contamination(df: pd.DataFrame, sample_info: pd.DataFrame, out_pdf: Path, variant_id: str = "AAV2") -> bool:
+    """Bar plot of AAV2 RPM by group, with one point per biological replicate."""
+    if "ID_WLG" not in df.columns:
+        logger.warning("Cannot plot AAV2 RPM: ID_WLG column is missing")
+        return False
+    hits = df.index[df["ID_WLG"].astype(str) == variant_id]
+    if len(hits) == 0:
+        logger.warning("Variant '%s' not found; skipping contamination plot", variant_id)
+        return False
+    if len(hits) > 1:
+        logger.warning("%d rows match %s; using the first", len(hits), variant_id)
+    row = df.loc[hits[0]]
+    records = []
+    group_order = []
+    for group in pd.unique(sample_info["group"].astype(str)):
+        chosen = _first_sample_per_biorep(sample_info, group)
+        if group not in group_order:
+            group_order.append(group)
+        for _, info in chosen.iterrows():
+            col = f"{info['sample_id']}_RPM"
+            if col not in df.columns:
+                continue
+            records.append({"group": group, "bio_rep": info["bio_rep"], "rpm": float(row[col])})
+    if not records:
+        logger.warning("No RPM columns available for %s", variant_id)
+        return False
+    long_df = pd.DataFrame(records)
+    summary = (
+        long_df.groupby("group", sort=False)["rpm"]
+        .agg(mean="mean", sd=lambda s: float(s.std(ddof=1)) if s.notna().sum() >= 2 else np.nan, n="count")
+        .reindex(group_order)
+        .reset_index()
+    )
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+    x = np.arange(len(summary))
+    ax.bar(x, summary["mean"].to_numpy(dtype=float), color="#4575b4", width=0.65, alpha=0.92)
+    for i, rec in summary.iterrows():
+        if rec["n"] >= 2 and np.isfinite(rec["sd"]):
+            ymin = max(0.0, float(rec["mean"]) - float(rec["sd"]))
+            ymax = float(rec["mean"]) + float(rec["sd"])
+            ax.errorbar(i, rec["mean"], yerr=[[rec["mean"] - ymin], [ymax - rec["mean"]]], fmt="none", ecolor="black", elinewidth=0.6, capsize=2)
+    rng = np.random.default_rng(0)
+    for i, group in enumerate(group_order):
+        pts = long_df.loc[long_df["group"] == group, "rpm"].to_numpy(dtype=float)
+        jitter = rng.uniform(-0.12, 0.12, size=len(pts))
+        ax.scatter(np.full(len(pts), i) + jitter, pts, s=22, c="#2c2c2c", zorder=3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(group_order, rotation=35, ha="right")
+    ax.set_ylabel("RPM")
+    ax.set_title(f"{variant_id} RPM (contamination)")
+    fig.tight_layout()
+    fig.savefig(out_pdf)
+    plt.close(fig)
+    logger.info("Saved %s RPM bar plot to %s", variant_id, out_pdf)
+    return True
+
+
+def _integer_counts(raw: pd.DataFrame) -> pd.DataFrame:
+    numeric = raw.apply(pd.to_numeric, errors="coerce").fillna(0)
+    rounded = numeric.round()
+    if ((numeric - rounded).abs() > 1e-6).any().any():
+        logger.warning("Rounding non-integer counts before DESeq2")
+    rounded = rounded.astype(int)
+    if (rounded < 0).any().any():
+        raise ValueError("Count matrix contains negative values")
+    return rounded
+
+
+def fit_blind_vst(counts: pd.DataFrame, sample_info: pd.DataFrame, n_cpus: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build a DESeqDataSet with design ``~ group`` and return blind VST counts.
+
+    The returned table has variants as rows and samples as columns. DESeq() is
+    not run here; dispersions for VST use an intercept-only trend.
+    """
+    sample_ids = [sid for sid in sample_info["sample_id"].astype(str) if sid in counts.columns]
+    if len(sample_ids) < 2:
+        raise ValueError("Need at least 2 samples with count columns for VST")
+    if "ID_WLG" not in counts.columns:
+        raise ValueError("Count table must contain ID_WLG for VST")
+    count_mat = _integer_counts(counts[sample_ids])
+    count_mat.index = counts["ID_WLG"].astype(str).to_numpy()
+    if count_mat.index.duplicated().any():
+        raise ValueError("Duplicate ID_WLG values while building the VST dataset")
+    count_mat = count_mat.T
+    count_mat.index = sample_ids
+    metadata = sample_info.loc[sample_ids, ["group"]].copy()
+    metadata["group"] = metadata["group"].astype(str)
+    dds = DeseqDataSet(
+        counts=count_mat,
+        metadata=metadata,
+        design="~group",
+        refit_cooks=True,
+        n_cpus=n_cpus,
+        quiet=True,
+    )
+    dds.vst(use_design=False)
+    vst = pd.DataFrame(dds.layers["vst_counts"], index=dds.obs_names, columns=dds.var_names).T
+    vst.index.name = "ID_WLG"
+    return vst, metadata
+
+
+def plot_vst_pearson_heatmap(vst: pd.DataFrame, out_pdf: Path) -> pd.DataFrame:
+    """Sample-sample Pearson correlation of blind VST values. Scale is fixed at 0.7 to 1."""
+    corr = vst.corr(method="pearson")
+    cmap = LinearSegmentedColormap.from_list(
+        "vst_corr",
+        ["#313695", "#4575b4", "#74add1", "#abd9e9", "#f7f7f7", "#fdae61", "#f46d43", "#d73027", "#a50026"],
+    )
+    n = corr.shape[0]
+    fig_w = max(8.5, 0.35 * n + 3)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_w * 0.9))
+    sns.heatmap(
+        corr,
+        ax=ax,
+        cmap=cmap,
+        vmin=0.7,
+        vmax=1.0,
+        square=True,
+        cbar_kws={"label": "Pearson r"},
+    )
+    ax.set_title("Sample Pearson correlation (blind VST)")
+    fig.tight_layout()
+    fig.savefig(out_pdf)
+    plt.close(fig)
+    logger.info("Saved VST Pearson heatmap to %s", out_pdf)
+    return corr
+
+
+def _pca_frame(vst: pd.DataFrame, sample_info: pd.DataFrame, n_top: Optional[int], exclude_groups: List[str]):
+    meta = sample_info.copy()
+    meta["group"] = meta["group"].astype(str)
+    keep = [sid for sid in vst.columns if sid in meta.index and meta.loc[sid, "group"] not in set(exclude_groups)]
+    if len(keep) < 2:
+        raise ValueError(
+            f"Need at least 2 samples after excluding {exclude_groups}; remaining: {keep}"
+        )
+    mat = vst[keep].apply(pd.to_numeric, errors="coerce")
+    variance = mat.var(axis=1, ddof=1)
+    ranked = variance[(variance > 0) & np.isfinite(variance)].sort_values(ascending=False)
+    if ranked.empty:
+        raise ValueError("No variants with positive finite VST variance")
+    if n_top is None:
+        selected = ranked.index
+    else:
+        selected = ranked.index[: int(n_top)]
+    features = mat.loc[selected].T
+    n_components = min(2, features.shape[0], features.shape[1])
+    pca = PCA(n_components=n_components, svd_solver="full")
+    coords = pca.fit_transform(features)
+    frame = pd.DataFrame(coords, index=features.index, columns=[f"PC{i + 1}" for i in range(n_components)])
+    if "PC2" not in frame.columns:
+        frame["PC2"] = 0.0
+    frame["group"] = meta.loc[frame.index, "group"].astype(str).to_numpy()
+    frame["bio_rep"] = meta.loc[frame.index, "bio_rep"].astype(str).to_numpy()
+    frame["sample"] = frame.index.astype(str)
+    pct = pca.explained_variance_ratio_ * 100.0
+    return frame, pct, len(selected)
+
+
+def _draw_pca(frame: pd.DataFrame, pct: np.ndarray, n_variants: int, title: str, exclude_groups: List[str], ax):
+    groups = list(dict.fromkeys(frame["group"]))
+    markers = ["o", "^", "s", "P", "X", "*", "D", "v", "<", ">", "p", "h"]
+    marker_map = {group: markers[i % len(markers)] for i, group in enumerate(groups)}
+    sns.scatterplot(
+        data=frame,
+        x="PC1",
+        y="PC2" if "PC2" in frame.columns else "PC1",
+        hue="bio_rep",
+        style="group",
+        markers=marker_map,
+        s=70,
+        ax=ax,
+    )
+    pc1 = f"PC1 ({pct[0]:.0f}% variance)" if len(pct) else "PC1"
+    pc2 = f"PC2 ({pct[1]:.0f}% variance)" if len(pct) > 1 else "PC2"
+    ax.set_xlabel(pc1)
+    ax.set_ylabel(pc2)
+    excluded = ", ".join(exclude_groups) if exclude_groups else "none"
+    ax.set_title(title)
+    ax.text(0.0, 1.02, f"n variants = {n_variants} | excluded groups: {excluded}", transform=ax.transAxes, fontsize=8, va="bottom")
+    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0, fontsize=8)
+
+
+def plot_vst_pca(vst: pd.DataFrame, sample_info: pd.DataFrame, qc_dir: Path, n_top: int, exclude_groups: List[str]) -> None:
+    """Write the two notebook PCA figures: all positive-variance variants, and the top variable set."""
+    all_frame, all_pct, n_all = _pca_frame(vst, sample_info, None, exclude_groups)
+    top_frame, top_pct, n_top_used = _pca_frame(vst, sample_info, n_top, exclude_groups)
+    plots = [
+        (all_frame, all_pct, n_all, "PCA on VST (all variants with positive variance)", qc_dir / "pca_all_features.png"),
+        (top_frame, top_pct, n_top_used, f"PCA on VST (top {n_top} variable variants)", qc_dir / "pca_top500_features.png"),
+    ]
+    with PdfPages(qc_dir / "pca_vst.pdf") as pdf:
+        for frame, pct, n_variants, title, png_path in plots:
+            fig, ax = plt.subplots(figsize=(7.5, 6.5))
+            _draw_pca(frame, pct, n_variants, title, exclude_groups, ax)
+            fig.tight_layout()
+            fig.savefig(png_path, dpi=300)
+            pdf.savefig(fig)
+            plt.close(fig)
+            logger.info("Saved %s", png_path)
+    logger.info("Saved two-page VST PCA to %s", qc_dir / "pca_vst.pdf")
+
+
+def run_deseq2_comparisons(
+    counts: pd.DataFrame,
+    sample_info: pd.DataFrame,
+    comparisons: pd.DataFrame,
+    out_dir: Path,
+    n_cpus: int,
+    min_replicates: int = 2,
+) -> int:
+    """
+    Fit each contrast on its two groups only.
+
+    This matches the notebook: subset the samples, run DESeq with design ``~ group``,
+    then test y_group versus x_group. Genes with no counts in the subset are omitted.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    n_ok = 0
+    id_by_row = counts["ID_WLG"].astype(str)
+    for _, cmp in comparisons.iterrows():
+        y_group = str(cmp["y_group"])
+        x_group = str(cmp["x_group"])
+        name = f"{y_group}_vs_{x_group}"
+        subset = sample_info.loc[sample_info["group"].astype(str).isin([y_group, x_group])].copy()
+        counts_per_group = subset["group"].astype(str).value_counts()
+        if counts_per_group.reindex([y_group, x_group]).fillna(0).min() < min_replicates:
+            logger.warning(
+                "Skipping %s: need >= %d sample(s) per group; counts: %s",
+                name,
+                min_replicates,
+                counts_per_group.to_dict(),
+            )
+            continue
+        sample_ids = [sid for sid in subset["sample_id"].astype(str) if sid in counts.columns]
+        count_mat = _integer_counts(counts[sample_ids])
+        keep_genes = count_mat.sum(axis=1) > 0
+        n_drop = int((~keep_genes).sum())
+        if n_drop:
+            logger.info("%s: omitting %d variant(s) with zero counts in the contrasted samples", name, n_drop)
+        count_mat = count_mat.loc[keep_genes]
+        if count_mat.empty:
+            logger.warning("Skipping %s: no expressed variants in the contrasted samples", name)
+            continue
+        count_mat.index = id_by_row.loc[count_mat.index]
+        if count_mat.index.duplicated().any():
+            raise ValueError(f"Duplicate variant IDs while preparing {name}")
+        design_counts = count_mat.T
+        metadata = subset.loc[sample_ids, ["group"]].copy()
+        metadata["group"] = metadata["group"].astype(str)
+        try:
+            dds = DeseqDataSet(
+                counts=design_counts,
+                metadata=metadata,
+                design="~group",
+                refit_cooks=True,
+                n_cpus=n_cpus,
+                quiet=True,
+            )
+            dds.deseq2()
+            stats = DeseqStats(dds, contrast=["group", y_group, x_group], quiet=True)
+            stats.summary()
+            res = stats.results_df.copy()
+            res.insert(0, "ID", res.index.astype(str))
+            res["y_group"] = y_group
+            res["x_group"] = x_group
+            res["comparison"] = name
+            out_path = out_dir / de_result_filename(y_group, x_group)
+            res.to_csv(out_path, sep="\t", index=False)
+            n_sig = int((res["padj"] < 0.05).sum()) if "padj" in res.columns else 0
+            logger.info("Wrote %s (%d variants, %d with padj < 0.05)", out_path, len(res), n_sig)
+            n_ok += 1
+        except Exception as exc:
+            logger.warning("DESeq2 failed for %s: %s", name, exc)
+    return n_ok
+
+
+def _cfg_int(value, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def run_statistical_analysis(
@@ -1459,24 +1471,12 @@ def run_statistical_analysis(
     log_file: Optional[Path] = None,
 ) -> bool:
     """
-    Run statistical analysis on CapScreen count data.
-    
-    This function can be called programmatically from other modules.
-    
-    Args:
-        counts_file: Path to merged.counts.csv file
-        sample_info_file: Path to Sample_info.csv file
-        output_dir: Output directory for results
-        config_file: Path to config.json file (optional)
-        n_cpus: Number of CPUs to use for DESeq2 (optional)
-        verbose: Enable verbose logging (default: False)
-        logger_instance: Optional logger instance to use (if None, uses module logger)
-        log_file: Optional path for a dedicated stat step log
-        
-    Returns:
-        True if analysis completed successfully, False otherwise
+    Run QC and DESeq2 on CapScreen count data.
+
+    QC files are written to ``output_dir/qc``. DESeq2 contrast tables are written
+    to ``output_dir/deseq2``. The filtered count matrix, with RPM and CV columns,
+    is written to ``output_dir/filtered_variant_metrics.tsv``.
     """
-    # Use provided logger or module logger
     if logger_instance is not None:
         global logger
         logger = logger_instance
@@ -1488,227 +1488,140 @@ def run_statistical_analysis(
             )
     else:
         setup_logging(verbose, log_file=log_file)
-    
-    # Load configuration
+
     config = load_config(config_file)
-    
-    # Create output directory. QC tables and plots live in a qc subdirectory.
     output_dir.mkdir(parents=True, exist_ok=True)
     qc_dir = output_dir / "qc"
+    de_dir = output_dir / "deseq2"
     qc_dir.mkdir(parents=True, exist_ok=True)
-    
+    de_dir.mkdir(parents=True, exist_ok=True)
+
+    analysis_cfg = config.get("analysis", {}) or {}
+    de_cfg = config.get("differential_expression", {}) or {}
+    n_cpus_val = n_cpus if n_cpus is not None else _cfg_int(analysis_cfg.get("n_cpus"), 8)
+    min_count = de_cfg.get("min_count", analysis_cfg.get("low_expression_threshold", 10))
+    min_count = 10 if min_count is None else float(min_count)
+    drop_if_any = bool(de_cfg.get("drop_if_any_group_low", False))
+    pseudocount = float(de_cfg.get("log2rpm_pseudocount", 1))
+    input_group = str(de_cfg.get("input_group", "Input"))
+    comparison_mode = de_cfg.get("comparison_mode", "auto")
+    min_replicates = _cfg_int(de_cfg.get("min_replicates"), 2)
+    pca_top_n = _cfg_int((analysis_cfg.get("pca") or {}).get("top_n_features"), 500)
+
     step = "initialization"
     try:
         step = "read count table"
         logger.info("STAT STEP START: %s", step)
-        raw_counts, rpm_counts = read_count_table(counts_file)
-        logger.info(
-            "STAT STEP OK: %s (raw %s, RPM %s)",
-            step,
-            raw_counts.shape,
-            rpm_counts.shape if not rpm_counts.empty else "empty",
-        )
+        counts = load_merged_counts(counts_file)
+        logger.info("STAT STEP OK: %s (%s)", step, counts.shape)
 
         step = "read sample info"
         logger.info("STAT STEP START: %s", step)
         meta = read_sample_info(sample_info_file)
-        logger.info("STAT STEP OK: %s (%d samples, groups=%s)", step, len(meta), sorted(meta["group"].unique()))
-
-        step = "identify groups"
-        logger.info("STAT STEP START: %s", step)
-        target_groups, background_groups, input_groups = identify_groups(meta, config=config)
         logger.info(
-            "STAT STEP OK: %s (target=%s, background=%s, input=%s)",
+            "STAT STEP OK: %s (%d samples, groups=%s)",
             step,
-            target_groups,
-            background_groups,
-            input_groups,
+            len(meta),
+            sorted(meta["group"].astype(str).unique()),
         )
-        
-        # Create DESeq2 dataset (drop variants with low total raw counts first)
-        n_cpus_val = n_cpus if n_cpus is not None else config.get("analysis", {}).get("n_cpus", 8)
-        analysis_cfg = config.get("analysis", {})
-        thr = analysis_cfg.get("low_expression_threshold", 10)
-        if thr is None:
-            thr = 10
-        try:
-            thr_i = int(thr)
-        except (TypeError, ValueError):
-            thr_i = 10
-        min_total_raw = thr_i if thr_i > 0 else None
-        step = "DESeq2 normalization"
-        logger.info("STAT STEP START: %s (n_cpus=%s, min_total_raw=%s)", step, n_cpus_val, min_total_raw)
-        dds = create_deseq_dataset(
-            raw_counts, meta, n_cpus=n_cpus_val, min_total_raw_counts=min_total_raw
-        )
-        logger.info("STAT STEP OK: %s", step)
 
-        step = "extract normalized counts"
+        step = "variant metrics"
         logger.info("STAT STEP START: %s", step)
-        df_norm = extract_normalized_counts(dds)
-        logger.info("STAT STEP OK: %s (shape %s)", step, df_norm.shape)
+        filtered = update_variant_metrics(
+            counts,
+            meta,
+            min_count=min_count,
+            drop_if_any_group_low=drop_if_any,
+            pseudocount=pseudocount,
+        )
+        filtered = add_cv_rpm_by_group(filtered, meta)
+        filtered_path = output_dir / "filtered_variant_metrics.tsv"
+        filtered.to_csv(filtered_path, sep="\t", index=False)
+        logger.info("STAT STEP OK: %s (%s)", step, filtered_path)
 
-        # Pearson on DESeq2 VST (blind to design for dispersion trend); fallback if VST fails
-        corr_pseudocount = analysis_cfg.get("lambda", 0.01)
-        pearson_space_label = f"log2(norm+{corr_pseudocount:g})"
-        step = "DESeq2 VST"
+        step = "log2RPM replicate correlation"
         logger.info("STAT STEP START: %s", step)
         try:
-            logger.info("Fitting DESeq2 VST for Pearson replicate correlation...")
-            dds.vst(use_design=False)
-            df_pearson = extract_vst_counts(dds)
-            pearson_space_label = "DESeq2 VST"
+            corr = calc_pearson_biorep_by_group(filtered, meta)
+            corr_path = qc_dir / "correlation_statistics.tsv"
+            corr.to_csv(corr_path, sep="\t", index=False)
+            plot_log2rpm_pearson_pdf(filtered, meta, qc_dir / "correlation_scatterPlot.pdf")
+            logger.info("STAT STEP OK: %s (%s)", step, corr_path)
+        except Exception as exc:
+            logger.warning("STAT STEP FAILED: %s: %s (continuing)", step, _stat_failure_reason(step, exc))
+
+        step = "CV histograms"
+        logger.info("STAT STEP START: %s", step)
+        try:
+            plot_cv_histogram_pdf(filtered, qc_dir / "cv_rpm_histograms.pdf")
             logger.info("STAT STEP OK: %s", step)
-        except Exception as e:
-            logger.warning(
-                "STAT STEP FAILED: %s: %s (continuing with log2(normalized + lambda))",
-                step,
-                _stat_failure_reason(step, e),
-            )
-            df_pearson = np.log2(df_norm + corr_pseudocount)
-        
-        # Save normalized counts
-        step = "save normalized counts"
-        logger.info("STAT STEP START: %s", step)
-        norm_counts_file = output_dir / "normalized_counts.tsv"
-        df_norm.to_csv(norm_counts_file, sep='\t')
-        logger.info("STAT STEP OK: %s (%s)", step, norm_counts_file)
-        
-        # Perform RPM-based enrichment analysis
-        step = "RPM enrichment analysis"
-        if not rpm_counts.empty and input_groups:
-            logger.info("STAT STEP START: %s", step)
-            try:
-                lambda_val = config.get("analysis", {}).get("lambda", 0.01)
-                df_rpm_annot = compute_rpm_enrichment_analysis(
-                    rpm_counts, meta, input_groups, LAMBDA=lambda_val,
-                    target_groups=target_groups, background_groups=background_groups,
-                    config=config
-                )
-                
-                # Save annotated RPM table with informative name
-                rpm_enrichment_file = output_dir / "RPM_enrichment_analysis.tsv"
-                df_rpm_annot.to_csv(rpm_enrichment_file, sep='\t')
-                logger.info(f"Saved RPM enrichment analysis to {rpm_enrichment_file}")
-                logger.info("STAT STEP OK: %s", step)
-                
-            except Exception as e:
-                logger.warning("STAT STEP FAILED: %s: %s (continuing)", step, _stat_failure_reason(step, e))
-        else:
-            if rpm_counts.empty:
-                logger.warning("STAT STEP SKIPPED: %s: RPM counts not available", step)
-            if not input_groups:
-                logger.warning("STAT STEP SKIPPED: %s: no input groups identified", step)
-        
-        # Create fixed color palette for groups (for consistent colors across all PCA plots)
-        all_groups = meta['group'].unique().tolist()
-        group_palette = create_group_color_palette(all_groups)
-        logger.info(f"Created color palette for {len(all_groups)} groups")
-        
-        step = "correlation statistics"
-        logger.info("STAT STEP START: %s", step)
-        df_corr = calculate_correlation_statistics(dds, df_norm, df_pearson)
-        corr_stats_file = qc_dir / "correlation_statistics.tsv"
-        df_corr.to_csv(corr_stats_file, sep='\t')
-        logger.info("STAT STEP OK: %s (%s)", step, corr_stats_file)
+        except Exception as exc:
+            logger.warning("STAT STEP FAILED: %s: %s (continuing)", step, _stat_failure_reason(step, exc))
 
-        step = "correlation scatter plots"
-        logger.info("STAT STEP START: %s", step)
-        corr_plots_file = qc_dir / "correlation_scatterPlot.pdf"
-        create_correlation_scatter_plots(
-            dds, df_norm, corr_plots_file, df_pearson, pearson_space_label=pearson_space_label
-        )
-        logger.info("STAT STEP OK: %s (%s)", step, corr_plots_file)
-        
-        pca_top_n = config.get("analysis", {}).get("pca", {}).get("top_n_features", 500)
-
-        step = "PCA all features"
-        logger.info("STAT STEP START: %s", step)
-        pca_all, pca_df_all = perform_pca(df_norm, meta, top_n_features=None, 
-                                          exclude_input=False, config=config)
-        plot_pca(pca_all, pca_df_all, 
-                qc_dir / "pca_all_features.png",
-                title="PCA - All Features",
-                group_palette=group_palette, config=config)
-        logger.info("STAT STEP OK: %s (%d samples)", step, len(pca_df_all))
-        
-        step = f"PCA top {pca_top_n} features"
-        logger.info("STAT STEP START: %s", step)
-        pca_top500, pca_df_top500 = perform_pca(df_norm, meta, top_n_features=pca_top_n,
-                                                exclude_input=False, config=config)
-        plot_pca(pca_top500, pca_df_top500,
-                qc_dir / "pca_top500_features.png",
-                title=f"PCA - Top {pca_top_n} Variable Features",
-                group_palette=group_palette, config=config)
-        logger.info("STAT STEP OK: %s", step)
-        
-        step = "PCA without input samples"
+        step = "AAV2 contamination"
         logger.info("STAT STEP START: %s", step)
         try:
-            pca_no_input, pca_df_no_input = perform_pca(df_norm, meta, top_n_features=pca_top_n,
-                                                        exclude_input=True,
-                                                        input_groups=input_groups, config=config)
-            plot_pca(pca_no_input, pca_df_no_input,
-                    qc_dir / "pca_no_input_samples.png",
-                    title=f"PCA - Top {pca_top_n} Features (No Input Samples)",
-                    group_palette=group_palette, config=config)
-            logger.info("STAT STEP OK: %s (%d samples)", step, len(pca_df_no_input))
-        except Exception as e:
-            logger.warning(
-                "STAT STEP FAILED: %s: %s (continuing). "
-                "If remaining samples is 0, only Input sample_id values matched "
-                "merged.counts.csv. Keep sample_id identical to count-table column "
-                "names (case-sensitive) and re-merge if you renamed folders.",
-                step,
-                _stat_failure_reason(step, e),
+            plotted = plot_aav2_rpm_contamination(filtered, meta, qc_dir / "aav2_rpm_contamination.pdf")
+            if plotted:
+                logger.info("STAT STEP OK: %s", step)
+            else:
+                logger.warning("STAT STEP SKIPPED: %s", step)
+        except Exception as exc:
+            logger.warning("STAT STEP FAILED: %s: %s (continuing)", step, _stat_failure_reason(step, exc))
+
+        step = "blind VST"
+        logger.info("STAT STEP START: %s", step)
+        vst, _meta_vst = fit_blind_vst(filtered, meta, n_cpus_val)
+        logger.info("STAT STEP OK: %s (%s)", step, vst.shape)
+
+        step = "VST Pearson heatmap"
+        logger.info("STAT STEP START: %s", step)
+        try:
+            sample_cor = plot_vst_pearson_heatmap(vst, qc_dir / "vst_pearson_heatmap.pdf")
+            sample_cor.to_csv(qc_dir / "vst_pearson_correlation.tsv", sep="\t")
+            logger.info("STAT STEP OK: %s", step)
+        except Exception as exc:
+            logger.warning("STAT STEP FAILED: %s: %s (continuing)", step, _stat_failure_reason(step, exc))
+
+        step = "VST PCA"
+        logger.info("STAT STEP START: %s", step)
+        try:
+            plot_vst_pca(
+                vst,
+                meta,
+                qc_dir,
+                n_top=pca_top_n,
+                exclude_groups=[input_group],
             )
-        
-        # Differential expression: pairing mode from config (see build_differential_expression_pairs)
-        de_cfg = config.get("differential_expression", {}) or {}
-        pairing = de_cfg.get("pairing", "target_background")
-        step = "differential expression"
-        logger.info("STAT STEP START: %s (pairing=%s)", step, pairing)
-        de_pairs = build_differential_expression_pairs(
-            meta, target_groups, background_groups, input_groups, pairing
-        )
+            logger.info("STAT STEP OK: %s", step)
+        except Exception as exc:
+            logger.warning("STAT STEP FAILED: %s: %s (continuing)", step, _stat_failure_reason(step, exc))
 
-        if de_pairs:
-            logger.info("Performing differential expression for %d pair(s) (pairing=%s)...", len(de_pairs), pairing)
-            de_ok = 0
-            for group_a, group_b in de_pairs:
-                try:
-                    logger.info("Running DE: %s vs %s", group_a, group_b)
-                    de_results = perform_differential_expression(
-                        df_norm, meta, group_a, group_b
-                    )
-
-                    safe_a = group_a.replace(" ", "_").replace("/", "_").replace("-", "_")
-                    safe_b = group_b.replace(" ", "_").replace("/", "_").replace("-", "_")
-                    de_file = output_dir / f"DE_{safe_a}_vs_{safe_b}.tsv"
-                    de_results.to_csv(de_file, sep='\t')
-                    logger.info("Saved differential expression results to %s", de_file)
-                    de_ok += 1
-
-                except Exception as e:
-                    logger.warning(
-                        "STAT STEP FAILED: differential expression %s vs %s: %s (continuing)",
-                        group_a,
-                        group_b,
-                        _stat_failure_reason(f"DE {group_a} vs {group_b}", e),
-                    )
-            logger.info("STAT STEP OK: %s (%d/%d pairs succeeded)", step, de_ok, len(de_pairs))
-        else:
-            logger.warning(
-                "STAT STEP SKIPPED: %s: no group pairs to compare "
-                "(check differential_expression.pairing and group_roles / metadata).",
-                step,
+        step = "DESeq2 contrasts"
+        logger.info("STAT STEP START: %s (mode=%s)", step, comparison_mode)
+        try:
+            comparisons = build_enrichment_comparisons(
+                meta,
+                input_group=input_group,
+                mode=comparison_mode,
             )
-        
+            comparisons.to_csv(de_dir / "comparisons.tsv", sep="\t", index=False)
+            n_ok = run_deseq2_comparisons(
+                filtered,
+                meta,
+                comparisons,
+                de_dir,
+                n_cpus=n_cpus_val,
+                min_replicates=min_replicates,
+            )
+            logger.info("STAT STEP OK: %s (%d/%d contrasts)", step, n_ok, len(comparisons))
+        except Exception as exc:
+            logger.warning("STAT STEP FAILED: %s: %s (continuing)", step, _stat_failure_reason(step, exc))
+
         logger.info("Statistical analysis completed successfully!")
         return True
-        
-    except Exception as e:
-        reason = _stat_failure_reason(step, e)
+    except Exception as exc:
+        reason = _stat_failure_reason(step, exc)
         logger.error("STAT STEP FAILED: %s: %s", step, reason, exc_info=True)
         return False
 
