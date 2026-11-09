@@ -5,6 +5,7 @@ Comprehensive statistical analysis script for CapScreen data.
 This script performs QC and DESeq2 analysis on CapScreen count data.
 
 1. Variant metrics, following the screening notebooks:
+   - Sum technical replicates within each (group, bio_rep) before QC and DESeq2
    - RPM and log2(RPM + 1) from the full library, then a per-group low-count filter
      (a group is low when every replicate is < min_count, including zeros)
    - CV of RPM across biological replicates
@@ -1009,14 +1010,105 @@ def update_variant_metrics(
     return out
 
 
-def _first_sample_per_biorep(sample_info: pd.DataFrame, group: str) -> pd.DataFrame:
-    """One sample_info row per biological replicate, the first row for that replicate."""
+def collapse_technical_replicates(
+    df: pd.DataFrame,
+    sample_info: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Sum raw counts across technical replicates within each (group, bio_rep).
+
+    Returns a count table and sample_info with one sample per biological
+    replicate. QC metrics and DESeq2 then use biological replicates as the
+    unit of analysis, so technical replicates do not inflate degrees of freedom.
+    Precomputed ``*_RPM`` / ``*_log2RPM`` columns are dropped; callers recompute
+    them after collapsing.
+    """
+    sample_ids = [sid for sid in sample_info["sample_id"].astype(str) if sid in df.columns]
+    if not sample_ids:
+        raise ValueError("No sample_id from sample_info matched columns in the count table")
+
+    info = sample_info.loc[sample_info["sample_id"].astype(str).isin(sample_ids)].copy()
+    sizes = info.groupby(["group", "bio_rep"], sort=False).size()
+    if int(sizes.max()) <= 1:
+        logger.info("No technical replicates to collapse (%d samples)", len(info))
+        return df, sample_info
+
+    drop_suffix_cols = [
+        c for c in df.columns
+        if str(c).endswith("_RPM") or str(c).endswith("_log2RPM")
+    ]
+    meta_cols = [
+        c for c in df.columns
+        if c not in sample_ids and c not in drop_suffix_cols
+    ]
+    out = df.loc[:, meta_cols].copy()
+    new_rows = []
+    used_ids: set = set()
+    n_collapsed = 0
+    for (group, bio_rep), sub in info.groupby(["group", "bio_rep"], sort=False):
+        cols = [sid for sid in sub["sample_id"].astype(str) if sid in df.columns]
+        if not cols:
+            continue
+        raw = df[cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+        if len(cols) == 1:
+            new_id = cols[0]
+            summed = raw[cols[0]].round().astype(int)
+        else:
+            base = f"{r_make_names(group)}_bio{bio_rep}"
+            new_id = base
+            suffix = 2
+            while new_id in used_ids or new_id in out.columns:
+                new_id = f"{base}_{suffix}"
+                suffix += 1
+            summed = raw.sum(axis=1).round().astype(int)
+            n_collapsed += 1
+            logger.info(
+                "Collapsed %d technical replicates for group=%s bio_rep=%s into %s",
+                len(cols),
+                group,
+                bio_rep,
+                new_id,
+            )
+        out[new_id] = summed.to_numpy()
+        used_ids.add(new_id)
+        row = sub.iloc[0].to_dict()
+        row["sample_id"] = new_id
+        if "tech_rep" in row:
+            row["tech_rep"] = 1
+        new_rows.append(row)
+
+    new_meta = pd.DataFrame(new_rows)
+    new_meta["sample_id"] = new_meta["sample_id"].astype(str)
+    new_meta = new_meta.set_index("sample_id", drop=False)
+    new_meta.index.name = "sample_id"
+    logger.info(
+        "Technical-replicate collapse: %d samples -> %d biological replicates (%d multi-tech groups)",
+        len(info),
+        len(new_meta),
+        n_collapsed,
+    )
+    return out, new_meta
+
+
+def _samples_per_biorep(sample_info: pd.DataFrame, group: str) -> pd.DataFrame:
+    """One sample_info row per biological replicate for a group, sorted by bio_rep.
+
+    After :func:`collapse_technical_replicates`, each bio_rep has a single sample.
+    If uncollapsed technical replicates remain, the first row for that bio_rep is used.
+    """
     sub = sample_info.loc[sample_info["group"].astype(str) == str(group)].copy()
     reps = sorted(sub["bio_rep"].unique(), key=_rep_sort_key)
     rows = []
     for rep in reps:
         hit = sub.loc[sub["bio_rep"] == rep]
         if len(hit):
+            if len(hit) > 1:
+                logger.warning(
+                    "Group '%s' bio_rep %s still has %d samples after collapse; using the first",
+                    group,
+                    rep,
+                    len(hit),
+                )
             rows.append(hit.iloc[0])
     if not rows:
         return sub.iloc[0:0]
@@ -1027,7 +1119,7 @@ def add_cv_rpm_by_group(df: pd.DataFrame, sample_info: pd.DataFrame, prefix: str
     """Add one CV column per group. CV is sd(RPM) / mean(RPM) across biological replicates."""
     out = df.copy()
     for group in pd.unique(sample_info["group"].astype(str)):
-        chosen = _first_sample_per_biorep(sample_info, group)
+        chosen = _samples_per_biorep(sample_info, group)
         rpm_cols = [f"{sid}_RPM" for sid in chosen["sample_id"].astype(str) if f"{sid}_RPM" in out.columns]
         if len(rpm_cols) < 2:
             logger.warning("Group '%s': need at least 2 biological replicates for CV; skipping", group)
@@ -1049,7 +1141,7 @@ def calc_pearson_biorep_by_group(df: pd.DataFrame, sample_info: pd.DataFrame) ->
     rows = []
     pair_names = []
     for group in pd.unique(sample_info["group"].astype(str)):
-        chosen = _first_sample_per_biorep(sample_info, group)
+        chosen = _samples_per_biorep(sample_info, group)
         if len(chosen) < 2:
             continue
         cols = []
@@ -1092,7 +1184,7 @@ def plot_log2rpm_pearson_pdf(df: pd.DataFrame, sample_info: pd.DataFrame, out_pd
     n_pages = 0
     with PdfPages(out_pdf) as pdf:
         for group in pd.unique(sample_info["group"].astype(str)):
-            chosen = _first_sample_per_biorep(sample_info, group)
+            chosen = _samples_per_biorep(sample_info, group)
             usable = []
             for _, row in chosen.iterrows():
                 col = f"{row['sample_id']}_log2RPM"
@@ -1192,7 +1284,7 @@ def plot_aav2_rpm_contamination(df: pd.DataFrame, sample_info: pd.DataFrame, out
     records = []
     group_order = []
     for group in pd.unique(sample_info["group"].astype(str)):
-        chosen = _first_sample_per_biorep(sample_info, group)
+        chosen = _samples_per_biorep(sample_info, group)
         if group not in group_order:
             group_order.append(group)
         for _, info in chosen.iterrows():
@@ -1524,6 +1616,16 @@ def run_statistical_analysis(
         meta = read_sample_info(sample_info_file)
         logger.info(
             "STAT STEP OK: %s (%d samples, groups=%s)",
+            step,
+            len(meta),
+            sorted(meta["group"].astype(str).unique()),
+        )
+
+        step = "collapse technical replicates"
+        logger.info("STAT STEP START: %s", step)
+        counts, meta = collapse_technical_replicates(counts, meta)
+        logger.info(
+            "STAT STEP OK: %s (%d biological replicates, groups=%s)",
             step,
             len(meta),
             sorted(meta["group"].astype(str).unique()),
