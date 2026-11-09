@@ -1185,7 +1185,12 @@ def calc_pearson_biorep_by_group(df: pd.DataFrame, sample_info: pd.DataFrame) ->
 
 
 def plot_log2rpm_pearson_pdf(df: pd.DataFrame, sample_info: pd.DataFrame, out_pdf: Path) -> int:
-    """Scatter log2(RPM) for every biological-replicate pair within each group."""
+    """Scatter log2(RPM) for every biological-replicate pair within each group.
+
+    Annotate Pearson r and the number of variants only. Do not show a p-value:
+    with n equal to the variant count, the test is almost always significant
+    even for weak correlations.
+    """
     n_pages = 0
     with PdfPages(out_pdf) as pdf:
         for group in pd.unique(sample_info["group"].astype(str)):
@@ -1201,7 +1206,7 @@ def plot_log2rpm_pearson_pdf(df: pd.DataFrame, sample_info: pd.DataFrame, out_pd
                     continue
                 x = pair[c1].to_numpy(dtype=float)
                 y = pair[c2].to_numpy(dtype=float)
-                r_val, p_val = pearsonr(x, y)
+                r_val = float(pearsonr(x, y)[0])
                 fig, ax = plt.subplots(figsize=(7, 6))
                 ax.scatter(x, y, s=8, alpha=0.35, c="#2C7FB8", linewidths=0)
                 if np.nanstd(x) > 0:
@@ -1214,7 +1219,7 @@ def plot_log2rpm_pearson_pdf(df: pd.DataFrame, sample_info: pd.DataFrame, out_pd
                 ax.text(
                     0.02,
                     0.98,
-                    f"Pearson r = {r_val:.3f}, p = {p_val:.2e}, n = {len(pair)}",
+                    f"Pearson r = {r_val:.3f}, n = {len(pair)}",
                     transform=ax.transAxes,
                     va="top",
                     fontsize=9,
