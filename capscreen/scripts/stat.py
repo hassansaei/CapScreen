@@ -1842,7 +1842,8 @@ def _arms_from_enrichment_metadata(
     Build Er/Eh arms from Sample_info enrichment_role / enrichment_arm.
 
     enrichment_role: input | target | background
-    enrichment_arm: free-form tag linking one target group to its background groups.
+    enrichment_arm: free-form tag linking one target group to its background
+    groups. A target may list several arms separated by ``;``.
     """
     info = _validate_enrichment_metadata_consistency(sample_info, group_col=group_col)
     input_groups = list(
@@ -1861,8 +1862,15 @@ def _arms_from_enrichment_metadata(
         )
     resolved_input = input_groups[0]
 
+    def _split_arms(value: str) -> List[str]:
+        return [a.strip() for a in str(value).split(";") if a.strip()]
+
     tb = info.loc[info["_role"].isin(["target", "background"])].copy()
-    arm_names = list(dict.fromkeys(a for a in tb["_arm"].tolist() if a))
+    arm_names: List[str] = []
+    for raw in tb["_arm"].tolist():
+        for arm_tag in _split_arms(raw):
+            if arm_tag not in arm_names:
+                arm_names.append(arm_tag)
     if not arm_names:
         raise ValueError(
             "Sample_info enrichment_role is set but no enrichment_arm values were found "
@@ -1871,12 +1879,14 @@ def _arms_from_enrichment_metadata(
 
     arms: List[Dict[str, Any]] = []
     for arm_tag in arm_names:
-        sub = tb.loc[tb["_arm"] == arm_tag]
+        members = tb.loc[tb["_arm"].map(lambda v: arm_tag in _split_arms(v))]
         targets = list(
-            dict.fromkeys(sub.loc[sub["_role"] == "target", group_col].astype(str))
+            dict.fromkeys(members.loc[members["_role"] == "target", group_col].astype(str))
         )
         backgrounds = list(
-            dict.fromkeys(sub.loc[sub["_role"] == "background", group_col].astype(str))
+            dict.fromkeys(
+                members.loc[members["_role"] == "background", group_col].astype(str)
+            )
         )
         if len(targets) == 0:
             raise ValueError(f"enrichment_arm '{arm_tag}' has no target group")

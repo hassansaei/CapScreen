@@ -129,7 +129,7 @@ Required columns:
 
 Required for statistical analysis (`stat`: DESeq2 **and** enrichment/enhancement):
 - `enrichment_role`: `input`, `target`, or `background` (blank = not used in DESeq2 or Er/Eh)
-- `enrichment_arm`: Free-form arm tag that links one target group to its background group(s)
+- `enrichment_arm`: Free-form arm tag that links one target group to its background group(s). A target used in several arms may list them separated by `;` (e.g. `OA_WT_vs_KO_POS;OA_WT_POS_vs_NEG`)
 
 Group names may be anything. Contrasts are **not** inferred from CapScreen naming templates; they come only from these columns:
 - Exactly one group must have `enrichment_role=input` (shared across arms; `enrichment_arm` may be blank)

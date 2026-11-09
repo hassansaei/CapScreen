@@ -1,3 +1,3 @@
 # capscreen/version.py
 
-__version__ = "1.0.0-alpha.35"
+__version__ = "1.0.0-alpha.36"
