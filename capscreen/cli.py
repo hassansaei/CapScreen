@@ -201,6 +201,8 @@ class SampleInfo:
     tech_rep: int
     bio_rep: int
     batch_seq: int
+    enrichment_role: str = ""
+    enrichment_arm: str = ""
 
 @contextmanager
 def sample_file_log_handler(log_path: Optional[Path]):
@@ -373,6 +375,8 @@ def _build_sample_info(row: Dict[str, str], seen_ids: Set[str]) -> SampleInfo:
     tech_rep = _parse_int_field(row.get("tech_rep"), "tech_rep")
     bio_rep = _parse_int_field(row.get("bio_rep"), "bio_rep")
     batch_seq = _parse_int_field(row.get("batch_seq"), "batch_seq")
+    enrichment_role = (row.get("enrichment_role") or "").strip()
+    enrichment_arm = (row.get("enrichment_arm") or "").strip()
     
     seen_ids.add(sample_id)
     
@@ -384,7 +388,9 @@ def _build_sample_info(row: Dict[str, str], seen_ids: Set[str]) -> SampleInfo:
         group=group_value,
         tech_rep=tech_rep,
         bio_rep=bio_rep,
-        batch_seq=batch_seq
+        batch_seq=batch_seq,
+        enrichment_role=enrichment_role,
+        enrichment_arm=enrichment_arm,
     )
 
 def load_sample_info(sample_info_path: Path) -> Tuple[List[SampleInfo], List[str]]:
@@ -435,7 +441,15 @@ def create_sample_info_csv(
         with output_path.open("w", newline='') as csv_file:
             writer = csv.DictWriter(
                 csv_file,
-                fieldnames=["sample_id", "group", "tech_rep", "bio_rep", "batch_seq"]
+                fieldnames=[
+                    "sample_id",
+                    "group",
+                    "tech_rep",
+                    "bio_rep",
+                    "batch_seq",
+                    "enrichment_role",
+                    "enrichment_arm",
+                ]
             )
             writer.writeheader()
             for entry in sample_entries:
@@ -444,7 +458,9 @@ def create_sample_info_csv(
                     "group": entry.group,
                     "tech_rep": entry.tech_rep,
                     "bio_rep": entry.bio_rep,
-                    "batch_seq": entry.batch_seq
+                    "batch_seq": entry.batch_seq,
+                    "enrichment_role": entry.enrichment_role,
+                    "enrichment_arm": entry.enrichment_arm,
                 })
         logger.info(f"Created Sample_info.csv at {output_path}")
         return True

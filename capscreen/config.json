@@ -55,24 +55,14 @@
     "show_histogram": true,
     "keep_intermediate": false,
     "statistical_analysis": {
-        "group_roles": {
-            "input": [],
-            "target": [],
-            "background": []
-        },
         "analysis": {
             "n_cpus": 8,
-            "lambda": 1,
             "low_expression_threshold": 10,
             "pca": {
-                "n_components": 2,
-                "random_state": 0,
                 "top_n_features": 500
             }
         },
         "differential_expression": {
-            "padj_threshold": 0.05,
-            "log2fc_threshold": 1.0,
             "min_replicates": 2,
             "min_count": 10,
             "drop_if_any_group_low": false,

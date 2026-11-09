@@ -83,31 +83,18 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
         logger.warning(f"Config file not found at {config_file}, using default values")
         # Return default config
         return {
-            "group_roles": {
-                "input": [],
-                "target": [],
-                "background": []
-            },
             "analysis": {
                 "n_cpus": 8,
-                "lambda": 1,
-                # Minimum total raw counts per variant (summed across samples) to keep for DESeq2.
-                # Set to 0 or null to disable pre-filtering.
                 "low_expression_threshold": 10,
                 "pca": {
-                    "n_components": 2,
-                    "random_state": 0,
                     "top_n_features": 500
                 }
             },
             "differential_expression": {
-                "padj_threshold": 0.05,
-                "log2fc_threshold": 1.0,
                 "min_replicates": 2,
                 "min_count": 10,
                 "drop_if_any_group_low": False,
                 "log2rpm_pseudocount": 1,
-                # Include batch_seq in the DESeq2 design when >=2 batches are present
                 "adjust_batch": True,
             },
             "enrichment_enhancement": {
@@ -122,7 +109,7 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
                     "standard": 300
                 },
                 "figure_sizes": {
-                    "pca": [6, 5]
+                    "pca": [7.5, 6.5]
                 },
                 "pca": {
                     "point_size": 120,
@@ -1493,7 +1480,16 @@ def _pca_frame(vst: pd.DataFrame, sample_info: pd.DataFrame, n_top: Optional[int
     return frame, pct, len(selected)
 
 
-def _draw_pca(frame: pd.DataFrame, pct: np.ndarray, n_variants: int, title: str, exclude_groups: List[str], ax):
+def _draw_pca(
+    frame: pd.DataFrame,
+    pct: np.ndarray,
+    n_variants: int,
+    title: str,
+    exclude_groups: List[str],
+    ax,
+    point_size: float = 120,
+    fontsize: float = 10,
+):
     groups = list(dict.fromkeys(frame["group"]))
     markers = ["o", "^", "s", "P", "X", "*", "D", "v", "<", ">", "p", "h"]
     marker_map = {group: markers[i % len(markers)] for i, group in enumerate(groups)}
@@ -1504,20 +1500,36 @@ def _draw_pca(frame: pd.DataFrame, pct: np.ndarray, n_variants: int, title: str,
         hue="bio_rep",
         style="group",
         markers=marker_map,
-        s=70,
+        s=point_size,
         ax=ax,
     )
     pc1 = f"PC1 ({pct[0]:.0f}% variance)" if len(pct) else "PC1"
     pc2 = f"PC2 ({pct[1]:.0f}% variance)" if len(pct) > 1 else "PC2"
-    ax.set_xlabel(pc1)
-    ax.set_ylabel(pc2)
+    ax.set_xlabel(pc1, fontsize=fontsize)
+    ax.set_ylabel(pc2, fontsize=fontsize)
     excluded = ", ".join(exclude_groups) if exclude_groups else "none"
-    ax.set_title(title)
-    ax.text(0.0, 1.02, f"n variants = {n_variants} | excluded groups: {excluded}", transform=ax.transAxes, fontsize=8, va="bottom")
-    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0, fontsize=8)
+    ax.set_title(title, fontsize=fontsize + 1)
+    ax.text(
+        0.0, 1.02,
+        f"n variants = {n_variants} | excluded groups: {excluded}",
+        transform=ax.transAxes, fontsize=max(fontsize - 2, 6), va="bottom",
+    )
+    ax.legend(
+        bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0,
+        fontsize=max(fontsize - 2, 6),
+    )
 
 
-def plot_vst_pca(vst: pd.DataFrame, sample_info: pd.DataFrame, qc_dir: Path, n_top: int, exclude_groups: List[str]) -> None:
+def plot_vst_pca(
+    vst: pd.DataFrame,
+    sample_info: pd.DataFrame,
+    qc_dir: Path,
+    n_top: int,
+    exclude_groups: List[str],
+    point_size: float = 120,
+    fontsize: float = 10,
+    figsize: Optional[Tuple[float, float]] = None,
+) -> None:
     """Write the two notebook PCA figures: all positive-variance variants, and the top variable set.
 
     Input samples are dropped via ``exclude_groups``. Control variants matching
@@ -1525,14 +1537,18 @@ def plot_vst_pca(vst: pd.DataFrame, sample_info: pd.DataFrame, qc_dir: Path, n_t
     """
     all_frame, all_pct, n_all = _pca_frame(vst, sample_info, None, exclude_groups)
     top_frame, top_pct, n_top_used = _pca_frame(vst, sample_info, n_top, exclude_groups)
+    fig_w, fig_h = figsize if figsize is not None else (7.5, 6.5)
     plots = [
         (all_frame, all_pct, n_all, "PCA on VST (all variants with positive variance)", qc_dir / "pca_all_features.png"),
         (top_frame, top_pct, n_top_used, f"PCA on VST (top {n_top} variable variants)", qc_dir / "pca_top500_features.png"),
     ]
     with PdfPages(qc_dir / "pca_vst.pdf") as pdf:
         for frame, pct, n_variants, title, png_path in plots:
-            fig, ax = plt.subplots(figsize=(7.5, 6.5))
-            _draw_pca(frame, pct, n_variants, title, exclude_groups, ax)
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+            _draw_pca(
+                frame, pct, n_variants, title, exclude_groups, ax,
+                point_size=point_size, fontsize=fontsize,
+            )
             fig.tight_layout()
             fig.savefig(png_path, dpi=300)
             pdf.savefig(fig)
@@ -2513,7 +2529,43 @@ def run_statistical_analysis(
     ee_n_top = _cfg_int(ee_cfg.get("n_top"), 20)
     ee_pseudo = float(ee_cfg.get("pseudocount", 1))
     plot_dpi = _cfg_int((plot_cfg.get("dpi") or {}).get("standard"), 300)
-    
+    pca_point_size = float((plot_cfg.get("pca") or {}).get("point_size", 120))
+    pca_fontsize = float((plot_cfg.get("pca") or {}).get("fontsize", 10))
+    pca_fig = (plot_cfg.get("figure_sizes") or {}).get("pca", [7.5, 6.5])
+    if not isinstance(pca_fig, (list, tuple)) or len(pca_fig) != 2:
+        pca_fig = [7.5, 6.5]
+    pca_figsize = (float(pca_fig[0]), float(pca_fig[1]))
+
+    analysis_params = {
+        "analysis": {
+            "n_cpus": n_cpus_val,
+            "low_expression_threshold": min_count,
+            "pca_top_n_features": pca_top_n,
+        },
+        "differential_expression": {
+            "min_replicates": min_replicates,
+            "min_count": min_count,
+            "drop_if_any_group_low": drop_if_any,
+            "log2rpm_pseudocount": pseudocount,
+            "adjust_batch": adjust_batch,
+        },
+        "enrichment_enhancement": {
+            "er_cut": ee_er_cut,
+            "eh_cut": ee_eh_cut,
+            "min_rpm": ee_min_rpm,
+            "n_top": ee_n_top,
+            "pseudocount": ee_pseudo,
+        },
+        "plots": {
+            "dpi": plot_dpi,
+            "pca_point_size": pca_point_size,
+            "pca_fontsize": pca_fontsize,
+            "pca_figsize": list(pca_figsize),
+        },
+    }
+    with (output_dir / "analysis_params.json").open("w") as fh:
+        json.dump(analysis_params, fh, indent=2)
+
     step = "initialization"
     try:
         step = "read count table"
@@ -2547,6 +2599,17 @@ def run_statistical_analysis(
         step = "collapse technical replicates"
         logger.info("STAT STEP START: %s", step)
         counts, meta = collapse_technical_replicates(counts, meta)
+        _validate_enrichment_metadata_consistency(meta)
+        input_groups = list(
+            dict.fromkeys(
+                meta.loc[
+                    meta["enrichment_role"].fillna("").astype(str).str.strip().str.lower().eq("input"),
+                    "group",
+                ]
+                .astype(str)
+                .tolist()
+            )
+        )
         logger.info(
             "STAT STEP OK: %s (%d biological replicates, groups=%s)",
             step,
@@ -2621,6 +2684,9 @@ def run_statistical_analysis(
                 qc_dir,
                 n_top=pca_top_n,
                 exclude_groups=input_groups,
+                point_size=pca_point_size,
+                fontsize=pca_fontsize,
+                figsize=pca_figsize,
             )
             logger.info("STAT STEP OK: %s", step)
         except Exception as exc:
