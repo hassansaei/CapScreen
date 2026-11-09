@@ -81,6 +81,15 @@
             "log2rpm_pseudocount": 1,
             "adjust_batch": true
         },
+        "enrichment_enhancement": {
+            "er_cut": 3,
+            "eh_cut": 3,
+            "min_rpm": 5,
+            "n_top": 20,
+            "pseudocount": 1,
+            "input_group": "Input",
+            "comparison_mode": "auto"
+        },
         "plots": {
             "dpi": {
                 "standard": 300

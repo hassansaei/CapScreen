@@ -25,7 +25,12 @@ This script performs QC and DESeq2 analysis on CapScreen count data.
      each requested pair is then tested as a Wald contrast
    - Wald statistics, log2 fold changes, and BH-adjusted p-values
 
-Enrichment analysis is intentionally not run here.
+4. Enrichment / enhancement (Lin et al.), written to
+   ``output_dir/enrichment_enhancement``:
+   - Er = target RPM / input RPM; Eh = target RPM / receptor-negative RPM
+   - Median- and mean-based scores, hit calling, Er-Eh scatter plots
+   - Top enriched variants: grouped log10 RPM bar plots across all
+     relevant groups
 """
 
 import argparse
@@ -45,6 +50,7 @@ import seaborn as sns
 from itertools import combinations
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.ticker import LogFormatterSciNotation
 from scipy.stats import pearsonr
 from sklearn.decomposition import PCA
 
@@ -105,6 +111,15 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
                 "log2rpm_pseudocount": 1,
                 # Include batch_seq in the DESeq2 design when >=2 batches are present
                 "adjust_batch": True,
+            },
+            "enrichment_enhancement": {
+                "er_cut": 3,
+                "eh_cut": 3,
+                "min_rpm": 5,
+                "n_top": 20,
+                "pseudocount": 1,
+                "input_group": "Input",
+                "comparison_mode": "auto",
             },
             "plots": {
                 "dpi": {
@@ -790,18 +805,13 @@ def _aavr_baseline_group(group: str) -> Optional[str]:
     return None
 
 
-def build_enrichment_comparisons(
+def _infer_stat_mode(
     sample_info: pd.DataFrame,
     group_col: str = "group",
     input_group: str = "Input",
     mode: str = "auto",
-) -> pd.DataFrame:
-    """
-    Build y-versus-x contrasts from sample_info group names.
-
-    ``auto`` selects aavr, pd_target, oa_opa, or fasma_fasta from those names.
-    y_group is the numerator of the DESeq2 contrast and x_group is the reference.
-    """
+) -> Tuple[str, List[str]]:
+    """Resolve comparison mode and return non-input group labels."""
     mode = (mode or "auto").strip().lower().replace("-", "_")
     allowed = {"auto", "aavr", "pd_target", "oa_opa", "fasma_fasta"}
     if mode not in allowed:
@@ -826,6 +836,24 @@ def build_enrichment_comparisons(
                 "Could not infer comparison mode from group names: "
                 + ", ".join(groups)
             )
+    return mode, groups
+
+
+def build_enrichment_comparisons(
+    sample_info: pd.DataFrame,
+    group_col: str = "group",
+    input_group: str = "Input",
+    mode: str = "auto",
+) -> pd.DataFrame:
+    """
+    Build y-versus-x contrasts from sample_info group names.
+
+    ``auto`` selects aavr, pd_target, oa_opa, or fasma_fasta from those names.
+    y_group is the numerator of the DESeq2 contrast and x_group is the reference.
+    """
+    mode, groups = _infer_stat_mode(
+        sample_info, group_col=group_col, input_group=input_group, mode=mode
+    )
     logger.info("Comparison mode '%s' from groups: %s", mode, groups)
 
     pairs: List[Tuple[str, str]] = []
@@ -1798,6 +1826,698 @@ def _cfg_int(value, default: int) -> int:
         return default
 
 
+def _rpm_cols_for_group(
+    sample_info: pd.DataFrame,
+    group: str,
+    df: pd.DataFrame,
+) -> List[str]:
+    """Return ``{sample_id}_RPM`` columns for a sample_info group."""
+    ids = (
+        sample_info.loc[sample_info["group"].astype(str) == str(group), "sample_id"]
+        .astype(str)
+        .tolist()
+    )
+    cols = [f"{sid}_RPM" for sid in ids if f"{sid}_RPM" in df.columns]
+    if not cols:
+        raise ValueError(f"No RPM columns found for group '{group}'")
+    return cols
+
+
+def _row_median(mat: np.ndarray) -> np.ndarray:
+    return np.nanmedian(mat, axis=1)
+
+
+def _er_eh_ratio(num: np.ndarray, den: np.ndarray, pseudo: float = 1.0) -> np.ndarray:
+    """Lin et al. abundance ratio with a 1 RPM pseudocount on both arms."""
+    return (num + pseudo) / (den + pseudo)
+
+
+def _variant_display_label(variant_id: str) -> str:
+    text = str(variant_id)
+    if text.startswith("WID-WID"):
+        return text[len("WID-WID"):]
+    if text.startswith("WID-"):
+        return text[len("WID-"):]
+    return text
+
+
+def build_enrichment_enhancement_arms(
+    sample_info: pd.DataFrame,
+    group_col: str = "group",
+    input_group: str = "Input",
+    mode: str = "auto",
+) -> pd.DataFrame:
+    """
+    Build Lin-style Er/Eh selection arms from sample_info group names.
+
+    Arms follow ``run_enrichment_enhancement.R``: receptor-positive target versus
+    a receptor-negative control set, with Input as the enrichment denominator.
+    """
+    mode, groups = _infer_stat_mode(
+        sample_info, group_col=group_col, input_group=input_group, mode=mode
+    )
+    group_set = set(groups)
+    present = lambda names: [n for n in names if n in group_set]
+    arms: List[Dict[str, Any]] = []
+
+    def add_arm(
+        tag: str,
+        target: str,
+        controls: List[str],
+        title: str,
+        subtitle: str,
+        bar_groups: List[str],
+    ) -> None:
+        ctl = present(controls)
+        if target not in group_set or not ctl:
+            return
+        bars = [g for g in bar_groups if g in group_set or g == input_group]
+        if input_group not in bars and input_group in set(sample_info[group_col].astype(str)):
+            bars = bars + [input_group]
+        arms.append(
+            {
+                "tag": tag,
+                "target": target,
+                "controls": ";".join(ctl),
+                "title": title,
+                "subtitle": subtitle,
+                "bar_groups": ";".join(bars),
+                "mode": mode,
+            }
+        )
+
+    if mode == "aavr":
+        receptors = [("human", "NTNG1"), ("mouse", "Ntng1")]
+        for geno in ("WT", "KO"):
+            for species, receptor in receptors:
+                target = f"AAVR-{geno}-{receptor}"
+                control = f"AAVR-{geno}"
+                add_arm(
+                    tag=f"{geno}_{species}_NTNG1",
+                    target=target,
+                    controls=[control],
+                    title=(
+                        f"NTNG1 transduction screen, {species} receptor "
+                        f"in AAVR-{geno} cells"
+                    ),
+                    subtitle=(
+                        f"Er = {target} / input pool; "
+                        f"Eh = {target} / {control} empty vector"
+                    ),
+                    bar_groups=[target, control, input_group],
+                )
+    elif mode == "pd_target":
+        targets = present(
+            ["Target", "human_Target", "mouse_Target", "Human-NTNG1", "Mouse-Ntng1"]
+        )
+        for target in targets:
+            species = "human" if "human" in target.lower() or "Human" in target else (
+                "mouse" if "mouse" in target.lower() or "Mouse" in target or "Ntng1" in target else "target"
+            )
+            add_arm(
+                tag=f"{sanitize_group_label(target)}_vs_Fc",
+                target=target,
+                controls=["Fc"],
+                title=f"NTNG1 pull-down selection, {species} receptor",
+                subtitle=f"Er = {target} / input pool; Eh = {target} / Fc-only resin",
+                bar_groups=[target, "Fc", "Bead", "Bead-Fc", input_group],
+            )
+    elif mode == "oa_opa":
+        for model in ("OA", "OPA"):
+            wt_pos = f"{model}-WT-POS"
+            ko_pos = f"{model}-KO-POS"
+            wt_neg = f"{model}-WT-NEG"
+            org_groups = [
+                f"{model}-WT-POS",
+                f"{model}-KO-POS",
+                f"{model}-WT-NEG",
+                f"{model}-KO-NEG",
+                input_group,
+            ]
+            add_arm(
+                tag=f"{model}_WT_vs_KO_POS",
+                target=wt_pos,
+                controls=[ko_pos],
+                title=f"Kidney {model} selection, WT versus receptor knockout",
+                subtitle=(
+                    f"Er = {wt_pos} / input pool; Eh = {wt_pos} / {ko_pos}"
+                ),
+                bar_groups=org_groups,
+            )
+            add_arm(
+                tag=f"{model}_WT_POS_vs_NEG",
+                target=wt_pos,
+                controls=[wt_neg],
+                title=f"Kidney {model} selection, WT POS versus NEG fraction",
+                subtitle=(
+                    f"Er = {wt_pos} / input pool; Eh = {wt_pos} / {wt_neg}"
+                ),
+                bar_groups=org_groups,
+            )
+    elif mode == "fasma_fasta":
+        for library in ("FASMA", "FASTA"):
+            tissues = ["kidney", "liver", "spleen", "Heart"]
+            target = f"{library}-kidney"
+            controls = [f"{library}-{t}" for t in tissues if t != "kidney"]
+            add_arm(
+                tag=f"{library}_kidney",
+                target=target,
+                controls=controls,
+                title=f"Kidney-targeted AAV selection in {library} mice",
+                subtitle=(
+                    "Er = kidney / input pool; "
+                    "Eh = kidney / off-target tissues (liver, spleen, heart)"
+                ),
+                bar_groups=[f"{library}-{t}" for t in tissues] + [input_group],
+            )
+
+    if not arms:
+        raise ValueError(
+            f"No enrichment/enhancement arms for mode '{mode}' with groups: {', '.join(groups)}"
+        )
+    out = pd.DataFrame(arms)
+    logger.info("Inferred %d enrichment/enhancement arm(s) (mode=%s)", len(out), mode)
+    return out
+
+
+def score_selection(
+    df: pd.DataFrame,
+    sample_info: pd.DataFrame,
+    target: str,
+    controls: List[str],
+    input_group: str = "Input",
+    pseudocount: float = 1.0,
+) -> pd.DataFrame:
+    """
+    Score one selection arm against its input pool and receptor-negative arm.
+
+    Er = A_i(target) / A_i(input); Eh = A_i(target) / A_i(controls).
+    A_i is RPM. Both replicate-median and replicate-mean summaries are reported,
+    plus per-target-replicate Er/Eh against the arm medians.
+    """
+    tgt_cols = _rpm_cols_for_group(sample_info, target, df)
+    ctl_cols: List[str] = []
+    for ctl in controls:
+        ctl_cols.extend(_rpm_cols_for_group(sample_info, ctl, df))
+    inp_cols = _rpm_cols_for_group(sample_info, input_group, df)
+
+    ids = df["ID_WLG"].astype(str).to_numpy()
+    peptide = (
+        df["peptide"].astype(str).to_numpy()
+        if "peptide" in df.columns
+        else np.array([""] * len(df), dtype=object)
+    )
+    tgt = df[tgt_cols].to_numpy(dtype=float)
+    ctl = df[ctl_cols].to_numpy(dtype=float)
+    inp = df[inp_cols].to_numpy(dtype=float)
+
+    tgt_med = _row_median(tgt)
+    ctl_med = _row_median(ctl)
+    inp_med = _row_median(inp)
+    tgt_mean = np.nanmean(tgt, axis=1)
+    ctl_mean = np.nanmean(ctl, axis=1)
+    inp_mean = np.nanmean(inp, axis=1)
+
+    er_reps = _er_eh_ratio(tgt, inp_med[:, None], pseudocount)
+    eh_reps = _er_eh_ratio(tgt, ctl_med[:, None], pseudocount)
+
+    out = pd.DataFrame(
+        {
+            "ID_WLG": ids,
+            "peptide": peptide,
+            "is_control": ~pd.Series(ids).str.startswith("WID-", na=False).to_numpy(),
+            "target_RPM_median": tgt_med,
+            "control_RPM_median": ctl_med,
+            "input_RPM_median": inp_med,
+            "target_RPM_mean": tgt_mean,
+            "control_RPM_mean": ctl_mean,
+            "input_RPM_mean": inp_mean,
+            "Er_median": _er_eh_ratio(tgt_med, inp_med, pseudocount),
+            "Eh_median": _er_eh_ratio(tgt_med, ctl_med, pseudocount),
+            "Er_mean": _er_eh_ratio(tgt_mean, inp_mean, pseudocount),
+            "Eh_mean": _er_eh_ratio(tgt_mean, ctl_mean, pseudocount),
+        }
+    )
+    for i in range(er_reps.shape[1]):
+        out[f"Er_rep{i + 1}"] = er_reps[:, i]
+        out[f"Eh_rep{i + 1}"] = eh_reps[:, i]
+    return out
+
+
+def call_top_er_eh(
+    scores: pd.DataFrame,
+    estimator: str = "median",
+    er_cut: float = 3.0,
+    eh_cut: float = 3.0,
+    min_rpm: float = 5.0,
+    n_top: Optional[int] = 20,
+) -> pd.DataFrame:
+    """Call top performers inside the Er/Eh performance box."""
+    er_rep_cols = [c for c in scores.columns if re.fullmatch(r"Er_rep\d+", c)]
+    eh_rep_cols = [c for c in scores.columns if re.fullmatch(r"Eh_rep\d+", c)]
+    if not er_rep_cols or not eh_rep_cols:
+        raise ValueError("score table is missing per-replicate Er/Eh columns")
+    n_reps = len(er_rep_cols)
+
+    out = scores.copy()
+    out["Er"] = out[f"Er_{estimator}"]
+    out["Eh"] = out[f"Eh_{estimator}"]
+    out["target_RPM"] = out[f"target_RPM_{estimator}"]
+    out["n_reps_pass"] = (
+        (out[er_rep_cols].to_numpy(dtype=float) > er_cut)
+        & (out[eh_rep_cols].to_numpy(dtype=float) > eh_cut)
+    ).sum(axis=1)
+    out["confidence"] = out["n_reps_pass"] / float(n_reps)
+    out["estimator"] = estimator
+
+    hits = out.loc[
+        (~out["is_control"])
+        & (out["Er"] > er_cut)
+        & (out["Eh"] > eh_cut)
+        & (out["target_RPM"] >= min_rpm)
+        & (out["n_reps_pass"] >= int(np.ceil(n_reps / 2.0)))
+    ].copy()
+    score = np.log2(hits["Er"].to_numpy(dtype=float)) + np.log2(hits["Eh"].to_numpy(dtype=float))
+    hits = hits.assign(_score=score).sort_values(
+        by=["confidence", "_score"], ascending=[False, False]
+    ).drop(columns=["_score"])
+    hits["rank"] = np.arange(1, len(hits) + 1)
+    if n_top is not None:
+        hits = hits.head(int(n_top)).copy()
+    return hits.reset_index(drop=True)
+
+
+def plot_er_eh_scatter(
+    scores: pd.DataFrame,
+    top: pd.DataFrame,
+    estimator: str,
+    out_prefix: Path,
+    title: str,
+    subtitle: str,
+    er_cut: float = 3.0,
+    eh_cut: float = 3.0,
+    dpi: int = 300,
+) -> None:
+    """Paper-style log-log enrichment versus enhancement scatter."""
+    d = scores.copy()
+    d["Er"] = d[f"Er_{estimator}"]
+    d["Eh"] = d[f"Eh_{estimator}"]
+    bg = d.loc[~d["is_control"]]
+    ctrl = d.loc[d["is_control"]]
+
+    vals = np.concatenate([d["Er"].to_numpy(dtype=float), d["Eh"].to_numpy(dtype=float)])
+    vals = vals[np.isfinite(vals) & (vals > 0)]
+    if vals.size == 0:
+        logger.warning("No finite Er/Eh values for %s", out_prefix.name)
+        return
+    lo = float(vals.min())
+    hi = float(vals.max()) * 1.6
+    lims = (max(lo, 1e-3), hi)
+
+    fig, ax = plt.subplots(figsize=(9.5, 6.5))
+    ax.scatter(
+        bg["Er"], bg["Eh"],
+        s=6, c="0.72", alpha=0.35, linewidths=0, zorder=1, rasterized=True,
+    )
+    ax.plot(lims, lims, ls="--", color="0.45", lw=1, zorder=0)
+    ax.add_patch(
+        plt.Rectangle(
+            (er_cut, eh_cut),
+            lims[1] - er_cut,
+            lims[1] - eh_cut,
+            fill=False,
+            edgecolor="goldenrod",
+            linestyle=":",
+            linewidth=1.2,
+            zorder=2,
+        )
+    )
+    if not ctrl.empty:
+        ax.scatter(ctrl["Er"], ctrl["Eh"], s=36, c="0.15", zorder=3)
+        for _, row in ctrl.iterrows():
+            ax.annotate(
+                str(row["ID_WLG"]),
+                (row["Er"], row["Eh"]),
+                textcoords="offset points",
+                xytext=(4, 4),
+                fontsize=7,
+                fontweight="bold",
+                color="0.15",
+            )
+
+    if top is not None and not top.empty:
+        hl = d.set_index("ID_WLG").loc[top["ID_WLG"]].reset_index()
+        cmap = plt.get_cmap("Dark2")
+        colors = [cmap(i % 8) for i in range(len(hl))]
+        for i, row in hl.iterrows():
+            label = f"{row['ID_WLG']}\n{row.get('peptide', '')}".strip()
+            ax.scatter(
+                [row["Er"]], [row["Eh"]],
+                s=48, c=[colors[i]], zorder=4, label=label,
+            )
+        ax.legend(
+            title=f"Top {len(hl)} reproducible\nvariants",
+            fontsize=6.5,
+            title_fontsize=7,
+            loc="upper left",
+            frameon=True,
+            borderpad=0.4,
+        )
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlim(*lims)
+    ax.set_ylim(*lims)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("Enrichment (Er)")
+    ax.set_ylabel("Enhancement (Eh)")
+    ax.set_title(title, fontweight="bold", fontsize=12)
+    ax.text(0.0, 1.02, subtitle, transform=ax.transAxes, fontsize=8.5, va="bottom")
+    ax.grid(True, which="major", linestyle="-", alpha=0.25)
+    ax.grid(False, which="minor")
+    fig.tight_layout()
+    out_prefix = Path(out_prefix)
+    out_prefix.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(f"{out_prefix}.png", dpi=dpi, bbox_inches="tight")
+    fig.savefig(f"{out_prefix}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_top_variant_rpm_bars(
+    df: pd.DataFrame,
+    sample_info: pd.DataFrame,
+    ids: List[str],
+    groups: List[str],
+    out_prefix: Path,
+    title: str,
+    subtitle: str,
+    dpi: int = 300,
+) -> Optional[pd.DataFrame]:
+    """
+    Grouped RPM bar plot for ordered top variants.
+
+    Bars are replicate medians; whiskers span the replicate range; individual
+    replicates are overlaid. Linear and log10 y-axis versions are written.
+    """
+    if not ids:
+        return None
+    present_groups = []
+    group_cols: Dict[str, List[str]] = {}
+    for group in groups:
+        try:
+            cols = _rpm_cols_for_group(sample_info, group, df)
+        except ValueError:
+            continue
+        present_groups.append(group)
+        group_cols[group] = cols
+    if not present_groups:
+        logger.warning("No groups available for RPM bars (%s)", out_prefix.name)
+        return None
+
+    id_order = [str(v) for v in ids]
+    sub = df.loc[df["ID_WLG"].astype(str).isin(id_order)].copy()
+    if sub.empty:
+        return None
+    sub["_ord"] = sub["ID_WLG"].astype(str).map({v: i for i, v in enumerate(id_order)})
+    sub = sub.sort_values("_ord")
+
+    long_rows = []
+    for group in present_groups:
+        cols = group_cols[group]
+        mat = sub[cols].to_numpy(dtype=float)
+        for j, col in enumerate(cols):
+            for i, vid in enumerate(sub["ID_WLG"].astype(str)):
+                long_rows.append(
+                    {
+                        "ID_WLG": vid,
+                        "variant": _variant_display_label(vid),
+                        "group": group,
+                        "replicate": j + 1,
+                        "RPM": float(mat[i, j]),
+                    }
+                )
+    long = pd.DataFrame(long_rows)
+    long["variant"] = pd.Categorical(
+        long["variant"],
+        categories=[_variant_display_label(v) for v in id_order],
+        ordered=True,
+    )
+    long["group"] = pd.Categorical(long["group"], categories=present_groups, ordered=True)
+
+    stats = (
+        long.groupby(["variant", "group"], observed=True)
+        .agg(
+            median_RPM=("RPM", "median"),
+            mean_RPM=("RPM", "mean"),
+            sd_RPM=("RPM", "std"),
+            min_RPM=("RPM", "min"),
+            max_RPM=("RPM", "max"),
+            n=("RPM", "size"),
+        )
+        .reset_index()
+    )
+
+    n_groups = len(present_groups)
+    cmap = plt.get_cmap("Dark2")
+    colors = {g: cmap(i % 8) for i, g in enumerate(present_groups[:-1])}
+    if present_groups:
+        colors[present_groups[-1]] = "0.6"
+        if present_groups[-1] != "Input" and "Input" in present_groups:
+            colors["Input"] = "0.6"
+            for i, g in enumerate([x for x in present_groups if x != "Input"]):
+                colors[g] = cmap(i % 8)
+
+    pos_rpm = long.loc[long["RPM"] > 0, "RPM"]
+    floor_rpm = max(float(pos_rpm.min()) if len(pos_rpm) else 1e-3, 1e-3)
+    variants = list(stats["variant"].cat.categories)
+    x = np.arange(len(variants))
+    width = 0.8 / max(n_groups, 1)
+
+    def _draw(log_scale: bool) -> plt.Figure:
+        fig, ax = plt.subplots(figsize=(max(11.0, 0.45 * len(variants) + 4), 5.5))
+        for gi, group in enumerate(present_groups):
+            gstat = stats.loc[stats["group"] == group].set_index("variant").reindex(variants)
+            med = gstat["median_RPM"].to_numpy(dtype=float)
+            ymin = gstat["min_RPM"].to_numpy(dtype=float)
+            ymax = gstat["max_RPM"].to_numpy(dtype=float)
+            if log_scale:
+                med = np.maximum(med, floor_rpm)
+                ymin = np.maximum(ymin, floor_rpm)
+                ymax = np.maximum(ymax, floor_rpm)
+            else:
+                med = np.nan_to_num(med, nan=0.0)
+                ymin = np.nan_to_num(ymin, nan=0.0)
+                ymax = np.nan_to_num(ymax, nan=0.0)
+            xpos = x - 0.4 + width / 2 + gi * width
+            ax.bar(
+                xpos, med, width=width * 0.95,
+                color=colors.get(group, "0.5"),
+                edgecolor="0.25", linewidth=0.3,
+                label=group, zorder=2,
+            )
+            yerr_lo = np.maximum(med - ymin, 0.0)
+            yerr_hi = np.maximum(ymax - med, 0.0)
+            ax.errorbar(
+                xpos, med, yerr=[yerr_lo, yerr_hi],
+                fmt="none", ecolor="0.25", elinewidth=0.6,
+                capsize=2.0, capthick=0.6, zorder=3,
+            )
+            glong = long.loc[long["group"] == group]
+            for vi, variant in enumerate(variants):
+                pts = glong.loc[glong["variant"] == variant, "RPM"].to_numpy(dtype=float)
+                if log_scale:
+                    pts = np.maximum(pts, floor_rpm)
+                jitter = (np.random.default_rng(vi + gi * 17).random(len(pts)) - 0.5) * width * 0.35
+                ax.scatter(
+                    np.full(len(pts), xpos[vi]) + jitter,
+                    pts,
+                    s=10, facecolors="white", edgecolors="0.2",
+                    linewidths=0.3, alpha=0.85, zorder=4,
+                )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(variants, rotation=45, ha="right", fontsize=7.5)
+        ax.set_xlabel("")
+        ax.set_title(title, fontweight="bold", fontsize=12)
+        ax.text(0.0, 1.02, subtitle, transform=ax.transAxes, fontsize=8.5, va="bottom")
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=min(n_groups, 5), frameon=False)
+        ax.grid(False, axis="x")
+        ax.grid(True, axis="y", alpha=0.25)
+        if log_scale:
+            ax.set_yscale("log")
+            ax.yaxis.set_major_formatter(LogFormatterSciNotation())
+            ax.set_ylabel("RPM (replicate median, log10 scale)")
+        else:
+            ymax_plot = float(np.nanmax(stats["median_RPM"].to_numpy(dtype=float))) * 1.6
+            if not np.isfinite(ymax_plot) or ymax_plot <= 0:
+                ymax_plot = 1.0
+            ax.set_ylim(0, ymax_plot)
+            ax.set_ylabel("RPM (replicate median)")
+            if (long["RPM"] > ymax_plot).any():
+                ax.text(
+                    0.0, -0.28,
+                    "Linear y axis clipped to the median range; some replicate values extend beyond it",
+                    transform=ax.transAxes, fontsize=7.5, color="0.35",
+                )
+        fig.tight_layout()
+        return fig
+
+    out_prefix = Path(out_prefix)
+    out_prefix.parent.mkdir(parents=True, exist_ok=True)
+    stats.to_csv(f"{out_prefix}_data.csv", index=False)
+    long.to_csv(f"{out_prefix}_replicates.csv", index=False)
+    for name, is_log in (("linear", False), ("log", True)):
+        fig = _draw(is_log)
+        fig.savefig(f"{out_prefix}_{name}.png", dpi=dpi, bbox_inches="tight")
+        fig.savefig(f"{out_prefix}_{name}.pdf", bbox_inches="tight")
+        plt.close(fig)
+    return stats
+
+
+def run_enrichment_enhancement_arm(
+    df: pd.DataFrame,
+    sample_info: pd.DataFrame,
+    arm: pd.Series,
+    out_dir: Path,
+    input_group: str = "Input",
+    er_cut: float = 3.0,
+    eh_cut: float = 3.0,
+    min_rpm: float = 5.0,
+    n_top: int = 20,
+    pseudocount: float = 1.0,
+    dpi: int = 300,
+) -> Dict[str, Any]:
+    """Score, call, and plot one enrichment/enhancement arm."""
+    controls = [c for c in str(arm["controls"]).split(";") if c]
+    bar_groups = [g for g in str(arm["bar_groups"]).split(";") if g]
+    tag = str(arm["tag"])
+    target = str(arm["target"])
+    title = str(arm["title"])
+    subtitle = str(arm["subtitle"])
+
+    scores = score_selection(
+        df, sample_info, target, controls,
+        input_group=input_group, pseudocount=pseudocount,
+    )
+    hits = call_top_er_eh(
+        scores, "median", er_cut=er_cut, eh_cut=eh_cut, min_rpm=min_rpm, n_top=None,
+    )
+    hits_mean = call_top_er_eh(
+        scores, "mean", er_cut=er_cut, eh_cut=eh_cut, min_rpm=min_rpm, n_top=None,
+    )
+    top = hits.head(int(n_top)).copy()
+    top_mean = hits_mean.head(int(n_top)).copy()
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    scores.sort_values("Er_median", ascending=False).to_csv(
+        out_dir / f"Er_Eh_{tag}_all_variants.csv", index=False
+    )
+    hits.to_csv(out_dir / f"Er_Eh_{tag}_hits_median.csv", index=False)
+    hits_mean.to_csv(out_dir / f"Er_Eh_{tag}_hits_mean.csv", index=False)
+    top.to_csv(out_dir / f"Er_Eh_{tag}_top_hits_median.csv", index=False)
+    top_mean.to_csv(out_dir / f"Er_Eh_{tag}_top_hits_mean.csv", index=False)
+
+    plot_er_eh_scatter(
+        scores, top, "median",
+        out_dir / f"Er_Eh_{tag}_median",
+        title,
+        (
+            f"{subtitle}\nA_i = replicate median RPM; highlighted variants clear "
+            f"Er > {er_cut} and Eh > {eh_cut} in a majority of replicates"
+        ),
+        er_cut=er_cut, eh_cut=eh_cut, dpi=dpi,
+    )
+    plot_er_eh_scatter(
+        scores, top, "mean",
+        out_dir / f"Er_Eh_{tag}_mean",
+        f"{title} (mean estimator)",
+        (
+            f"{subtitle}\nA_i = replicate mean RPM, as in the paper; same "
+            "highlighted variants as the median figure"
+        ),
+        er_cut=er_cut, eh_cut=eh_cut, dpi=dpi,
+    )
+
+    if bar_groups and not top.empty:
+        plot_top_variant_rpm_bars(
+            df, sample_info,
+            ids=top["ID_WLG"].astype(str).tolist(),
+            groups=bar_groups,
+            out_prefix=out_dir / f"RPM_bars_{tag}_top{len(top)}",
+            title=f"Top {len(top)} {target} variants: RPM across groups",
+            subtitle=(
+                f"{subtitle}\nBars are the replicate median, whiskers the replicate "
+                "range, points individual replicates; variants ordered by Er/Eh rank"
+            ),
+            dpi=dpi,
+        )
+
+    n_lib = int((~scores["is_control"]).sum())
+    return {
+        "arm": tag,
+        "target": target,
+        "controls": "; ".join(controls),
+        "n_variants": n_lib,
+        "n_in_box_median": int(
+            ((~scores["is_control"])
+             & (scores["Er_median"] > er_cut)
+             & (scores["Eh_median"] > eh_cut)).sum()
+        ),
+        "n_in_box_mean": int(
+            ((~scores["is_control"])
+             & (scores["Er_mean"] > er_cut)
+             & (scores["Eh_mean"] > eh_cut)).sum()
+        ),
+        "n_hits_median": int(len(hits)),
+        "n_hits_mean": int(len(hits_mean)),
+        "n_top_median": int(len(top)),
+        "n_top_mean": int(len(top_mean)),
+        "top_variant": top["ID_WLG"].iloc[0] if len(top) else np.nan,
+        "top_Er_median": float(top["Er"].iloc[0]) if len(top) else np.nan,
+        "top_Eh_median": float(top["Eh"].iloc[0]) if len(top) else np.nan,
+    }
+
+
+def run_enrichment_enhancement_analysis(
+    df: pd.DataFrame,
+    sample_info: pd.DataFrame,
+    out_dir: Path,
+    mode: str = "auto",
+    input_group: str = "Input",
+    er_cut: float = 3.0,
+    eh_cut: float = 3.0,
+    min_rpm: float = 5.0,
+    n_top: int = 20,
+    pseudocount: float = 1.0,
+    dpi: int = 300,
+) -> pd.DataFrame:
+    """Run enrichment/enhancement for all inferred arms and write a summary table."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    arms = build_enrichment_enhancement_arms(
+        sample_info, input_group=input_group, mode=mode,
+    )
+    arms.to_csv(out_dir / "arms.tsv", sep="\t", index=False)
+    summaries = []
+    for _, arm in arms.iterrows():
+        logger.info(
+            "Enrichment/enhancement arm %s: target=%s controls=%s",
+            arm["tag"], arm["target"], arm["controls"],
+        )
+        summaries.append(
+            run_enrichment_enhancement_arm(
+                df, sample_info, arm, out_dir,
+                input_group=input_group,
+                er_cut=er_cut, eh_cut=eh_cut, min_rpm=min_rpm,
+                n_top=n_top, pseudocount=pseudocount, dpi=dpi,
+            )
+        )
+    summary = pd.DataFrame(summaries)
+    summary.to_csv(out_dir / "Er_Eh_summary_all_arms.csv", index=False)
+    return summary
+
+
 def run_statistical_analysis(
     counts_file: Path,
     sample_info_file: Path,
@@ -1809,11 +2529,12 @@ def run_statistical_analysis(
     log_file: Optional[Path] = None,
 ) -> bool:
     """
-    Run QC and DESeq2 on CapScreen count data.
+    Run QC, DESeq2, and Lin-style enrichment/enhancement on CapScreen count data.
 
     QC files are written to ``output_dir/qc``. DESeq2 contrast tables are written
-    to ``output_dir/deseq2``. The filtered count matrix, with RPM and CV columns,
-    is written to ``output_dir/filtered_variant_metrics.tsv``.
+    to ``output_dir/deseq2``. Enrichment/enhancement results are written to
+    ``output_dir/enrichment_enhancement``. The filtered count matrix, with RPM
+    and CV columns, is written to ``output_dir/filtered_variant_metrics.tsv``.
     """
     if logger_instance is not None:
         global logger
@@ -1831,11 +2552,15 @@ def run_statistical_analysis(
     output_dir.mkdir(parents=True, exist_ok=True)
     qc_dir = output_dir / "qc"
     de_dir = output_dir / "deseq2"
+    ee_dir = output_dir / "enrichment_enhancement"
     qc_dir.mkdir(parents=True, exist_ok=True)
     de_dir.mkdir(parents=True, exist_ok=True)
+    ee_dir.mkdir(parents=True, exist_ok=True)
 
     analysis_cfg = config.get("analysis", {}) or {}
     de_cfg = config.get("differential_expression", {}) or {}
+    ee_cfg = config.get("enrichment_enhancement", {}) or {}
+    plot_cfg = config.get("plots", {}) or {}
     n_cpus_val = n_cpus if n_cpus is not None else _cfg_int(analysis_cfg.get("n_cpus"), 8)
     min_count = de_cfg.get("min_count", analysis_cfg.get("low_expression_threshold", 10))
     min_count = 10 if min_count is None else float(min_count)
@@ -1846,6 +2571,14 @@ def run_statistical_analysis(
     min_replicates = _cfg_int(de_cfg.get("min_replicates"), 2)
     adjust_batch = bool(de_cfg.get("adjust_batch", True))
     pca_top_n = _cfg_int((analysis_cfg.get("pca") or {}).get("top_n_features"), 500)
+    ee_mode = ee_cfg.get("comparison_mode", comparison_mode)
+    ee_input = str(ee_cfg.get("input_group", input_group))
+    ee_er_cut = float(ee_cfg.get("er_cut", 3))
+    ee_eh_cut = float(ee_cfg.get("eh_cut", 3))
+    ee_min_rpm = float(ee_cfg.get("min_rpm", 5))
+    ee_n_top = _cfg_int(ee_cfg.get("n_top"), 20)
+    ee_pseudo = float(ee_cfg.get("pseudocount", 1))
+    plot_dpi = _cfg_int((plot_cfg.get("dpi") or {}).get("standard"), 300)
 
     step = "initialization"
     try:
@@ -1965,6 +2698,31 @@ def run_statistical_analysis(
                 adjust_batch=adjust_batch,
             )
             logger.info("STAT STEP OK: %s (%d/%d contrasts)", step, n_ok, len(comparisons))
+        except Exception as exc:
+            logger.warning("STAT STEP FAILED: %s: %s (continuing)", step, _stat_failure_reason(step, exc))
+
+        step = "enrichment/enhancement"
+        logger.info("STAT STEP START: %s (mode=%s, n_top=%d)", step, ee_mode, ee_n_top)
+        try:
+            summary = run_enrichment_enhancement_analysis(
+                filtered,
+                meta,
+                ee_dir,
+                mode=ee_mode,
+                input_group=ee_input,
+                er_cut=ee_er_cut,
+                eh_cut=ee_eh_cut,
+                min_rpm=ee_min_rpm,
+                n_top=ee_n_top,
+                pseudocount=ee_pseudo,
+                dpi=plot_dpi,
+            )
+            logger.info(
+                "STAT STEP OK: %s (%d arm(s); summary=%s)",
+                step,
+                len(summary),
+                ee_dir / "Er_Eh_summary_all_arms.csv",
+            )
         except Exception as exc:
             logger.warning("STAT STEP FAILED: %s: %s (continuing)", step, _stat_failure_reason(step, exc))
 
