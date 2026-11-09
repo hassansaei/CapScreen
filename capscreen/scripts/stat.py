@@ -27,10 +27,11 @@ This script performs QC and DESeq2 analysis on CapScreen count data.
 
 4. Enrichment / enhancement (Lin et al.), written to
    ``output_dir/enrichment_enhancement``:
-   - Er = target RPM / input RPM; Eh = target RPM / receptor-negative RPM
+   - Arms from Sample_info ``enrichment_role`` / ``enrichment_arm`` when set;
+     otherwise CapScreen name templates (AAVR, PD, OA/OPA, FASMA/FASTA)
+   - Er = target RPM / input RPM; Eh = target RPM / background RPM
    - Median- and mean-based scores, hit calling, Er-Eh scatter plots
-   - Top enriched variants: grouped log10 RPM bar plots across all
-     relevant groups
+   - Top enriched variants: grouped log10 RPM bar plots for all groups
 """
 
 import argparse
@@ -266,7 +267,7 @@ def read_sample_info(sample_info_file: Path) -> pd.DataFrame:
         DataFrame with sample metadata
     """
     logger.info(f"Reading sample info from {sample_info_file}")
-
+    
     meta = pd.read_csv(sample_info_file, sep=",")
     if "sample_id" not in meta.columns:
         meta = meta.rename(columns={meta.columns[0]: "sample_id"})
@@ -289,11 +290,16 @@ def read_sample_info(sample_info_file: Path) -> pd.DataFrame:
     if meta.empty:
         raise ValueError("sample_info has no rows with a group label")
 
-    keep = [col for col in required_cols if col in meta.columns]
+    optional_cols = ["enrichment_role", "enrichment_arm"]
+    keep = [col for col in required_cols + optional_cols if col in meta.columns]
     meta = meta.loc[:, keep].copy()
+    if "enrichment_role" in meta.columns:
+        meta["enrichment_role"] = meta["enrichment_role"].fillna("").astype(str).str.strip()
+    if "enrichment_arm" in meta.columns:
+        meta["enrichment_arm"] = meta["enrichment_arm"].fillna("").astype(str).str.strip()
     meta = meta.set_index("sample_id", drop=False)
     meta.index.name = "sample_id"
-
+    
     logger.info(f"Sample info shape: {meta.shape}")
     logger.info(f"Groups found: {sorted(meta['group'].astype(str).unique())}")
     return meta
@@ -1861,6 +1867,148 @@ def _variant_display_label(variant_id: str) -> str:
     return text
 
 
+def _sample_info_groups_in_order(
+    sample_info: pd.DataFrame,
+    group_col: str = "group",
+) -> List[str]:
+    """Unique group labels in first-seen Sample_info order."""
+    return list(dict.fromkeys(sample_info[group_col].astype(str).tolist()))
+
+
+def _has_enrichment_metadata(sample_info: pd.DataFrame) -> bool:
+    """True when Sample_info defines at least one non-empty enrichment_role."""
+    if "enrichment_role" not in sample_info.columns:
+        return False
+    roles = sample_info["enrichment_role"].fillna("").astype(str).str.strip()
+    return bool((roles != "").any())
+
+
+def _validate_enrichment_metadata_consistency(
+    sample_info: pd.DataFrame,
+    group_col: str = "group",
+) -> pd.DataFrame:
+    """Normalize enrichment columns and require consistent values within a group."""
+    info = sample_info.copy()
+    if "enrichment_role" not in info.columns:
+        raise ValueError("Sample_info is missing enrichment_role")
+    info["_role"] = info["enrichment_role"].fillna("").astype(str).str.strip().str.lower()
+    if "enrichment_arm" in info.columns:
+        info["_arm"] = info["enrichment_arm"].fillna("").astype(str).str.strip()
+    else:
+        info["_arm"] = ""
+
+    allowed = {"", "input", "target", "background"}
+    bad = sorted(set(info["_role"]) - allowed)
+    if bad:
+        raise ValueError(
+            "enrichment_role must be input, target, background, or blank; got: "
+            + ", ".join(bad)
+        )
+
+    for group, sub in info.groupby(group_col, sort=False):
+        roles = sorted(set(sub["_role"]))
+        arms = sorted(set(sub["_arm"]))
+        if len(roles) > 1:
+            raise ValueError(
+                f"Group '{group}' has inconsistent enrichment_role values: {roles}"
+            )
+        if len(arms) > 1:
+            raise ValueError(
+                f"Group '{group}' has inconsistent enrichment_arm values: {arms}"
+            )
+        role = roles[0]
+        arm = arms[0]
+        if role in {"target", "background"} and not arm:
+            raise ValueError(
+                f"Group '{group}' has enrichment_role={role} but empty enrichment_arm"
+            )
+        if role == "input" and arm:
+            logger.warning(
+                "Input group '%s' has enrichment_arm=%r; arm is ignored for input",
+                group,
+                arm,
+            )
+    return info
+
+
+def _arms_from_enrichment_metadata(
+    sample_info: pd.DataFrame,
+    group_col: str = "group",
+) -> pd.DataFrame:
+    """
+    Build Er/Eh arms from Sample_info enrichment_role / enrichment_arm.
+
+    enrichment_role: input | target | background
+    enrichment_arm: free-form tag linking one target group to its background groups.
+    """
+    info = _validate_enrichment_metadata_consistency(sample_info, group_col=group_col)
+    input_groups = list(
+        dict.fromkeys(
+            info.loc[info["_role"] == "input", group_col].astype(str).tolist()
+        )
+    )
+    if not input_groups:
+        raise ValueError(
+            "Sample_info enrichment_role is set but no group has enrichment_role=input"
+        )
+    if len(input_groups) > 1:
+        raise ValueError(
+            "Sample_info defines multiple input groups via enrichment_role=input: "
+            + ", ".join(input_groups)
+        )
+    resolved_input = input_groups[0]
+
+    tb = info.loc[info["_role"].isin(["target", "background"])].copy()
+    arm_names = list(dict.fromkeys(a for a in tb["_arm"].tolist() if a))
+    if not arm_names:
+        raise ValueError(
+            "Sample_info enrichment_role is set but no enrichment_arm values were found "
+            "for target/background groups"
+        )
+
+    arms: List[Dict[str, Any]] = []
+    for arm_tag in arm_names:
+        sub = tb.loc[tb["_arm"] == arm_tag]
+        targets = list(
+            dict.fromkeys(sub.loc[sub["_role"] == "target", group_col].astype(str))
+        )
+        backgrounds = list(
+            dict.fromkeys(sub.loc[sub["_role"] == "background", group_col].astype(str))
+        )
+        if len(targets) == 0:
+            raise ValueError(f"enrichment_arm '{arm_tag}' has no target group")
+        if len(targets) > 1:
+            raise ValueError(
+                f"enrichment_arm '{arm_tag}' has multiple target groups: {', '.join(targets)}"
+            )
+        if not backgrounds:
+            raise ValueError(f"enrichment_arm '{arm_tag}' has no background group")
+        target = targets[0]
+        file_tag = sanitize_group_label(arm_tag)
+        arms.append(
+            {
+                "tag": file_tag,
+                "target": target,
+                "backgrounds": ";".join(backgrounds),
+                "input_group": resolved_input,
+                "title": f"Enrichment/enhancement arm {arm_tag}",
+                "subtitle": (
+                    f"Er = {target} / {resolved_input}; "
+                    f"Eh = {target} / {' + '.join(backgrounds)}"
+                ),
+                "mode": "sample_info",
+            }
+        )
+    out = pd.DataFrame(arms)
+    logger.info(
+        "Built %d enrichment/enhancement arm(s) from Sample_info enrichment_role/arm "
+        "(input=%s)",
+        len(out),
+        resolved_input,
+    )
+    return out
+
+
 def build_enrichment_enhancement_arms(
     sample_info: pd.DataFrame,
     group_col: str = "group",
@@ -1868,11 +2016,15 @@ def build_enrichment_enhancement_arms(
     mode: str = "auto",
 ) -> pd.DataFrame:
     """
-    Build Lin-style Er/Eh selection arms from sample_info group names.
+    Build Lin-style Er/Eh selection arms.
 
-    Arms follow ``run_enrichment_enhancement.R``: receptor-positive target versus
-    a receptor-negative control set, with Input as the enrichment denominator.
+    Prefer Sample_info ``enrichment_role`` / ``enrichment_arm`` when present.
+    Otherwise fall back to CapScreen group-name templates (AAVR, PD, OA/OPA,
+    FASMA/FASTA): target versus background, with Input as the Er denominator.
     """
+    if _has_enrichment_metadata(sample_info):
+        return _arms_from_enrichment_metadata(sample_info, group_col=group_col)
+
     mode, groups = _infer_stat_mode(
         sample_info, group_col=group_col, input_group=input_group, mode=mode
     )
@@ -1883,25 +2035,21 @@ def build_enrichment_enhancement_arms(
     def add_arm(
         tag: str,
         target: str,
-        controls: List[str],
+        backgrounds: List[str],
         title: str,
         subtitle: str,
-        bar_groups: List[str],
     ) -> None:
-        ctl = present(controls)
-        if target not in group_set or not ctl:
+        bg = present(backgrounds)
+        if target not in group_set or not bg:
             return
-        bars = [g for g in bar_groups if g in group_set or g == input_group]
-        if input_group not in bars and input_group in set(sample_info[group_col].astype(str)):
-            bars = bars + [input_group]
         arms.append(
             {
                 "tag": tag,
                 "target": target,
-                "controls": ";".join(ctl),
+                "backgrounds": ";".join(bg),
+                "input_group": input_group,
                 "title": title,
                 "subtitle": subtitle,
-                "bar_groups": ";".join(bars),
                 "mode": mode,
             }
         )
@@ -1911,20 +2059,19 @@ def build_enrichment_enhancement_arms(
         for geno in ("WT", "KO"):
             for species, receptor in receptors:
                 target = f"AAVR-{geno}-{receptor}"
-                control = f"AAVR-{geno}"
+                background = f"AAVR-{geno}"
                 add_arm(
                     tag=f"{geno}_{species}_NTNG1",
                     target=target,
-                    controls=[control],
+                    backgrounds=[background],
                     title=(
                         f"NTNG1 transduction screen, {species} receptor "
                         f"in AAVR-{geno} cells"
                     ),
                     subtitle=(
                         f"Er = {target} / input pool; "
-                        f"Eh = {target} / {control} empty vector"
+                        f"Eh = {target} / {background} empty vector"
                     ),
-                    bar_groups=[target, control, input_group],
                 )
     elif mode == "pd_target":
         targets = present(
@@ -1937,58 +2084,47 @@ def build_enrichment_enhancement_arms(
             add_arm(
                 tag=f"{sanitize_group_label(target)}_vs_Fc",
                 target=target,
-                controls=["Fc"],
+                backgrounds=["Fc"],
                 title=f"NTNG1 pull-down selection, {species} receptor",
                 subtitle=f"Er = {target} / input pool; Eh = {target} / Fc-only resin",
-                bar_groups=[target, "Fc", "Bead", "Bead-Fc", input_group],
             )
     elif mode == "oa_opa":
         for model in ("OA", "OPA"):
             wt_pos = f"{model}-WT-POS"
             ko_pos = f"{model}-KO-POS"
             wt_neg = f"{model}-WT-NEG"
-            org_groups = [
-                f"{model}-WT-POS",
-                f"{model}-KO-POS",
-                f"{model}-WT-NEG",
-                f"{model}-KO-NEG",
-                input_group,
-            ]
             add_arm(
                 tag=f"{model}_WT_vs_KO_POS",
                 target=wt_pos,
-                controls=[ko_pos],
+                backgrounds=[ko_pos],
                 title=f"Kidney {model} selection, WT versus receptor knockout",
                 subtitle=(
                     f"Er = {wt_pos} / input pool; Eh = {wt_pos} / {ko_pos}"
                 ),
-                bar_groups=org_groups,
             )
             add_arm(
                 tag=f"{model}_WT_POS_vs_NEG",
                 target=wt_pos,
-                controls=[wt_neg],
+                backgrounds=[wt_neg],
                 title=f"Kidney {model} selection, WT POS versus NEG fraction",
                 subtitle=(
                     f"Er = {wt_pos} / input pool; Eh = {wt_pos} / {wt_neg}"
                 ),
-                bar_groups=org_groups,
             )
     elif mode == "fasma_fasta":
         for library in ("FASMA", "FASTA"):
             tissues = ["kidney", "liver", "spleen", "Heart"]
             target = f"{library}-kidney"
-            controls = [f"{library}-{t}" for t in tissues if t != "kidney"]
+            backgrounds = [f"{library}-{t}" for t in tissues if t != "kidney"]
             add_arm(
                 tag=f"{library}_kidney",
                 target=target,
-                controls=controls,
+                backgrounds=backgrounds,
                 title=f"Kidney-targeted AAV selection in {library} mice",
                 subtitle=(
                     "Er = kidney / input pool; "
                     "Eh = kidney / off-target tissues (liver, spleen, heart)"
                 ),
-                bar_groups=[f"{library}-{t}" for t in tissues] + [input_group],
             )
 
     if not arms:
@@ -2004,21 +2140,21 @@ def score_selection(
     df: pd.DataFrame,
     sample_info: pd.DataFrame,
     target: str,
-    controls: List[str],
+    backgrounds: List[str],
     input_group: str = "Input",
     pseudocount: float = 1.0,
 ) -> pd.DataFrame:
     """
-    Score one selection arm against its input pool and receptor-negative arm.
+    Score one selection arm against its input pool and background arm(s).
 
-    Er = A_i(target) / A_i(input); Eh = A_i(target) / A_i(controls).
+    Er = A_i(target) / A_i(input); Eh = A_i(target) / A_i(backgrounds).
     A_i is RPM. Both replicate-median and replicate-mean summaries are reported,
     plus per-target-replicate Er/Eh against the arm medians.
     """
     tgt_cols = _rpm_cols_for_group(sample_info, target, df)
-    ctl_cols: List[str] = []
-    for ctl in controls:
-        ctl_cols.extend(_rpm_cols_for_group(sample_info, ctl, df))
+    bg_cols: List[str] = []
+    for bg in backgrounds:
+        bg_cols.extend(_rpm_cols_for_group(sample_info, bg, df))
     inp_cols = _rpm_cols_for_group(sample_info, input_group, df)
 
     ids = df["ID_WLG"].astype(str).to_numpy()
@@ -2028,18 +2164,18 @@ def score_selection(
         else np.array([""] * len(df), dtype=object)
     )
     tgt = df[tgt_cols].to_numpy(dtype=float)
-    ctl = df[ctl_cols].to_numpy(dtype=float)
+    bg = df[bg_cols].to_numpy(dtype=float)
     inp = df[inp_cols].to_numpy(dtype=float)
 
     tgt_med = _row_median(tgt)
-    ctl_med = _row_median(ctl)
+    bg_med = _row_median(bg)
     inp_med = _row_median(inp)
     tgt_mean = np.nanmean(tgt, axis=1)
-    ctl_mean = np.nanmean(ctl, axis=1)
+    bg_mean = np.nanmean(bg, axis=1)
     inp_mean = np.nanmean(inp, axis=1)
 
     er_reps = _er_eh_ratio(tgt, inp_med[:, None], pseudocount)
-    eh_reps = _er_eh_ratio(tgt, ctl_med[:, None], pseudocount)
+    eh_reps = _er_eh_ratio(tgt, bg_med[:, None], pseudocount)
 
     out = pd.DataFrame(
         {
@@ -2047,15 +2183,15 @@ def score_selection(
             "peptide": peptide,
             "is_control": ~pd.Series(ids).str.startswith("WID-", na=False).to_numpy(),
             "target_RPM_median": tgt_med,
-            "control_RPM_median": ctl_med,
+            "background_RPM_median": bg_med,
             "input_RPM_median": inp_med,
             "target_RPM_mean": tgt_mean,
-            "control_RPM_mean": ctl_mean,
+            "background_RPM_mean": bg_mean,
             "input_RPM_mean": inp_mean,
             "Er_median": _er_eh_ratio(tgt_med, inp_med, pseudocount),
-            "Eh_median": _er_eh_ratio(tgt_med, ctl_med, pseudocount),
+            "Eh_median": _er_eh_ratio(tgt_med, bg_med, pseudocount),
             "Er_mean": _er_eh_ratio(tgt_mean, inp_mean, pseudocount),
-            "Eh_mean": _er_eh_ratio(tgt_mean, ctl_mean, pseudocount),
+            "Eh_mean": _er_eh_ratio(tgt_mean, bg_mean, pseudocount),
         }
     )
     for i in range(er_reps.shape[1]):
@@ -2388,16 +2524,17 @@ def run_enrichment_enhancement_arm(
     dpi: int = 300,
 ) -> Dict[str, Any]:
     """Score, call, and plot one enrichment/enhancement arm."""
-    controls = [c for c in str(arm["controls"]).split(";") if c]
-    bar_groups = [g for g in str(arm["bar_groups"]).split(";") if g]
+    backgrounds = [c for c in str(arm["backgrounds"]).split(";") if c]
     tag = str(arm["tag"])
     target = str(arm["target"])
     title = str(arm["title"])
     subtitle = str(arm["subtitle"])
+    arm_input = str(arm["input_group"]) if "input_group" in arm.index and pd.notna(arm["input_group"]) else input_group
+    bar_groups = _sample_info_groups_in_order(sample_info)
 
     scores = score_selection(
-        df, sample_info, target, controls,
-        input_group=input_group, pseudocount=pseudocount,
+        df, sample_info, target, backgrounds,
+        input_group=arm_input, pseudocount=pseudocount,
     )
     hits = call_top_er_eh(
         scores, "median", er_cut=er_cut, eh_cut=eh_cut, min_rpm=min_rpm, n_top=None,
@@ -2448,7 +2585,8 @@ def run_enrichment_enhancement_arm(
             title=f"Top {len(top)} {target} variants: RPM across groups",
             subtitle=(
                 f"{subtitle}\nBars are the replicate median, whiskers the replicate "
-                "range, points individual replicates; variants ordered by Er/Eh rank"
+                "range, points individual replicates; all Sample_info groups shown; "
+                "variants ordered by Er/Eh rank"
             ),
             dpi=dpi,
         )
@@ -2457,7 +2595,8 @@ def run_enrichment_enhancement_arm(
     return {
         "arm": tag,
         "target": target,
-        "controls": "; ".join(controls),
+        "backgrounds": "; ".join(backgrounds),
+        "input_group": arm_input,
         "n_variants": n_lib,
         "n_in_box_median": int(
             ((~scores["is_control"])
@@ -2502,8 +2641,11 @@ def run_enrichment_enhancement_analysis(
     summaries = []
     for _, arm in arms.iterrows():
         logger.info(
-            "Enrichment/enhancement arm %s: target=%s controls=%s",
-            arm["tag"], arm["target"], arm["controls"],
+            "Enrichment/enhancement arm %s: target=%s backgrounds=%s input=%s",
+            arm["tag"],
+            arm["target"],
+            arm["backgrounds"],
+            arm.get("input_group", input_group),
         )
         summaries.append(
             run_enrichment_enhancement_arm(
@@ -2547,7 +2689,7 @@ def run_statistical_analysis(
             )
     else:
         setup_logging(verbose, log_file=log_file)
-
+    
     config = load_config(config_file)
     output_dir.mkdir(parents=True, exist_ok=True)
     qc_dir = output_dir / "qc"
@@ -2579,7 +2721,7 @@ def run_statistical_analysis(
     ee_n_top = _cfg_int(ee_cfg.get("n_top"), 20)
     ee_pseudo = float(ee_cfg.get("pseudocount", 1))
     plot_dpi = _cfg_int((plot_cfg.get("dpi") or {}).get("standard"), 300)
-
+    
     step = "initialization"
     try:
         step = "read count table"
