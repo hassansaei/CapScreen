@@ -6,6 +6,7 @@ This script performs QC and DESeq2 analysis on CapScreen count data.
 
 1. Variant metrics, following the screening notebooks:
    - RPM and log2(RPM + 1) from the full library, then a per-group low-count filter
+     (a group is low when every replicate is < min_count, including zeros)
    - CV of RPM across biological replicates
 
 2. QC plots and tables, written to ``output_dir/qc``:
@@ -927,11 +928,14 @@ def load_merged_counts(count_file: Path) -> pd.DataFrame:
 
 
 def _group_is_low(values: np.ndarray, min_count: float) -> np.ndarray:
-    """True when every finite replicate count is strictly between 0 and min_count."""
+    """True when every finite replicate count is strictly below ``min_count``.
+
+    Zeros count as low. A group with no finite values is not marked low.
+    """
     finite = np.isfinite(values)
-    low = finite & (values > 0) & (values < min_count)
     n_finite = finite.sum(axis=1)
-    return (n_finite > 0) & (low.sum(axis=1) == n_finite)
+    below = finite & (values < min_count)
+    return (n_finite > 0) & (below.sum(axis=1) == n_finite)
 
 
 def update_variant_metrics(
@@ -947,9 +951,9 @@ def update_variant_metrics(
     Attach RPM and log2(RPM + pseudocount), then drop low-count variants.
 
     RPM is computed from the full table before row filtering. A group is low
-    only when every replicate count is greater than 0 and below ``min_count``.
-    With ``drop_if_any_group_low=False``, a variant is removed only when every
-    group is low.
+    when every finite replicate count is strictly below ``min_count``
+    (zeros included). With ``drop_if_any_group_low=False``, a variant is
+    removed only when every group is low, so all-zero variants are dropped.
     """
     sample_ids = [sid for sid in sample_info["sample_id"].astype(str) if sid in df.columns]
     if not sample_ids:
