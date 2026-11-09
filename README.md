@@ -127,20 +127,20 @@ Required columns:
 - `bio_rep`: Biological replicate number
 - `batch_seq`: Batch sequence number
 
-Optional columns for statistical analysis (`stat`: DESeq2 **and** enrichment/enhancement):
+Required for statistical analysis (`stat`: DESeq2 **and** enrichment/enhancement):
 - `enrichment_role`: `input`, `target`, or `background` (blank = not used in DESeq2 or Er/Eh)
 - `enrichment_arm`: Free-form arm tag that links one target group to its background group(s)
 
-Rules when `enrichment_role` is set:
+Group names may be anything. Contrasts are **not** inferred from CapScreen naming templates; they come only from these columns:
 - Exactly one group must have `enrichment_role=input` (shared across arms; `enrichment_arm` may be blank)
 - Each arm needs exactly one `target` group and one or more `background` groups with the same `enrichment_arm`
 - All rows of the same `group` must share the same role and arm
 - **DESeq2**: one contrast per target-versus-background pair (input is not a DESeq2 reference)
 - **Enrichment/enhancement**: Er = target RPM / input RPM; Eh = target RPM / background RPM (all backgrounds for that arm pooled)
 - Top-variant RPM bar plots show **all** groups in Sample_info
-- If these columns are omitted, CapScreen falls back to name-based templates (AAVR, PD, OA/OPA, FASMA/FASTA) for both DESeq2 and Er/Eh
+- PCA excludes the Sample_info input group(s)
 
-Example for the sequencing pipeline (required columns only):
+Example for the sequencing pipeline only (roles optional until `stat` is run):
 ```csv
 sample_id,run_mode,path_FASTQ,group,tech_rep,bio_rep,batch_seq
 sample1,PE,/opt/capscreen/input/sample1_1.fq.gz,Target,1,1,1
@@ -148,7 +148,7 @@ sample2,PE,/opt/capscreen/input/sample2_1.fq.gz,Bead-Fc,1,1,1
 sample3,PE,/opt/capscreen/input/sample3_1.fq.gz,Input,1,1,1
 ```
 
-Example for DESeq2 + enrichment/enhancement with custom group names:
+Example for `stat` (DESeq2 + enrichment/enhancement); roles are required:
 ```csv
 sample_id,run_mode,path_FASTQ,group,tech_rep,bio_rep,batch_seq,enrichment_role,enrichment_arm
 In1,PE,/opt/capscreen/input/In1_1.fq.gz,LibraryInput,1,1,1,input,

@@ -18,9 +18,8 @@ This script performs QC and DESeq2 analysis on CapScreen count data.
      variants, and the top variable variants)
 
 3. DESeq2, written to ``output_dir/deseq2``:
-   - Contrasts from Sample_info ``enrichment_role`` / ``enrichment_arm``
-     when set (target versus each background); otherwise CapScreen
-     group-name templates (AAVR, PD, OA/OPA, FASMA/FASTA)
+   - Contrasts are taken only from Sample_info ``enrichment_role`` /
+     ``enrichment_arm`` (target versus each background on an arm)
    - Design is ``~ group``, or ``~ batch_seq + group`` when multiple
      sequencing batches are present and not confounded with group
    - One DESeq2 fit on all samples shares size factors and dispersions;
@@ -29,8 +28,7 @@ This script performs QC and DESeq2 analysis on CapScreen count data.
 
 4. Enrichment / enhancement (Lin et al.), written to
    ``output_dir/enrichment_enhancement``:
-   - Same Sample_info role/arm columns as DESeq2 when set; otherwise
-     CapScreen name templates
+   - Same Sample_info role/arm columns as DESeq2
    - Er = target RPM / input RPM; Eh = target RPM / background RPM
    - Median- and mean-based scores, hit calling, Er-Eh scatter plots
    - Top enriched variants: grouped log10 RPM bar plots for all groups
@@ -105,9 +103,6 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
             "differential_expression": {
                 "padj_threshold": 0.05,
                 "log2fc_threshold": 1.0,
-                # auto | aavr | pd_target | oa_opa | fasma_fasta
-                "comparison_mode": "auto",
-                "input_group": "Input",
                 "min_replicates": 2,
                 "min_count": 10,
                 "drop_if_any_group_low": False,
@@ -121,8 +116,6 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
                 "min_rpm": 5,
                 "n_top": 20,
                 "pseudocount": 1,
-                "input_group": "Input",
-                "comparison_mode": "auto",
             },
             "plots": {
                 "dpi": {
@@ -805,48 +798,6 @@ def de_result_filename(y_group: str, x_group: str) -> str:
     return f"DE_{sanitize_group_label(y_group)}_vs_{sanitize_group_label(x_group)}.tsv"
 
 
-def _aavr_baseline_group(group: str) -> Optional[str]:
-    if str(group).startswith("AAVR-WT-"):
-        return "AAVR-WT"
-    if str(group).startswith("AAVR-KO-"):
-        return "AAVR-KO"
-    return None
-
-
-def _infer_stat_mode(
-    sample_info: pd.DataFrame,
-    group_col: str = "group",
-    input_group: str = "Input",
-    mode: str = "auto",
-) -> Tuple[str, List[str]]:
-    """Resolve comparison mode and return non-input group labels."""
-    mode = (mode or "auto").strip().lower().replace("-", "_")
-    allowed = {"auto", "aavr", "pd_target", "oa_opa", "fasma_fasta"}
-    if mode not in allowed:
-        raise ValueError(f"Unknown comparison mode '{mode}'. Expected one of {sorted(allowed)}")
-
-    groups = [g for g in pd.unique(sample_info[group_col].astype(str)) if g and g != input_group]
-    if not groups:
-        raise ValueError("No groups found in sample_info after excluding Input.")
-
-    if mode == "auto":
-        group_set = set(groups)
-        if any(g.startswith("AAVR-") for g in groups):
-            mode = "aavr"
-        elif group_set & {"Target", "human_Target", "mouse_Target", "Human-NTNG1", "Mouse-Ntng1"}:
-            mode = "pd_target"
-        elif any(g.startswith(("OA-", "OPA-")) for g in groups):
-            mode = "oa_opa"
-        elif any(g.startswith("FASMA-") for g in groups) and any(g.startswith("FASTA-") for g in groups):
-            mode = "fasma_fasta"
-        else:
-            raise ValueError(
-                "Could not infer comparison mode from group names: "
-                + ", ".join(groups)
-            )
-    return mode, groups
-
-
 def _deseq2_pairs_from_enrichment_arms(arms: pd.DataFrame) -> List[Tuple[str, str]]:
     """
     One DESeq2 contrast per target-versus-background pair in each Er/Eh arm.
@@ -869,133 +820,37 @@ def _deseq2_pairs_from_enrichment_arms(arms: pd.DataFrame) -> List[Tuple[str, st
 def build_enrichment_comparisons(
     sample_info: pd.DataFrame,
     group_col: str = "group",
-    input_group: str = "Input",
-    mode: str = "auto",
 ) -> pd.DataFrame:
     """
-    Build y-versus-x DESeq2 contrasts from Sample_info.
+    Build y-versus-x DESeq2 contrasts only from Sample_info roles/arms.
 
-    Prefer ``enrichment_role`` / ``enrichment_arm`` when present: each arm yields
-    one contrast of target versus each background group. Otherwise ``auto``
-    selects aavr, pd_target, oa_opa, or fasma_fasta from group names.
-    y_group is the numerator of the DESeq2 contrast and x_group is the reference.
+    Requires ``enrichment_role`` / ``enrichment_arm``. Each arm yields one
+    contrast of target versus each background group. y_group is the numerator
+    and x_group is the reference.
     """
-    if _has_enrichment_metadata(sample_info):
-        arms = _arms_from_enrichment_metadata(sample_info, group_col=group_col)
-        pairs = _deseq2_pairs_from_enrichment_arms(arms)
-        if not pairs:
-            raise ValueError(
-                "Sample_info enrichment_role/arm is set but no DESeq2 contrasts "
-                "could be built (need target and at least one background per arm)"
-            )
-        arm_labels: List[str] = []
-        for y_group, x_group in pairs:
-            label = ""
-            for _, arm in arms.iterrows():
-                bgs = [b.strip() for b in str(arm["backgrounds"]).split(";") if b.strip()]
-                if str(arm["target"]) == y_group and x_group in bgs:
-                    label = str(arm["tag"])
-                    break
-            arm_labels.append(label)
-        out = pd.DataFrame(pairs, columns=["y_group", "x_group"])
-        out["mode"] = "sample_info"
-        out["arm"] = arm_labels
-        logger.info(
-            "Built %d DESeq2 contrast(s) from Sample_info enrichment_role/arm",
-            len(out),
-        )
-        return out
-
-    mode, groups = _infer_stat_mode(
-        sample_info, group_col=group_col, input_group=input_group, mode=mode
-    )
-    logger.info("Comparison mode '%s' from groups: %s", mode, groups)
-
-    pairs: List[Tuple[str, str]] = []
-
-    def add(y_group: str, x_group: str) -> None:
-        if not y_group or not x_group or y_group == x_group:
-            return
-        if y_group in groups and x_group in groups and (y_group, x_group) not in pairs:
-            pairs.append((y_group, x_group))
-
-    if mode == "aavr":
-        for bait in groups:
-            if not bait.startswith("AAVR-"):
-                continue
-            if _is_human_ntng1_group(bait) or _is_mouse_ntng1_group(bait):
-                baseline = _aavr_baseline_group(bait)
-                if baseline:
-                    add(bait, baseline)
-        add("AAVR-WT-NTNG1", "AAVR-KO-NTNG1")
-        add("AAVR-WT-Ntng1", "AAVR-KO-Ntng1")
-        add("AAVR-WT", "AAVR-KO")
-        add("AAVR-WT-NTNG1", "AAVR-WT-Ntng1")
-        add("AAVR-KO-NTNG1", "AAVR-KO-Ntng1")
-    elif mode == "pd_target":
-        targets = [g for g in ("Target", "human_Target", "mouse_Target", "Human-NTNG1", "Mouse-Ntng1") if g in groups]
-        controls = [g for g in ("Fc", "Bead", "Bead-Fc") if g in groups]
-        if not targets:
-            raise ValueError(
-                "pd_target mode needs Target, human_Target, mouse_Target, Human-NTNG1, or Mouse-Ntng1"
-            )
-        for target in targets:
-            for control in controls:
-                add(target, control)
-    elif mode == "oa_opa":
-        parsed = []
-        for group in groups:
-            if not group.startswith(("OA-", "OPA-")):
-                continue
-            parts = group.split("-")
-            if len(parts) != 3:
-                continue
-            parsed.append((group, parts[0], parts[1], parts[2]))
-        if not parsed:
-            raise ValueError("oa_opa mode needs groups starting with OA- or OPA-")
-        for group, model, genotype, fraction in parsed:
-            if fraction == "POS":
-                add(group, f"{model}-{genotype}-NEG")
-            if genotype == "WT":
-                add(group, f"{model}-KO-{fraction}")
-            if model == "OA":
-                add(group, f"OPA-{genotype}-{fraction}")
-    elif mode == "fasma_fasta":
-        parsed = []
-        for group in groups:
-            if not group.startswith(("FASMA-", "FASTA-")):
-                continue
-            library, _, tissue = group.partition("-")
-            if tissue:
-                parsed.append((group, library, tissue))
-        if not parsed:
-            raise ValueError("fasma_fasta mode needs groups starting with FASMA- or FASTA-")
-        tissues = []
-        for _, _, tissue in parsed:
-            if tissue not in tissues:
-                tissues.append(tissue)
-        for tissue in tissues:
-            y_hits = [g for g, library, tiss in parsed if library == "FASMA" and tiss == tissue]
-            x_hits = [g for g, library, tiss in parsed if library == "FASTA" and tiss == tissue]
-            if len(y_hits) == 1 and len(x_hits) == 1:
-                add(y_hits[0], x_hits[0])
-        other = [t for t in tissues if t != "kidney"]
-        for library in ("FASMA", "FASTA"):
-            y_hits = [g for g, lib, tiss in parsed if lib == library and tiss == "kidney"]
-            if len(y_hits) != 1:
-                continue
-            for tissue in other:
-                x_hits = [g for g, lib, tiss in parsed if lib == library and tiss == tissue]
-                if len(x_hits) == 1:
-                    add(y_hits[0], x_hits[0])
-
+    arms = _arms_from_enrichment_metadata(sample_info, group_col=group_col)
+    pairs = _deseq2_pairs_from_enrichment_arms(arms)
     if not pairs:
         raise ValueError(
-            f"No comparison pairs could be built for mode '{mode}' with groups: {', '.join(groups)}"
+            "No DESeq2 contrasts could be built from Sample_info "
+            "(need target and at least one background per enrichment_arm)"
         )
+    arm_labels: List[str] = []
+    for y_group, x_group in pairs:
+        label = ""
+        for _, arm in arms.iterrows():
+            bgs = [b.strip() for b in str(arm["backgrounds"]).split(";") if b.strip()]
+            if str(arm["target"]) == y_group and x_group in bgs:
+                label = str(arm["tag"])
+                break
+        arm_labels.append(label)
     out = pd.DataFrame(pairs, columns=["y_group", "x_group"])
-    out["mode"] = mode
-    logger.info("Inferred %d DESeq2 contrast(s)", len(out))
+    out["mode"] = "sample_info"
+    out["arm"] = arm_labels
+    logger.info(
+        "Built %d DESeq2 contrast(s) from Sample_info enrichment_role/arm",
+        len(out),
+    )
     return out
 
 
@@ -1924,27 +1779,26 @@ def _sample_info_groups_in_order(
     return list(dict.fromkeys(sample_info[group_col].astype(str).tolist()))
 
 
-def _has_enrichment_metadata(sample_info: pd.DataFrame) -> bool:
-    """True when Sample_info defines at least one non-empty enrichment_role."""
-    if "enrichment_role" not in sample_info.columns:
-        return False
-    roles = sample_info["enrichment_role"].fillna("").astype(str).str.strip()
-    return bool((roles != "").any())
-
-
 def _validate_enrichment_metadata_consistency(
     sample_info: pd.DataFrame,
     group_col: str = "group",
 ) -> pd.DataFrame:
     """Normalize enrichment columns and require consistent values within a group."""
     info = sample_info.copy()
-    if "enrichment_role" not in info.columns:
-        raise ValueError("Sample_info is missing enrichment_role")
+    missing = [c for c in ("enrichment_role", "enrichment_arm") if c not in info.columns]
+    if missing:
+        raise ValueError(
+            "Sample_info must define DESeq2 and enrichment/enhancement contrasts via "
+            f"columns {missing}. Required: enrichment_role "
+            "(input|target|background) and enrichment_arm. See README."
+        )
     info["_role"] = info["enrichment_role"].fillna("").astype(str).str.strip().str.lower()
-    if "enrichment_arm" in info.columns:
-        info["_arm"] = info["enrichment_arm"].fillna("").astype(str).str.strip()
-    else:
-        info["_arm"] = ""
+    info["_arm"] = info["enrichment_arm"].fillna("").astype(str).str.strip()
+    if not (info["_role"] != "").any():
+        raise ValueError(
+            "Sample_info enrichment_role is empty for all samples; assign at least "
+            "one input, one target, and one background group"
+        )
 
     allowed = {"", "input", "target", "background"}
     bad = sorted(set(info["_role"]) - allowed)
@@ -2061,128 +1915,14 @@ def _arms_from_enrichment_metadata(
 def build_enrichment_enhancement_arms(
     sample_info: pd.DataFrame,
     group_col: str = "group",
-    input_group: str = "Input",
-    mode: str = "auto",
 ) -> pd.DataFrame:
     """
-    Build Lin-style Er/Eh selection arms.
+    Build Lin-style Er/Eh arms only from Sample_info roles/arms.
 
-    Prefer Sample_info ``enrichment_role`` / ``enrichment_arm`` when present.
-    Otherwise fall back to CapScreen group-name templates (AAVR, PD, OA/OPA,
-    FASMA/FASTA): target versus background, with Input as the Er denominator.
+    Requires ``enrichment_role`` / ``enrichment_arm``. Target versus background,
+    with the Sample_info input group as the Er denominator.
     """
-    if _has_enrichment_metadata(sample_info):
-        return _arms_from_enrichment_metadata(sample_info, group_col=group_col)
-
-    mode, groups = _infer_stat_mode(
-        sample_info, group_col=group_col, input_group=input_group, mode=mode
-    )
-    group_set = set(groups)
-    present = lambda names: [n for n in names if n in group_set]
-    arms: List[Dict[str, Any]] = []
-
-    def add_arm(
-        tag: str,
-        target: str,
-        backgrounds: List[str],
-        title: str,
-        subtitle: str,
-    ) -> None:
-        bg = present(backgrounds)
-        if target not in group_set or not bg:
-            return
-        arms.append(
-            {
-                "tag": tag,
-                "target": target,
-                "backgrounds": ";".join(bg),
-                "input_group": input_group,
-                "title": title,
-                "subtitle": subtitle,
-                "mode": mode,
-            }
-        )
-
-    if mode == "aavr":
-        receptors = [("human", "NTNG1"), ("mouse", "Ntng1")]
-        for geno in ("WT", "KO"):
-            for species, receptor in receptors:
-                target = f"AAVR-{geno}-{receptor}"
-                background = f"AAVR-{geno}"
-                add_arm(
-                    tag=f"{geno}_{species}_NTNG1",
-                    target=target,
-                    backgrounds=[background],
-                    title=(
-                        f"NTNG1 transduction screen, {species} receptor "
-                        f"in AAVR-{geno} cells"
-                    ),
-                    subtitle=(
-                        f"Er = {target} / input pool; "
-                        f"Eh = {target} / {background} empty vector"
-                    ),
-                )
-    elif mode == "pd_target":
-        targets = present(
-            ["Target", "human_Target", "mouse_Target", "Human-NTNG1", "Mouse-Ntng1"]
-        )
-        for target in targets:
-            species = "human" if "human" in target.lower() or "Human" in target else (
-                "mouse" if "mouse" in target.lower() or "Mouse" in target or "Ntng1" in target else "target"
-            )
-            add_arm(
-                tag=f"{sanitize_group_label(target)}_vs_Fc",
-                target=target,
-                backgrounds=["Fc"],
-                title=f"NTNG1 pull-down selection, {species} receptor",
-                subtitle=f"Er = {target} / input pool; Eh = {target} / Fc-only resin",
-            )
-    elif mode == "oa_opa":
-        for model in ("OA", "OPA"):
-            wt_pos = f"{model}-WT-POS"
-            ko_pos = f"{model}-KO-POS"
-            wt_neg = f"{model}-WT-NEG"
-            add_arm(
-                tag=f"{model}_WT_vs_KO_POS",
-                target=wt_pos,
-                backgrounds=[ko_pos],
-                title=f"Kidney {model} selection, WT versus receptor knockout",
-                subtitle=(
-                    f"Er = {wt_pos} / input pool; Eh = {wt_pos} / {ko_pos}"
-                ),
-            )
-            add_arm(
-                tag=f"{model}_WT_POS_vs_NEG",
-                target=wt_pos,
-                backgrounds=[wt_neg],
-                title=f"Kidney {model} selection, WT POS versus NEG fraction",
-                subtitle=(
-                    f"Er = {wt_pos} / input pool; Eh = {wt_pos} / {wt_neg}"
-                ),
-            )
-    elif mode == "fasma_fasta":
-        for library in ("FASMA", "FASTA"):
-            tissues = ["kidney", "liver", "spleen", "Heart"]
-            target = f"{library}-kidney"
-            backgrounds = [f"{library}-{t}" for t in tissues if t != "kidney"]
-            add_arm(
-                tag=f"{library}_kidney",
-                target=target,
-                backgrounds=backgrounds,
-                title=f"Kidney-targeted AAV selection in {library} mice",
-                subtitle=(
-                    "Er = kidney / input pool; "
-                    "Eh = kidney / off-target tissues (liver, spleen, heart)"
-                ),
-            )
-
-    if not arms:
-        raise ValueError(
-            f"No enrichment/enhancement arms for mode '{mode}' with groups: {', '.join(groups)}"
-        )
-    out = pd.DataFrame(arms)
-    logger.info("Inferred %d enrichment/enhancement arm(s) (mode=%s)", len(out), mode)
-    return out
+    return _arms_from_enrichment_metadata(sample_info, group_col=group_col)
 
 
 def score_selection(
@@ -2671,8 +2411,6 @@ def run_enrichment_enhancement_analysis(
     df: pd.DataFrame,
     sample_info: pd.DataFrame,
     out_dir: Path,
-    mode: str = "auto",
-    input_group: str = "Input",
     er_cut: float = 3.0,
     eh_cut: float = 3.0,
     min_rpm: float = 5.0,
@@ -2680,26 +2418,25 @@ def run_enrichment_enhancement_analysis(
     pseudocount: float = 1.0,
     dpi: int = 300,
 ) -> pd.DataFrame:
-    """Run enrichment/enhancement for all inferred arms and write a summary table."""
+    """Run enrichment/enhancement for all Sample_info arms and write a summary table."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    arms = build_enrichment_enhancement_arms(
-        sample_info, input_group=input_group, mode=mode,
-    )
+    arms = build_enrichment_enhancement_arms(sample_info)
     arms.to_csv(out_dir / "arms.tsv", sep="\t", index=False)
     summaries = []
     for _, arm in arms.iterrows():
+        arm_input = str(arm["input_group"]) if "input_group" in arm.index else ""
         logger.info(
             "Enrichment/enhancement arm %s: target=%s backgrounds=%s input=%s",
             arm["tag"],
             arm["target"],
             arm["backgrounds"],
-            arm.get("input_group", input_group),
+            arm_input,
         )
         summaries.append(
             run_enrichment_enhancement_arm(
                 df, sample_info, arm, out_dir,
-                input_group=input_group,
+                input_group=arm_input,
                 er_cut=er_cut, eh_cut=eh_cut, min_rpm=min_rpm,
                 n_top=n_top, pseudocount=pseudocount, dpi=dpi,
             )
@@ -2757,13 +2494,9 @@ def run_statistical_analysis(
     min_count = 10 if min_count is None else float(min_count)
     drop_if_any = bool(de_cfg.get("drop_if_any_group_low", False))
     pseudocount = float(de_cfg.get("log2rpm_pseudocount", 1))
-    input_group = str(de_cfg.get("input_group", "Input"))
-    comparison_mode = de_cfg.get("comparison_mode", "auto")
     min_replicates = _cfg_int(de_cfg.get("min_replicates"), 2)
     adjust_batch = bool(de_cfg.get("adjust_batch", True))
     pca_top_n = _cfg_int((analysis_cfg.get("pca") or {}).get("top_n_features"), 500)
-    ee_mode = ee_cfg.get("comparison_mode", comparison_mode)
-    ee_input = str(ee_cfg.get("input_group", input_group))
     ee_er_cut = float(ee_cfg.get("er_cut", 3))
     ee_eh_cut = float(ee_cfg.get("eh_cut", 3))
     ee_min_rpm = float(ee_cfg.get("min_rpm", 5))
@@ -2781,11 +2514,24 @@ def run_statistical_analysis(
         step = "read sample info"
         logger.info("STAT STEP START: %s", step)
         meta = read_sample_info(sample_info_file)
+        # Validate enrichment metadata early so DESeq2 and Er/Eh share one schema
+        _validate_enrichment_metadata_consistency(meta)
+        input_groups = list(
+            dict.fromkeys(
+                meta.loc[
+                    meta["enrichment_role"].fillna("").astype(str).str.strip().str.lower().eq("input"),
+                    "group",
+                ]
+                .astype(str)
+                .tolist()
+            )
+        )
         logger.info(
-            "STAT STEP OK: %s (%d samples, groups=%s)",
+            "STAT STEP OK: %s (%d samples, groups=%s, input=%s)",
             step,
             len(meta),
             sorted(meta["group"].astype(str).unique()),
+            input_groups,
         )
 
         step = "collapse technical replicates"
@@ -2864,20 +2610,16 @@ def run_statistical_analysis(
                 meta,
                 qc_dir,
                 n_top=pca_top_n,
-                exclude_groups=[input_group],
+                exclude_groups=input_groups,
             )
             logger.info("STAT STEP OK: %s", step)
         except Exception as exc:
             logger.warning("STAT STEP FAILED: %s: %s (continuing)", step, _stat_failure_reason(step, exc))
 
         step = "DESeq2 contrasts"
-        logger.info("STAT STEP START: %s (mode=%s)", step, comparison_mode)
+        logger.info("STAT STEP START: %s", step)
         try:
-            comparisons = build_enrichment_comparisons(
-                meta,
-                input_group=input_group,
-                mode=comparison_mode,
-            )
+            comparisons = build_enrichment_comparisons(meta)
             comparisons.to_csv(de_dir / "comparisons.tsv", sep="\t", index=False)
             n_ok = run_deseq2_comparisons(
                 filtered,
@@ -2893,14 +2635,12 @@ def run_statistical_analysis(
             logger.warning("STAT STEP FAILED: %s: %s (continuing)", step, _stat_failure_reason(step, exc))
 
         step = "enrichment/enhancement"
-        logger.info("STAT STEP START: %s (mode=%s, n_top=%d)", step, ee_mode, ee_n_top)
+        logger.info("STAT STEP START: %s (n_top=%d)", step, ee_n_top)
         try:
             summary = run_enrichment_enhancement_analysis(
                 filtered,
                 meta,
                 ee_dir,
-                mode=ee_mode,
-                input_group=ee_input,
                 er_cut=ee_er_cut,
                 eh_cut=ee_eh_cut,
                 min_rpm=ee_min_rpm,

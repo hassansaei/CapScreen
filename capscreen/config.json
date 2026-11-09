@@ -73,8 +73,6 @@
         "differential_expression": {
             "padj_threshold": 0.05,
             "log2fc_threshold": 1.0,
-            "comparison_mode": "auto",
-            "input_group": "Input",
             "min_replicates": 2,
             "min_count": 10,
             "drop_if_any_group_low": false,
@@ -86,9 +84,7 @@
             "eh_cut": 3,
             "min_rpm": 5,
             "n_top": 20,
-            "pseudocount": 1,
-            "input_group": "Input",
-            "comparison_mode": "auto"
+            "pseudocount": 1
         },
         "plots": {
             "dpi": {
