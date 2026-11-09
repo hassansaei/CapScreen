@@ -36,12 +36,9 @@ This script performs a complete statistical analysis pipeline on CapScreen count
      ``all_meta_non_input``: every unordered pair among all metadata groups except input
    - Calculates log2 fold changes, p-values, and FDR-adjusted p-values
 
-6. Visualization:
-   - Target enrichment scatter plots and top-variant bar plots for each requested
-     enrichment pair (default: all unordered pairs among non-input groups with
-     ``mean_log2Enrich_*`` columns; configurable via ``plots.enrichment_plot_pairing``)
-   - RPM scatter density plots for replicate comparisons
-   - Heatmaps for target-enriched peptides (from differential expression results)
+6. Visualization (written to ``output_dir/qc``):
+   - Correlation scatter plots and correlation statistics
+   - PCA with all features, top variable features, and excluding input samples
 
 All analysis parameters are configurable via config.json file.
 """
@@ -56,17 +53,14 @@ from typing import Tuple, Optional, Dict, Any
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib as mpl
 import seaborn as sns
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from itertools import combinations
 from scipy.stats import spearmanr, pearsonr
 from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.colors import LinearSegmentedColormap
 import statsmodels.api as sm
 from statsmodels.stats.multitest import multipletests
-import mpl_scatter_density  # noqa: F401
 
 from pydeseq2.dds import DeseqDataSet
 from pydeseq2.ds import DeseqStats
@@ -120,38 +114,16 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
                 "pairing": "target_background",
             },
             "plots": {
-                "scatter_highlight_top_n": 60,
-                "bar_plot_top_n": 30,
                 "dpi": {
-                    "standard": 300,
-                    "heatmap": 600
+                    "standard": 300
                 },
                 "figure_sizes": {
-                    "scatter": [6, 6],
-                    "bar": [6, 6],
-                    "rpm_scatter": [6, 4],
-                    "pca": [6, 5],
-                    "heatmap": [10, 10]
-                },
-                "scatter": {
-                    "all_points_size": 10,
-                    "all_points_alpha": 0.4,
-                    "highlighted_size": 40
+                    "pca": [6, 5]
                 },
                 "pca": {
                     "point_size": 120,
                     "fontsize": 10
-                },
-                "fontsize": 10,
-                # "target_background" = only target×background grid; "all_pairs" = every group pair
-                "enrichment_plot_pairing": "all_pairs",
-            },
-            "colors": {
-                "target": "#d62728",
-                "background_bead": "#1f77b4",
-                "background_bead_fc": "#ff7f0e",
-                "gray": "#808080",
-                "highlight": "#d62728"
+                }
             }
         }
     
@@ -1392,382 +1364,6 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
     return df_rpm_annot
 
 
-def iter_enrichment_scatter_bar_pairs(
-    groups_in_enrich: list,
-    plot_targets: list,
-    plot_backgrounds: list,
-    pairing: str,
-) -> list:
-    """
-    Build (group_y, group_x) tuples for enrichment scatter and bar plots.
-
-    Scatter uses y = mean log2 enrichment of ``group_y`` vs Input, x = that of ``group_x``.
-
-    Parameters
-    ----------
-    pairing:
-        - ``target_background`` — Cartesian product ``plot_targets`` × ``plot_backgrounds``
-          (skips pairs where both names are equal).
-        - ``all_pairs`` — all unordered pairs among ``groups_in_enrich`` (drops a group
-          whose name is only ``input``, case-insensitive).
-    """
-    mode = (pairing or "target_background").strip().lower().replace("-", "_")
-
-    if mode in ("all_pairs", "all", "complete"):
-        cand = sorted({g for g in groups_in_enrich if str(g).strip().lower() != "input"})
-        if len(cand) < 2:
-            return []
-        pairs = list(combinations(cand, 2))
-        logger.info(
-            f"Enrichment plot pairing '{mode}': {len(pairs)} unordered group pair(s) among {cand}"
-        )
-        return pairs
-
-    if mode not in ("target_background", "legacy", "default"):
-        logger.warning(
-            f"Unknown plots.enrichment_plot_pairing '{pairing}'; using 'target_background'."
-        )
-    pairs = []
-    for t in plot_targets:
-        for b in plot_backgrounds:
-            if t != b:
-                pairs.append((t, b))
-    logger.info(
-        f"Enrichment plot pairing 'target_background': {len(pairs)} target×background pair(s)"
-    )
-    return pairs
-
-
-def plot_target_enrichment_scatter(df_rpm_annot: pd.DataFrame, output_file: Path,
-                                   target_group: str = "Target", 
-                                   background_group: str = "Bead-Fc",
-                                   top_n: int = 60,
-                                   config: Optional[Dict[str, Any]] = None):
-    """
-    Create scatter plot of target vs background enrichment, highlighting top enriched variants.
-    
-    Args:
-        df_rpm_annot: Annotated RPM dataframe with enrichment metrics
-        output_file: Path to save the plot
-        target_group: Name of target group (default: "Target")
-        background_group: Name of background group (default: "Bead-Fc")
-        top_n: Number of top peptides to highlight (default: 60)
-    """
-    logger.info(f"Creating target enrichment scatter plot: {target_group} vs {background_group}")
-    
-    # Column names for enrichment
-    target_col = f"mean_log2Enrich_{target_group}"
-    background_col = f"mean_log2Enrich_{background_group}"
-    
-    # Check if columns exist
-    if target_col not in df_rpm_annot.columns or background_col not in df_rpm_annot.columns:
-        logger.warning(f"Required columns not found: {target_col} or {background_col}")
-        logger.warning(f"Available columns: {list(df_rpm_annot.columns)}")
-        return
-    
-    # Filter out NaN values and compute specificity on the fly
-    df_plot = df_rpm_annot[[target_col, background_col]].dropna()
-    
-    if len(df_plot) == 0:
-        logger.warning("No data available for scatter plot")
-        return
-    
-    # Compute specificity: target - background
-    df_plot = df_plot.copy()
-    df_plot['specificity'] = df_plot[target_col] - df_plot[background_col]
-    
-    # Get config values
-    if config is None:
-        config = {}
-    plot_config = config.get("plots", {})
-    figsize = plot_config.get("figure_sizes", {}).get("scatter", [6, 6])
-    dpi = plot_config.get("dpi", {}).get("standard", 300)
-    scatter_config = plot_config.get("scatter", {})
-    all_size = scatter_config.get("all_points_size", 10)
-    all_alpha = scatter_config.get("all_points_alpha", 0.4)
-    highlight_size = scatter_config.get("highlighted_size", 40)
-    enable_highlighting = scatter_config.get("enable_highlighting", False)
-    fontsize = plot_config.get("fontsize", 10)
-    colors_config = config.get("colors", {})
-    gray_color = colors_config.get("gray", "#808080")
-    highlight_color = colors_config.get("highlight", "#d62728")
-    
-    # Create figure
-    plt.figure(figsize=tuple(figsize), dpi=dpi)
-    
-    # Plot all points in gray
-    plt.scatter(
-        df_plot[background_col],
-        df_plot[target_col],
-        s=all_size, alpha=all_alpha, color=gray_color
-    )
-    
-    # Highlight top peptides by sorting on specificity (target - background) if enabled
-    if enable_highlighting:
-        top = df_plot.sort_values('specificity', ascending=False).head(top_n)
-        
-        if len(top) > 0:
-            plt.scatter(
-                top[background_col],
-                top[target_col],
-                s=highlight_size, color=highlight_color, zorder=5  # zorder to ensure points are on top
-            )
-            logger.info(f"Highlighted {len(top)} top enriched variants (sorted by {target_col} - {background_col})")
-        else:
-            logger.warning(f"No peptides found for highlighting")
-    else:
-        logger.info("Highlighting disabled in config, showing all points only")
-    
-    # Add vertical and horizontal lines at 0
-    plt.axvline(x=0, linestyle="--", color="black", linewidth=1)
-    plt.axhline(y=0, linestyle="--", color="black", linewidth=1)
-    
-    # Set labels
-    plt.xlabel(f"{background_group} log2 enrichment vs Input", fontsize=fontsize)
-    plt.ylabel(f"{target_group} log2 enrichment vs Input", fontsize=fontsize)
-    plt.title(
-        f"{target_group} vs {background_group}\n(log2 enrichment vs Input)",
-        fontsize=fontsize,
-    )
-    
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=dpi, bbox_inches='tight')
-    plt.close()
-    
-    logger.info(f"Saved target enrichment scatter plot to {output_file}")
-
-
-def plot_top_target_specific_variants(df_rpm_annot: pd.DataFrame, output_file: Path,
-                                      target_group: str = "Target",
-                                      background_group: str = "Bead-Fc",
-                                      top_n: int = 30,
-                                      config: Optional[Dict[str, Any]] = None):
-    """
-    Create horizontal bar plot showing top target-specific variants.
-    
-    Args:
-        df_rpm_annot: Annotated RPM dataframe with enrichment metrics
-        output_file: Path to save the plot
-        target_group: Name of target group (default: "Target")
-        background_group: Name of background group (default: "Bead-Fc")
-        top_n: Number of top variants to show (default: 30)
-    """
-    logger.info(f"Creating top {top_n} target-specific variants bar plot: {target_group} vs {background_group}")
-    
-    # Column names for enrichment
-    target_col = f"mean_log2Enrich_{target_group}"
-    background_col = f"mean_log2Enrich_{background_group}"
-    
-    # Check if columns exist
-    if target_col not in df_rpm_annot.columns or background_col not in df_rpm_annot.columns:
-        logger.warning(f"Required columns not found: {target_col} or {background_col}")
-        logger.warning(f"Available columns: {list(df_rpm_annot.columns)}")
-        return
-    
-    # Compute specificity column name (matching the pattern from compute_rpm_enrichment_analysis)
-    bg_name_clean = background_group.replace("-", "").replace("_", "")
-    target_name_clean = target_group.replace("-", "").replace("_", "")
-    specificity_col_name = f"{target_name_clean}_minus_{bg_name_clean}"
-    
-    # Check if specificity column exists, if not compute it
-    if specificity_col_name not in df_rpm_annot.columns:
-        logger.info(f"Computing specificity column: {specificity_col_name}")
-        df_plot = df_rpm_annot[[target_col, background_col]].dropna().copy()
-        df_plot[specificity_col_name] = df_plot[target_col] - df_plot[background_col]
-    else:
-        logger.info(f"Using existing specificity column: {specificity_col_name}")
-        df_plot = df_rpm_annot[[target_col, background_col, specificity_col_name]].dropna().copy()
-    
-    if len(df_plot) == 0:
-        logger.warning("No data available for bar plot")
-        return
-    
-    # Sort by specificity and get top N
-    top_variants = df_plot.sort_values(specificity_col_name, ascending=False).head(top_n)
-    
-    if len(top_variants) == 0:
-        logger.warning("No variants found for bar plot")
-        return
-    
-    # Get config values
-    if config is None:
-        config = {}
-    plot_config = config.get("plots", {})
-    figsize = plot_config.get("figure_sizes", {}).get("bar", [6, 6])
-    dpi = plot_config.get("dpi", {}).get("standard", 300)
-    fontsize = plot_config.get("fontsize", 10)
-    colors_config = config.get("colors", {})
-    highlight_color = colors_config.get("highlight", "#d62728")
-    
-    # Create figure
-    plt.figure(figsize=tuple(figsize), dpi=dpi)
-    
-    # Create horizontal bar plot
-    plt.barh(
-        top_variants.index,
-        top_variants[specificity_col_name],
-        color=highlight_color
-    )
-    
-    # Set labels
-    plt.xlabel(
-        f"{target_group} − {background_group} (Δ log2 enrichment vs Input)",
-        fontsize=fontsize,
-    )
-    plt.ylabel("Peptide", fontsize=fontsize)
-    plt.title(
-        f"Top {len(top_variants)} variants (higher in {target_group})",
-        fontsize=fontsize,
-    )
-    
-    # Invert y-axis so highest values are at the top
-    plt.gca().invert_yaxis()
-    
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=dpi, bbox_inches='tight')
-    plt.close()
-    
-    logger.info(f"Saved top {len(top_variants)} target-specific variants bar plot to {output_file}")
-
-
-def create_white_viridis_colormap() -> LinearSegmentedColormap:
-    """
-    Create a custom colormap with white background for scatter density plots.
-    
-    Returns:
-        LinearSegmentedColormap object
-    """
-    white_viridis = LinearSegmentedColormap.from_list(
-        "white_viridis",
-        [
-            (0, "#ffffff"),
-            (1e-20, "#440053"),
-            (0.2, "#404388"),
-            (0.4, "#2a788e"),
-            (0.6, "#21a784"),
-            (0.8, "#78d151"),
-            (1, "#fde624"),
-        ],
-        N=256,
-    )
-    return white_viridis
-
-
-def create_rpm_scatter_density_plots(rpm_counts: pd.DataFrame, meta: pd.DataFrame,
-                                     output_dir: Path,
-                                     config: Optional[Dict[str, Any]] = None):
-    """
-    Create scatter density plots for all replicate comparisons within each group using RPM counts.
-
-    Values are plotted as log2(RPM + λ) where λ is ``analysis.lambda`` from config (default 0.01),
-    matching RPM enrichment pseudocount and avoiding huge negative log2 when RPM is zero.
-
-    Args:
-        rpm_counts: RPM counts dataframe (variants as rows, samples as columns)
-        meta: Metadata dataframe
-        output_dir: Directory to save PNG plots
-    """
-    logger.info("Creating scatter density plots for RPM counts...")
-    
-    # Reset matplotlib style to default with white background
-    plt.style.use("default")
-    mpl.rcParams.update({
-        "figure.facecolor": "white",
-        "axes.facecolor": "white",
-        "savefig.facecolor": "white",
-    })
-    
-    # Create custom colormap
-    white_viridis = create_white_viridis_colormap()
-    
-    # Refactored: Fixed to preserve peptide column instead of dropping it
-    # Sourcery-AI suggestion: Keep ID_WLG as index and preserve peptide column to maintain 
-    # both identifier and sequence information for downstream use
-    # Align RPM counts with metadata
-    # rpm_counts has variants as rows, samples as columns
-    # Set ID_WLG as index if it's a column, preserve peptide column (contains sequence)
-    if 'ID_WLG' in rpm_counts.columns:
-        rpm_counts = rpm_counts.set_index('ID_WLG')
-    # Keep peptide column - don't drop it (contains actual sequence)
-    
-    # Remove AAV2 or control variants if they exist
-    control_variants = rpm_counts.index[rpm_counts.index.str.contains('AAV', case=False, na=False)]
-    if len(control_variants) > 0:
-        logger.info(f"Removing control variants from RPM counts: {list(control_variants)}")
-        rpm_counts = rpm_counts.drop(control_variants)
-    
-    # Get common samples
-    common_samples = rpm_counts.columns.intersection(meta.index)
-    rpm_counts_aligned = rpm_counts[common_samples]
-    meta_aligned = meta.loc[common_samples]
-    
-    logger.info(f"Aligned {len(common_samples)} samples for RPM scatter density plots")
-    
-    # Get all groups
-    groups = meta_aligned['group'].unique()
-    
-    plot_count = 0
-    for group in groups:
-        group_samples = meta_aligned[meta_aligned['group'] == group].index.tolist()
-        
-        if len(group_samples) >= 2:
-            # Create plots for all pairwise comparisons within the group
-            for s1, s2 in combinations(group_samples, 2):
-                if s1 in rpm_counts_aligned.columns and s2 in rpm_counts_aligned.columns:
-                    # Get RPM values and apply log2 transformation
-                    x_rpm = rpm_counts_aligned[s1].to_numpy()
-                    y_rpm = rpm_counts_aligned[s2].to_numpy()
-                    
-                    # log2(RPM + pseudocount); use analysis.lambda (same as enrichment / Pearson fallback)
-                    if config is None:
-                        config = {}
-                    rpm_pseudo = float(config.get("analysis", {}).get("lambda", 0.01))
-                    x = np.log2(x_rpm + rpm_pseudo)
-                    y = np.log2(y_rpm + rpm_pseudo)
-                    
-                    # Remove NaN and Inf values
-                    mask = np.isfinite(x) & np.isfinite(y)
-                    x = x[mask]
-                    y = y[mask]
-                    
-                    if len(x) > 0:
-                        plot_config = config.get("plots", {})
-                        figsize = plot_config.get("figure_sizes", {}).get("rpm_scatter", [6, 4])
-                        dpi = plot_config.get("dpi", {}).get("standard", 300)
-                        fontsize = plot_config.get("fontsize", 10)
-                        
-                        fig = plt.figure(figsize=tuple(figsize), dpi=dpi)
-                        ax = fig.add_subplot(1, 1, 1, projection="scatter_density")
-                        
-                        # Force white axes background
-                        ax.patch.set_facecolor("white")
-                        
-                        # Create scatter density plot
-                        density = ax.scatter_density(x, y, cmap=white_viridis)
-                        
-                        # Add colorbar
-                        cbar = fig.colorbar(density, ax=ax)
-                        cbar.set_label("Density")
-                        
-                        # Set labels and title
-                        ax.set_xlabel(s1, fontsize=fontsize)
-                        ax.set_ylabel(s2, fontsize=fontsize)
-                        ax.set_title(f"{group}", fontsize=fontsize)
-                        
-                        plt.tight_layout()
-                        
-                        # Save plot
-                        safe_group_name = group.replace(" ", "_").replace("/", "_")
-                        plot_filename = f"rpm_scatter_{safe_group_name}_{s1}_vs_{s2}.png"
-                        plot_path = output_dir / plot_filename
-                        plt.savefig(plot_path, dpi=dpi, bbox_inches='tight')
-                        plt.close()
-                        
-                        plot_count += 1
-    
-    logger.info(f"Created {plot_count} scatter density plots for RPM counts")
-
-
 def create_group_color_palette(all_groups: list) -> dict:
     """
     Create a fixed color palette for groups to ensure consistency across plots.
@@ -1896,8 +1492,10 @@ def run_statistical_analysis(
     # Load configuration
     config = load_config(config_file)
     
-    # Create output directory
+    # Create output directory. QC tables and plots live in a qc subdirectory.
     output_dir.mkdir(parents=True, exist_ok=True)
+    qc_dir = output_dir / "qc"
+    qc_dir.mkdir(parents=True, exist_ok=True)
     
     step = "initialization"
     try:
@@ -1976,20 +1574,7 @@ def run_statistical_analysis(
         df_norm.to_csv(norm_counts_file, sep='\t')
         logger.info("STAT STEP OK: %s (%s)", step, norm_counts_file)
         
-        # Create RPM scatter density plots for replicate comparisons
-        step = "RPM scatter plots"
-        if not rpm_counts.empty:
-            logger.info("STAT STEP START: %s", step)
-            try:
-                create_rpm_scatter_density_plots(rpm_counts, meta, output_dir, config=config)
-                logger.info("STAT STEP OK: %s", step)
-            except Exception as e:
-                logger.warning("STAT STEP FAILED: %s: %s (continuing)", step, _stat_failure_reason(step, e))
-        else:
-            logger.warning("STAT STEP SKIPPED: %s: RPM counts not available", step)
-        
         # Perform RPM-based enrichment analysis
-        df_rpm_annot = None
         step = "RPM enrichment analysis"
         if not rpm_counts.empty and input_groups:
             logger.info("STAT STEP START: %s", step)
@@ -2005,129 +1590,6 @@ def run_statistical_analysis(
                 rpm_enrichment_file = output_dir / "RPM_enrichment_analysis.tsv"
                 df_rpm_annot.to_csv(rpm_enrichment_file, sep='\t')
                 logger.info(f"Saved RPM enrichment analysis to {rpm_enrichment_file}")
-                
-                # Enrichment scatter + bar plots for each requested group pair
-                if df_rpm_annot is not None:
-                    enrich_cols = [
-                        col for col in df_rpm_annot.columns if col.startswith("mean_log2Enrich_")
-                    ]
-                    if enrich_cols:
-                        groups_in_enrich = [
-                            col.replace("mean_log2Enrich_", "") for col in enrich_cols
-                        ]
-
-                        config_groups = config.get("group_roles", None) if config else None
-                        plot_targets: list = []
-                        plot_backgrounds: list = []
-
-                        if config_groups:
-                            plot_targets = [
-                                g for g in config_groups.get("target", []) if g in groups_in_enrich
-                            ]
-                            plot_backgrounds = [
-                                g for g in config_groups.get("background", [])
-                                if g in groups_in_enrich
-                            ]
-                            classified = set(plot_targets + plot_backgrounds)
-                            unclassified = [
-                                g for g in groups_in_enrich if g not in classified
-                            ]
-                            for g in unclassified:
-                                role = _classify_group_heuristic(g)
-                                if role == "target":
-                                    plot_targets.append(g)
-                                elif role == "background":
-                                    plot_backgrounds.append(g)
-                        else:
-                            plot_targets = [
-                                g
-                                for g in groups_in_enrich
-                                if _classify_group_heuristic(g) == "target"
-                            ]
-                            plot_backgrounds = [
-                                g
-                                for g in groups_in_enrich
-                                if _classify_group_heuristic(g) == "background"
-                            ]
-
-                        plot_cfg = config.get("plots", {}) or {}
-                        enrich_pairing = plot_cfg.get("enrichment_plot_pairing", "all_pairs")
-                        pair_list = iter_enrichment_scatter_bar_pairs(
-                            groups_in_enrich,
-                            plot_targets,
-                            plot_backgrounds,
-                            enrich_pairing,
-                        )
-
-                        if pair_list:
-                            scatter_top_n = plot_cfg.get("scatter_highlight_top_n", 60)
-                            bar_top_n = plot_cfg.get("bar_plot_top_n", 30)
-
-                            scatter_ok = 0
-                            bar_ok = 0
-                            for group_y, group_x in pair_list:
-                                safe_y = (
-                                    group_y.replace(" ", "_")
-                                    .replace("/", "_")
-                                    .replace("-", "_")
-                                )
-                                safe_x = (
-                                    group_x.replace(" ", "_")
-                                    .replace("/", "_")
-                                    .replace("-", "_")
-                                )
-                                scatter_file = (
-                                    output_dir
-                                    / f"target_enrichment_scatter_{safe_y}_vs_{safe_x}.png"
-                                )
-                                try:
-                                    plot_target_enrichment_scatter(
-                                        df_rpm_annot,
-                                        scatter_file,
-                                        target_group=group_y,
-                                        background_group=group_x,
-                                        top_n=scatter_top_n,
-                                        config=config,
-                                    )
-                                    scatter_ok += 1
-                                except Exception as e:
-                                    logger.warning(
-                                        f"Failed to create scatter plot for {group_y} vs {group_x}: {e}"
-                                    )
-
-                                bar_plot_file = (
-                                    output_dir
-                                    / f"top_target_specific_variants_{safe_y}_vs_{safe_x}.png"
-                                )
-                                try:
-                                    plot_top_target_specific_variants(
-                                        df_rpm_annot,
-                                        bar_plot_file,
-                                        target_group=group_y,
-                                        background_group=group_x,
-                                        top_n=bar_top_n,
-                                        config=config,
-                                    )
-                                    bar_ok += 1
-                                except Exception as e:
-                                    logger.warning(
-                                        f"Failed to create bar plot for {group_y} vs {group_x}: {e}"
-                                    )
-
-                            logger.info(
-                                "Created %d enrichment scatter plot(s) and %d bar plot(s) "
-                                "(pairing=%s).",
-                                scatter_ok,
-                                bar_ok,
-                                enrich_pairing,
-                            )
-                        else:
-                            logger.warning(
-                                "No enrichment scatter/bar pairs to plot "
-                                "(check plots.enrichment_plot_pairing and group columns)."
-                            )
-                    else:
-                        logger.warning("No mean_log2Enrich_* columns for enrichment plots")
                 logger.info("STAT STEP OK: %s", step)
                 
             except Exception as e:
@@ -2146,13 +1608,13 @@ def run_statistical_analysis(
         step = "correlation statistics"
         logger.info("STAT STEP START: %s", step)
         df_corr = calculate_correlation_statistics(dds, df_norm, df_pearson)
-        corr_stats_file = output_dir / "correlation_statistics.tsv"
+        corr_stats_file = qc_dir / "correlation_statistics.tsv"
         df_corr.to_csv(corr_stats_file, sep='\t')
         logger.info("STAT STEP OK: %s (%s)", step, corr_stats_file)
 
         step = "correlation scatter plots"
         logger.info("STAT STEP START: %s", step)
-        corr_plots_file = output_dir / "correlation_scatterPlot.pdf"
+        corr_plots_file = qc_dir / "correlation_scatterPlot.pdf"
         create_correlation_scatter_plots(
             dds, df_norm, corr_plots_file, df_pearson, pearson_space_label=pearson_space_label
         )
@@ -2165,7 +1627,7 @@ def run_statistical_analysis(
         pca_all, pca_df_all = perform_pca(df_norm, meta, top_n_features=None, 
                                           exclude_input=False, config=config)
         plot_pca(pca_all, pca_df_all, 
-                output_dir / "pca_all_features.png",
+                qc_dir / "pca_all_features.png",
                 title="PCA - All Features",
                 group_palette=group_palette, config=config)
         logger.info("STAT STEP OK: %s (%d samples)", step, len(pca_df_all))
@@ -2175,7 +1637,7 @@ def run_statistical_analysis(
         pca_top500, pca_df_top500 = perform_pca(df_norm, meta, top_n_features=pca_top_n,
                                                 exclude_input=False, config=config)
         plot_pca(pca_top500, pca_df_top500,
-                output_dir / "pca_top500_features.png",
+                qc_dir / "pca_top500_features.png",
                 title=f"PCA - Top {pca_top_n} Variable Features",
                 group_palette=group_palette, config=config)
         logger.info("STAT STEP OK: %s", step)
@@ -2187,7 +1649,7 @@ def run_statistical_analysis(
                                                         exclude_input=True,
                                                         input_groups=input_groups, config=config)
             plot_pca(pca_no_input, pca_df_no_input,
-                    output_dir / "pca_no_input_samples.png",
+                    qc_dir / "pca_no_input_samples.png",
                     title=f"PCA - Top {pca_top_n} Features (No Input Samples)",
                     group_palette=group_palette, config=config)
             logger.info("STAT STEP OK: %s (%d samples)", step, len(pca_df_no_input))

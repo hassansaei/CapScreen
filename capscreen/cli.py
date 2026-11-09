@@ -971,12 +971,13 @@ def main():
                     stat_success = False
                 else:
                     logger.info("Starting QC analysis before statistical analysis...")
-                    # Create output directory for stat results (QC plots will be saved here too)
+                    # Stat results go here; sequencing QC and sample-QC plots go in qc/
                     stat_output_dir = args.output_dir / "statistical_analysis"
                     stat_output_dir.mkdir(parents=True, exist_ok=True)
                     
-                    # Run QC analysis on reports in output_dir, save plots to stat_output_dir
-                    qc_success = qc_module.run_qc_analysis(args.output_dir, stat_output_dir, logger_instance=logger)
+                    # Sequencing QC summary and plots go in statistical_analysis/qc
+                    qc_output_dir = stat_output_dir / "qc"
+                    qc_success = qc_module.run_qc_analysis(args.output_dir, qc_output_dir, logger_instance=logger)
                     if qc_success:
                         logger.info("QC analysis completed successfully")
                     else:

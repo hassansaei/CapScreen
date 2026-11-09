@@ -76,38 +76,16 @@
             "pairing": "target_background"
         },
         "plots": {
-            "scatter_highlight_top_n": 60,
-            "bar_plot_top_n": 30,
             "dpi": {
-                "standard": 300,
-                "heatmap": 600
+                "standard": 300
             },
             "figure_sizes": {
-                "scatter": [6, 6],
-                "bar": [6, 6],
-                "rpm_scatter": [6, 4],
-                "pca": [6, 5],
-                "heatmap": [10, 10]
-            },
-            "scatter": {
-                "all_points_size": 10,
-                "all_points_alpha": 0.4,
-                "highlighted_size": 40,
-                "enable_highlighting": false
+                "pca": [6, 5]
             },
             "pca": {
                 "point_size": 120,
                 "fontsize": 10
-            },
-            "fontsize": 10,
-            "enrichment_plot_pairing": "all_pairs"
-        },
-        "colors": {
-            "target": "#d62728",
-            "background_bead": "#1f77b4",
-            "background_bead_fc": "#ff7f0e",
-            "gray": "#808080",
-            "highlight": "#d62728"
+            }
         }
     }
 }
