@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Advance the CapScreen alpha version inside a release commit.
 
-feat, fix, perf, and refactor commits increment 1.0.0-alpha.N in
+feat, fix, perf, and refactor commits increment MAJOR.MINOR.PATCH-alpha.N in
 capscreen/version.py and amend that file into the commit just created.
 A breaking change (! or a BREAKING CHANGE footer) does the same for
 any commit type. Other types leave the version unchanged.
@@ -77,7 +77,7 @@ def main():
     if current is None:
         sys.exit(
             'post-commit: capscreen/version.py must contain '
-            '__version__ = "1.0.0-alpha.N"'
+            '__version__ = "X.Y.Z-alpha.N"'
         )
 
     parent = git("rev-parse", "--verify", "HEAD^", check=False)
