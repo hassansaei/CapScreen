@@ -1459,9 +1459,35 @@ def fit_blind_vst(
     return vst, metadata
 
 
+def drop_control_variants(vst: pd.DataFrame, pattern: str = "AAV") -> pd.DataFrame:
+    """Drop control variants such as AAV2 from a variants-by-samples matrix."""
+    if vst.empty:
+        return vst
+    mask = vst.index.astype(str).str.contains(pattern, case=False, na=False)
+    n_drop = int(mask.sum())
+    if n_drop:
+        logger.info("Excluding %d control variant(s) matching %r from PCA", n_drop, pattern)
+        return vst.loc[~mask].copy()
+    return vst
+
+
 def plot_vst_pearson_heatmap(vst: pd.DataFrame, out_pdf: Path) -> pd.DataFrame:
-    """Sample-sample Pearson correlation of blind VST values. Scale is fixed at 0.7 to 1."""
+    """Sample-sample Pearson correlation of blind VST values.
+
+    Color limits follow the observed correlation range so weak replicate
+    correlations are not compressed into the same color as 0.7.
+    """
     corr = vst.corr(method="pearson")
+    finite = corr.to_numpy(dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        raise ValueError("No finite Pearson correlations to plot")
+    vmin = float(np.min(finite))
+    vmax = float(np.max(finite))
+    if np.isclose(vmin, vmax):
+        pad = 0.01 if vmax < 1.0 else 0.0
+        vmin = max(-1.0, vmin - pad)
+        vmax = min(1.0, vmax + pad)
     cmap = LinearSegmentedColormap.from_list(
         "vst_corr",
         ["#313695", "#4575b4", "#74add1", "#abd9e9", "#f7f7f7", "#fdae61", "#f46d43", "#d73027", "#a50026"],
@@ -1473,8 +1499,8 @@ def plot_vst_pearson_heatmap(vst: pd.DataFrame, out_pdf: Path) -> pd.DataFrame:
         corr,
         ax=ax,
         cmap=cmap,
-        vmin=0.7,
-        vmax=1.0,
+        vmin=vmin,
+        vmax=vmax,
         square=True,
         cbar_kws={"label": "Pearson r"},
     )
@@ -1482,7 +1508,12 @@ def plot_vst_pearson_heatmap(vst: pd.DataFrame, out_pdf: Path) -> pd.DataFrame:
     fig.tight_layout()
     fig.savefig(out_pdf)
     plt.close(fig)
-    logger.info("Saved VST Pearson heatmap to %s", out_pdf)
+    logger.info(
+        "Saved VST Pearson heatmap to %s (color scale %.3f to %.3f)",
+        out_pdf,
+        vmin,
+        vmax,
+    )
     return corr
 
 
@@ -1494,7 +1525,9 @@ def _pca_frame(vst: pd.DataFrame, sample_info: pd.DataFrame, n_top: Optional[int
         raise ValueError(
             f"Need at least 2 samples after excluding {exclude_groups}; remaining: {keep}"
         )
-    mat = vst[keep].apply(pd.to_numeric, errors="coerce")
+    mat = drop_control_variants(vst[keep].apply(pd.to_numeric, errors="coerce"))
+    if mat.empty:
+        raise ValueError("No variants left for PCA after excluding control variants")
     variance = mat.var(axis=1, ddof=1)
     ranked = variance[(variance > 0) & np.isfinite(variance)].sort_values(ascending=False)
     if ranked.empty:
@@ -1542,7 +1575,11 @@ def _draw_pca(frame: pd.DataFrame, pct: np.ndarray, n_variants: int, title: str,
 
 
 def plot_vst_pca(vst: pd.DataFrame, sample_info: pd.DataFrame, qc_dir: Path, n_top: int, exclude_groups: List[str]) -> None:
-    """Write the two notebook PCA figures: all positive-variance variants, and the top variable set."""
+    """Write the two notebook PCA figures: all positive-variance variants, and the top variable set.
+
+    Input samples are dropped via ``exclude_groups``. Control variants matching
+    AAV (for example AAV2) are removed so contamination does not drive the PCs.
+    """
     all_frame, all_pct, n_all = _pca_frame(vst, sample_info, None, exclude_groups)
     top_frame, top_pct, n_top_used = _pca_frame(vst, sample_info, n_top, exclude_groups)
     plots = [
