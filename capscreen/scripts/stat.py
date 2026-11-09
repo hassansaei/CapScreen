@@ -18,7 +18,9 @@ This script performs QC and DESeq2 analysis on CapScreen count data.
      variants, and the top variable variants)
 
 3. DESeq2, written to ``output_dir/deseq2``:
-   - Contrasts are inferred from ``sample_info`` group names
+   - Contrasts from Sample_info ``enrichment_role`` / ``enrichment_arm``
+     when set (target versus each background); otherwise CapScreen
+     group-name templates (AAVR, PD, OA/OPA, FASMA/FASTA)
    - Design is ``~ group``, or ``~ batch_seq + group`` when multiple
      sequencing batches are present and not confounded with group
    - One DESeq2 fit on all samples shares size factors and dispersions;
@@ -27,8 +29,8 @@ This script performs QC and DESeq2 analysis on CapScreen count data.
 
 4. Enrichment / enhancement (Lin et al.), written to
    ``output_dir/enrichment_enhancement``:
-   - Arms from Sample_info ``enrichment_role`` / ``enrichment_arm`` when set;
-     otherwise CapScreen name templates (AAVR, PD, OA/OPA, FASMA/FASTA)
+   - Same Sample_info role/arm columns as DESeq2 when set; otherwise
+     CapScreen name templates
    - Er = target RPM / input RPM; Eh = target RPM / background RPM
    - Median- and mean-based scores, hit calling, Er-Eh scatter plots
    - Top enriched variants: grouped log10 RPM bar plots for all groups
@@ -845,6 +847,25 @@ def _infer_stat_mode(
     return mode, groups
 
 
+def _deseq2_pairs_from_enrichment_arms(arms: pd.DataFrame) -> List[Tuple[str, str]]:
+    """
+    One DESeq2 contrast per target-versus-background pair in each Er/Eh arm.
+
+    Input is used for enrichment Er only and is not added as a DESeq2 reference here.
+    """
+    pairs: List[Tuple[str, str]] = []
+    for _, arm in arms.iterrows():
+        target = str(arm["target"])
+        for background in str(arm["backgrounds"]).split(";"):
+            background = background.strip()
+            if not background or background == target:
+                continue
+            pair = (target, background)
+            if pair not in pairs:
+                pairs.append(pair)
+    return pairs
+
+
 def build_enrichment_comparisons(
     sample_info: pd.DataFrame,
     group_col: str = "group",
@@ -852,11 +873,39 @@ def build_enrichment_comparisons(
     mode: str = "auto",
 ) -> pd.DataFrame:
     """
-    Build y-versus-x contrasts from sample_info group names.
+    Build y-versus-x DESeq2 contrasts from Sample_info.
 
-    ``auto`` selects aavr, pd_target, oa_opa, or fasma_fasta from those names.
+    Prefer ``enrichment_role`` / ``enrichment_arm`` when present: each arm yields
+    one contrast of target versus each background group. Otherwise ``auto``
+    selects aavr, pd_target, oa_opa, or fasma_fasta from group names.
     y_group is the numerator of the DESeq2 contrast and x_group is the reference.
     """
+    if _has_enrichment_metadata(sample_info):
+        arms = _arms_from_enrichment_metadata(sample_info, group_col=group_col)
+        pairs = _deseq2_pairs_from_enrichment_arms(arms)
+        if not pairs:
+            raise ValueError(
+                "Sample_info enrichment_role/arm is set but no DESeq2 contrasts "
+                "could be built (need target and at least one background per arm)"
+            )
+        arm_labels: List[str] = []
+        for y_group, x_group in pairs:
+            label = ""
+            for _, arm in arms.iterrows():
+                bgs = [b.strip() for b in str(arm["backgrounds"]).split(";") if b.strip()]
+                if str(arm["target"]) == y_group and x_group in bgs:
+                    label = str(arm["tag"])
+                    break
+            arm_labels.append(label)
+        out = pd.DataFrame(pairs, columns=["y_group", "x_group"])
+        out["mode"] = "sample_info"
+        out["arm"] = arm_labels
+        logger.info(
+            "Built %d DESeq2 contrast(s) from Sample_info enrichment_role/arm",
+            len(out),
+        )
+        return out
+
     mode, groups = _infer_stat_mode(
         sample_info, group_col=group_col, input_group=input_group, mode=mode
     )

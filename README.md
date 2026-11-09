@@ -116,22 +116,62 @@ docker run --rm \
     --stat
 ```
 
-**Sample_info.csv Format** (required columns):
+**Sample_info.csv Format**
+
+Required columns:
 - `sample_id`: Unique identifier for each sample
 - `run_mode`: Currently only `PE` (paired-end) is supported
 - `path_FASTQ`: Path to R1 FASTQ file (R2 is automatically inferred)
-- `group`: Sample group name (e.g., "Target", "Bead-Fc", "Input")
+- `group`: Sample group name (any label; e.g. `Target`, `MyKidney`, `Input`)
 - `tech_rep`: Technical replicate number
 - `bio_rep`: Biological replicate number
 - `batch_seq`: Batch sequence number
 
-Example `Sample_info.csv`:
+Optional columns for statistical analysis (`stat`: DESeq2 **and** enrichment/enhancement):
+- `enrichment_role`: `input`, `target`, or `background` (blank = not used in DESeq2 or Er/Eh)
+- `enrichment_arm`: Free-form arm tag that links one target group to its background group(s)
+
+Rules when `enrichment_role` is set:
+- Exactly one group must have `enrichment_role=input` (shared across arms; `enrichment_arm` may be blank)
+- Each arm needs exactly one `target` group and one or more `background` groups with the same `enrichment_arm`
+- All rows of the same `group` must share the same role and arm
+- **DESeq2**: one contrast per target-versus-background pair (input is not a DESeq2 reference)
+- **Enrichment/enhancement**: Er = target RPM / input RPM; Eh = target RPM / background RPM (all backgrounds for that arm pooled)
+- Top-variant RPM bar plots show **all** groups in Sample_info
+- If these columns are omitted, CapScreen falls back to name-based templates (AAVR, PD, OA/OPA, FASMA/FASTA) for both DESeq2 and Er/Eh
+
+Example for the sequencing pipeline (required columns only):
 ```csv
 sample_id,run_mode,path_FASTQ,group,tech_rep,bio_rep,batch_seq
 sample1,PE,/opt/capscreen/input/sample1_1.fq.gz,Target,1,1,1
 sample2,PE,/opt/capscreen/input/sample2_1.fq.gz,Bead-Fc,1,1,1
 sample3,PE,/opt/capscreen/input/sample3_1.fq.gz,Input,1,1,1
 ```
+
+Example for DESeq2 + enrichment/enhancement with custom group names:
+```csv
+sample_id,run_mode,path_FASTQ,group,tech_rep,bio_rep,batch_seq,enrichment_role,enrichment_arm
+In1,PE,/opt/capscreen/input/In1_1.fq.gz,LibraryInput,1,1,1,input,
+In2,PE,/opt/capscreen/input/In2_1.fq.gz,LibraryInput,1,2,1,input,
+K1,PE,/opt/capscreen/input/K1_1.fq.gz,MyKidney,1,1,1,target,kidney_vs_offtarget
+K2,PE,/opt/capscreen/input/K2_1.fq.gz,MyKidney,1,2,1,target,kidney_vs_offtarget
+K3,PE,/opt/capscreen/input/K3_1.fq.gz,MyKidney,1,3,1,target,kidney_vs_offtarget
+L1,PE,/opt/capscreen/input/L1_1.fq.gz,MyLiver,1,1,1,background,kidney_vs_offtarget
+L2,PE,/opt/capscreen/input/L2_1.fq.gz,MyLiver,1,2,1,background,kidney_vs_offtarget
+L3,PE,/opt/capscreen/input/L3_1.fq.gz,MyLiver,1,3,1,background,kidney_vs_offtarget
+S1,PE,/opt/capscreen/input/S1_1.fq.gz,MySpleen,1,1,1,background,kidney_vs_offtarget
+S2,PE,/opt/capscreen/input/S2_1.fq.gz,MySpleen,1,2,1,background,kidney_vs_offtarget
+S3,PE,/opt/capscreen/input/S3_1.fq.gz,MySpleen,1,3,1,background,kidney_vs_offtarget
+H1,PE,/opt/capscreen/input/H1_1.fq.gz,MyHeart,1,1,1,,
+H2,PE,/opt/capscreen/input/H2_1.fq.gz,MyHeart,1,2,1,,
+H3,PE,/opt/capscreen/input/H3_1.fq.gz,MyHeart,1,3,1,,
+```
+
+In that example, arm `kidney_vs_offtarget` drives:
+- DESeq2 contrasts `MyKidney` vs `MyLiver` and `MyKidney` vs `MySpleen`
+- Er = MyKidney / LibraryInput and Eh = MyKidney / (MyLiver + MySpleen)
+
+`MyHeart` has a blank role, so it is skipped by DESeq2 and Er/Eh but still appears in the RPM bar plots.
 
 **FASTQ Naming Conventions Supported:**
 - Illumina standard: `sample_1.fq.gz` / `sample_2.fq.gz`
