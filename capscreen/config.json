@@ -78,7 +78,8 @@
             "min_replicates": 2,
             "min_count": 10,
             "drop_if_any_group_low": false,
-            "log2rpm_pseudocount": 1
+            "log2rpm_pseudocount": 1,
+            "adjust_batch": true
         },
         "plots": {
             "dpi": {

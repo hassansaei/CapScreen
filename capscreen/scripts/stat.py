@@ -19,7 +19,9 @@ This script performs QC and DESeq2 analysis on CapScreen count data.
 
 3. DESeq2, written to ``output_dir/deseq2``:
    - Contrasts are inferred from ``sample_info`` group names
-   - Each contrast is fit on the two groups only, with design ``~ group``
+   - Each contrast is fit on the two groups only
+   - Design is ``~ group``, or ``~ batch_seq + group`` when multiple
+     sequencing batches are present and not confounded with group
    - Wald statistics, log2 fold changes, and BH-adjusted p-values
 
 Enrichment analysis is intentionally not run here.
@@ -100,6 +102,8 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
                 "min_count": 10,
                 "drop_if_any_group_low": False,
                 "log2rpm_pseudocount": 1,
+                # Include batch_seq in the DESeq2 design when >=2 batches are present
+                "adjust_batch": True,
             },
             "plots": {
                 "dpi": {
@@ -1337,12 +1341,95 @@ def _integer_counts(raw: pd.DataFrame) -> pd.DataFrame:
     return rounded
 
 
-def fit_blind_vst(counts: pd.DataFrame, sample_info: pd.DataFrame, n_cpus: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def build_deseq_design(
+    sample_info: pd.DataFrame,
+    adjust_batch: bool = True,
+    batch_col: str = "batch_seq",
+) -> Tuple[str, List[str]]:
     """
-    Build a DESeqDataSet with design ``~ group`` and return blind VST counts.
+    Choose the DESeq2 design for CapScreen samples.
 
-    The returned table has variants as rows and samples as columns. DESeq() is
-    not run here; dispersions for VST use an intercept-only trend.
+    Always include ``group``. Never include ``bio_rep``: replicate numbers are
+    labels within a group, not a shared blocking factor across groups. Include
+    ``batch_seq`` only when ``adjust_batch`` is true, at least two batches are
+    present, and batch is not fully confounded with group (each group exclusive
+    to one batch and each batch exclusive to one group).
+
+    Returns
+    -------
+    design :
+        Formula string, e.g. ``~group`` or ``~batch_seq + group``.
+    metadata_cols :
+        Columns required in the colData for that design.
+    """
+    metadata_cols = ["group"]
+    if not adjust_batch:
+        return "~group", metadata_cols
+    if batch_col not in sample_info.columns:
+        logger.info("No %s column in sample_info; using design ~group", batch_col)
+        return "~group", metadata_cols
+
+    batches = sample_info[batch_col]
+    n_batches = int(pd.Series(batches).nunique(dropna=True))
+    if n_batches < 2:
+        logger.info("Single sequencing batch detected; using design ~group")
+        return "~group", metadata_cols
+
+    groups = sample_info["group"].astype(str)
+    batch_labels = batches.astype(str)
+    n_batch_per_group = (
+        pd.DataFrame({"group": groups, "batch": batch_labels})
+        .groupby("group")["batch"]
+        .nunique()
+    )
+    n_group_per_batch = (
+        pd.DataFrame({"group": groups, "batch": batch_labels})
+        .groupby("batch")["group"]
+        .nunique()
+    )
+    if bool((n_batch_per_group == 1).all() and (n_group_per_batch == 1).all()):
+        logger.warning(
+            "batch_seq is fully confounded with group "
+            "(each group is exclusive to one batch). "
+            "Cannot adjust for batch; using design ~group."
+        )
+        return "~group", metadata_cols
+
+    logger.info(
+        "Multiple sequencing batches detected (%d); using design ~%s + group",
+        n_batches,
+        batch_col,
+    )
+    return f"~{batch_col} + group", [batch_col, "group"]
+
+
+def _deseq_metadata(
+    sample_info: pd.DataFrame,
+    sample_ids: List[str],
+    metadata_cols: List[str],
+) -> pd.DataFrame:
+    """Build DESeq2 colData with categorical factors for the chosen design."""
+    missing = [col for col in metadata_cols if col not in sample_info.columns]
+    if missing:
+        raise ValueError(f"sample_info is missing design columns: {missing}")
+    metadata = sample_info.loc[sample_ids, metadata_cols].copy()
+    for col in metadata_cols:
+        metadata[col] = metadata[col].astype(str)
+    return metadata
+
+
+def fit_blind_vst(
+    counts: pd.DataFrame,
+    sample_info: pd.DataFrame,
+    n_cpus: int,
+    adjust_batch: bool = True,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build a DESeqDataSet and return blind VST counts.
+
+    Blind VST fits an intercept-only dispersion trend (``use_design=False``).
+    The stored design still follows :func:`build_deseq_design` so batch is
+    recorded consistently when present.
     """
     sample_ids = [sid for sid in sample_info["sample_id"].astype(str) if sid in counts.columns]
     if len(sample_ids) < 2:
@@ -1355,12 +1442,12 @@ def fit_blind_vst(counts: pd.DataFrame, sample_info: pd.DataFrame, n_cpus: int) 
         raise ValueError("Duplicate ID_WLG values while building the VST dataset")
     count_mat = count_mat.T
     count_mat.index = sample_ids
-    metadata = sample_info.loc[sample_ids, ["group"]].copy()
-    metadata["group"] = metadata["group"].astype(str)
+    design, metadata_cols = build_deseq_design(sample_info.loc[sample_ids], adjust_batch=adjust_batch)
+    metadata = _deseq_metadata(sample_info, sample_ids, metadata_cols)
     dds = DeseqDataSet(
         counts=count_mat,
         metadata=metadata,
-        design="~group",
+        design=design,
         refit_cooks=True,
         n_cpus=n_cpus,
         quiet=True,
@@ -1480,12 +1567,15 @@ def run_deseq2_comparisons(
     out_dir: Path,
     n_cpus: int,
     min_replicates: int = 2,
+    adjust_batch: bool = True,
 ) -> int:
     """
     Fit each contrast on its two groups only.
 
-    This matches the notebook: subset the samples, run DESeq with design ``~ group``,
-    then test y_group versus x_group. Genes with no counts in the subset are omitted.
+    Design is chosen per contrast from the subset samples via
+    :func:`build_deseq_design`: ``~group``, or ``~batch_seq + group`` when
+    multiple non-confounded batches are present. ``bio_rep`` is never in the
+    design. Genes with no counts in the subset are omitted.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     n_ok = 0
@@ -1518,13 +1608,13 @@ def run_deseq2_comparisons(
         if count_mat.index.duplicated().any():
             raise ValueError(f"Duplicate variant IDs while preparing {name}")
         design_counts = count_mat.T
-        metadata = subset.loc[sample_ids, ["group"]].copy()
-        metadata["group"] = metadata["group"].astype(str)
+        design, metadata_cols = build_deseq_design(subset.loc[sample_ids], adjust_batch=adjust_batch)
+        metadata = _deseq_metadata(subset, sample_ids, metadata_cols)
         try:
             dds = DeseqDataSet(
                 counts=design_counts,
                 metadata=metadata,
-                design="~group",
+                design=design,
                 refit_cooks=True,
                 n_cpus=n_cpus,
                 quiet=True,
@@ -1537,10 +1627,17 @@ def run_deseq2_comparisons(
             res["y_group"] = y_group
             res["x_group"] = x_group
             res["comparison"] = name
+            res["design"] = design
             out_path = out_dir / de_result_filename(y_group, x_group)
             res.to_csv(out_path, sep="\t", index=False)
             n_sig = int((res["padj"] < 0.05).sum()) if "padj" in res.columns else 0
-            logger.info("Wrote %s (%d variants, %d with padj < 0.05)", out_path, len(res), n_sig)
+            logger.info(
+                "Wrote %s (design=%s, %d variants, %d with padj < 0.05)",
+                out_path,
+                design,
+                len(res),
+                n_sig,
+            )
             n_ok += 1
         except Exception as exc:
             logger.warning("DESeq2 failed for %s: %s", name, exc)
@@ -1602,6 +1699,7 @@ def run_statistical_analysis(
     input_group = str(de_cfg.get("input_group", "Input"))
     comparison_mode = de_cfg.get("comparison_mode", "auto")
     min_replicates = _cfg_int(de_cfg.get("min_replicates"), 2)
+    adjust_batch = bool(de_cfg.get("adjust_batch", True))
     pca_top_n = _cfg_int((analysis_cfg.get("pca") or {}).get("top_n_features"), 500)
 
     step = "initialization"
@@ -1677,7 +1775,7 @@ def run_statistical_analysis(
 
         step = "blind VST"
         logger.info("STAT STEP START: %s", step)
-        vst, _meta_vst = fit_blind_vst(filtered, meta, n_cpus_val)
+        vst, _meta_vst = fit_blind_vst(filtered, meta, n_cpus_val, adjust_batch=adjust_batch)
         logger.info("STAT STEP OK: %s (%s)", step, vst.shape)
 
         step = "VST Pearson heatmap"
@@ -1719,6 +1817,7 @@ def run_statistical_analysis(
                 de_dir,
                 n_cpus=n_cpus_val,
                 min_replicates=min_replicates,
+                adjust_batch=adjust_batch,
             )
             logger.info("STAT STEP OK: %s (%d/%d contrasts)", step, n_ok, len(comparisons))
         except Exception as exc:
