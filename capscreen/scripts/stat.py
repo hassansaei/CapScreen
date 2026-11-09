@@ -1603,6 +1603,65 @@ def plot_vst_pca(vst: pd.DataFrame, sample_info: pd.DataFrame, qc_dir: Path, n_t
     logger.info("Saved two-page VST PCA to %s", qc_dir / "pca_vst.pdf")
 
 
+def _samples_for_group(
+    sample_info: pd.DataFrame,
+    sample_ids: List[str],
+    group: str,
+) -> List[str]:
+    return [
+        sid
+        for sid in sample_ids
+        if str(sample_info.loc[sid, "group"]) == str(group)
+    ]
+
+
+def _finalize_contrast_results(
+    results_df: pd.DataFrame,
+    raw_counts: pd.DataFrame,
+    all_variant_ids: pd.Index,
+    y_samples: List[str],
+    x_samples: List[str],
+    y_group: str,
+    x_group: str,
+    design: str,
+) -> pd.DataFrame:
+    """
+    Reindex DESeq2 results to every filtered variant and blank unsupported tests.
+
+    Variants with zero counts in both contrast groups cannot support a fold
+    change. Keep them in the table with missing test statistics (and baseMean 0),
+    matching the R notebook behavior.
+    """
+    res = results_df.copy()
+    res.index = res.index.astype(str)
+    res = res.reindex(all_variant_ids.astype(str))
+    res.insert(0, "ID", all_variant_ids.astype(str).to_numpy())
+
+    y_sum = raw_counts.loc[all_variant_ids, y_samples].sum(axis=1)
+    x_sum = raw_counts.loc[all_variant_ids, x_samples].sum(axis=1)
+    zero_both = (y_sum.to_numpy() == 0) & (x_sum.to_numpy() == 0)
+    n_zero = int(zero_both.sum())
+    if n_zero:
+        for col in ("log2FoldChange", "lfcSE", "stat", "pvalue", "padj"):
+            if col in res.columns:
+                res.loc[zero_both, col] = np.nan
+        if "baseMean" in res.columns:
+            res.loc[zero_both, "baseMean"] = 0.0
+        logger.info(
+            "%s vs %s: %d variant(s) have zero counts in both groups; "
+            "wrote missing DE statistics",
+            y_group,
+            x_group,
+            n_zero,
+        )
+
+    res["y_group"] = y_group
+    res["x_group"] = x_group
+    res["comparison"] = f"{y_group}_vs_{x_group}"
+    res["design"] = design
+    return res
+
+
 def run_deseq2_comparisons(
     counts: pd.DataFrame,
     sample_info: pd.DataFrame,
@@ -1615,15 +1674,21 @@ def run_deseq2_comparisons(
     """
     Fit one DESeq2 model on all samples, then test each contrast.
 
-    Size factors, dispersions, and ``baseMean`` are shared across contrasts.
-    Design comes from :func:`build_deseq_design` on the full sample set
-    (``~group`` or ``~batch_seq + group``). ``bio_rep`` is never in the design.
-    Variants with zero counts in every sample are omitted before the fit.
+    Size factors and dispersions are shared across contrasts. Design comes from
+    :func:`build_deseq_design` on the full sample set (``~group`` or
+    ``~batch_seq + group``). ``bio_rep`` is never in the design.
+
+    Variants with zero counts in every sample are excluded from the fit but still
+    written in each contrast table with missing statistics. Variants with zero
+    counts in both groups of a contrast likewise keep a row with missing test
+    statistics.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     sample_ids = [sid for sid in sample_info["sample_id"].astype(str) if sid in counts.columns]
     if len(sample_ids) < 2:
         raise ValueError("Need at least 2 samples with count columns for DESeq2")
+    if "ID_WLG" not in counts.columns:
+        raise ValueError("Count table must contain ID_WLG for DESeq2")
 
     group_counts = sample_info.loc[sample_ids, "group"].astype(str).value_counts()
     runnable = []
@@ -1650,17 +1715,23 @@ def run_deseq2_comparisons(
         logger.warning("No DESeq2 contrasts left after replicate filtering")
         return 0
 
-    count_mat = _integer_counts(counts[sample_ids])
-    keep_genes = count_mat.sum(axis=1) > 0
+    raw_all = _integer_counts(counts[sample_ids])
+    raw_all.index = counts["ID_WLG"].astype(str)
+    if raw_all.index.duplicated().any():
+        raise ValueError("Duplicate variant IDs while preparing the DESeq2 dataset")
+    all_variant_ids = raw_all.index
+
+    keep_genes = raw_all.sum(axis=1) > 0
     n_drop = int((~keep_genes).sum())
     if n_drop:
-        logger.info("Omitting %d variant(s) with zero counts across all samples", n_drop)
-    count_mat = count_mat.loc[keep_genes]
+        logger.info(
+            "Excluding %d all-zero variant(s) from the DESeq2 fit; "
+            "they remain in contrast tables with missing statistics",
+            n_drop,
+        )
+    count_mat = raw_all.loc[keep_genes]
     if count_mat.empty:
         raise ValueError("No expressed variants left for DESeq2")
-    count_mat.index = counts.loc[count_mat.index, "ID_WLG"].astype(str)
-    if count_mat.index.duplicated().any():
-        raise ValueError("Duplicate variant IDs while preparing the DESeq2 dataset")
 
     design, metadata_cols = build_deseq_design(
         sample_info.loc[sample_ids], adjust_batch=adjust_batch
@@ -1690,12 +1761,18 @@ def run_deseq2_comparisons(
         try:
             stats = DeseqStats(dds, contrast=["group", y_group, x_group], quiet=True)
             stats.summary()
-            res = stats.results_df.copy()
-            res.insert(0, "ID", res.index.astype(str))
-            res["y_group"] = y_group
-            res["x_group"] = x_group
-            res["comparison"] = name
-            res["design"] = design
+            y_samples = _samples_for_group(sample_info, sample_ids, y_group)
+            x_samples = _samples_for_group(sample_info, sample_ids, x_group)
+            res = _finalize_contrast_results(
+                stats.results_df,
+                raw_all,
+                all_variant_ids,
+                y_samples,
+                x_samples,
+                y_group,
+                x_group,
+                design,
+            )
             out_path = out_dir / de_result_filename(y_group, x_group)
             res.to_csv(out_path, sep="\t", index=False)
             n_sig = int((res["padj"] < 0.05).fillna(False).sum()) if "padj" in res.columns else 0
