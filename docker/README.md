@@ -51,6 +51,8 @@ triggers **Actions → Publish CapScreen app image**. That workflow:
 1. Uses `ghcr.io/hassansaei/capscreen-base:latest` as `BASE_IMAGE`
 2. Builds `docker/DockerFile` for `linux/amd64`
 3. Pushes `ghcr.io/hassansaei/capscreen:<tag>` and `:latest`
+4. Converts the pushed image to Apptainer/Singularity `capscreen-<tag>.sif`
+5. Attaches that `.sif` to the GitHub Release (and uploads it as a workflow artifact)
 
 Optional Docker Hub publish (`saei/capscreen:<tag>` and `:latest`) runs when
 these repository secrets exist:
@@ -63,12 +65,21 @@ Add them under **Settings → Secrets and variables → Actions**.
 You can also run the workflow manually:
 **Actions → Publish CapScreen app image → Run workflow**
 (optionally pass a version; otherwise it reads `capscreen/version.py`).
+Manual runs still build the `.sif` and upload it as an Actions artifact.
+
+HPC / Apptainer example (after downloading the release asset):
+
+```bash
+apptainer run capscreen-2.1.0.sif --version
+apptainer run capscreen-2.1.0.sif pipeline --vp-seq ...
+```
 
 Release checklist:
 
 1. Push commits that bump `capscreen/version.py` (post-commit hook for alphas)
 2. Create a GitHub Release whose tag matches that version (e.g. `2.0.0-alpha.2`)
 3. Wait for the app image workflow to finish; pull from GHCR (and Docker Hub if configured)
+4. Download `capscreen-<tag>.sif` from the release assets if you need Singularity/Apptainer
 
 ## When to rebuild the final (app) image locally
 

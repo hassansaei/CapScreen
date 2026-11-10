@@ -11,12 +11,13 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 env:
   REGISTRY: ghcr.io
   DOCKERHUB_IMAGE: saei/capscreen
+  APPTAINER_VERSION: "1.3.6"
 
 jobs:
   build-and-push:
@@ -48,6 +49,7 @@ jobs:
 
           GHCR_IMAGE="${{ env.REGISTRY }}/${OWNER}/capscreen"
           BASE_IMAGE="${{ env.REGISTRY }}/${OWNER}/capscreen-base:latest"
+          SIF_NAME="capscreen-${VERSION}.sif"
           TAGS="${GHCR_IMAGE}:${VERSION},${GHCR_IMAGE}:latest"
           PUSH_DOCKERHUB=false
 
@@ -58,13 +60,17 @@ jobs:
 
           {
             echo "version=${VERSION}"
+            echo "ghcr_image=${GHCR_IMAGE}"
             echo "base_image=${BASE_IMAGE}"
+            echo "sif_name=${SIF_NAME}"
             echo "tags=${TAGS}"
             echo "push_dockerhub=${PUSH_DOCKERHUB}"
           } >> "$GITHUB_OUTPUT"
 
           echo "version=${VERSION}"
+          echo "ghcr_image=${GHCR_IMAGE}"
           echo "base=${BASE_IMAGE}"
+          echo "sif=${SIF_NAME}"
           echo "tags=${TAGS}"
           echo "push_dockerhub=${PUSH_DOCKERHUB}"
 
@@ -94,3 +100,49 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Free disk space for SIF build
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          docker system prune -f || true
+          df -h
+
+      - name: Install Apptainer
+        run: |
+          set -euo pipefail
+          VER="${{ env.APPTAINER_VERSION }}"
+          sudo apt-get update
+          sudo apt-get install -y wget
+          wget -q "https://github.com/apptainer/apptainer/releases/download/v${VER}/apptainer_${VER}_amd64.deb"
+          sudo apt-get install -y "./apptainer_${VER}_amd64.deb"
+          apptainer version
+
+      - name: Pull image and build SIF
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          GHCR_IMAGE: ${{ steps.meta.outputs.ghcr_image }}
+          SIF_NAME: ${{ steps.meta.outputs.sif_name }}
+        run: |
+          set -euo pipefail
+          docker pull "${GHCR_IMAGE}:${VERSION}"
+          apptainer build "${SIF_NAME}" "docker-daemon://${GHCR_IMAGE}:${VERSION}"
+          ls -lh "${SIF_NAME}"
+
+      - name: Upload SIF to GitHub Release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIF_NAME: ${{ steps.meta.outputs.sif_name }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "${TAG_NAME}" "${SIF_NAME}" --clobber
+          echo "Uploaded ${SIF_NAME} to release ${TAG_NAME}"
+
+      - name: Upload SIF workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.sif_name }}
+          path: ${{ steps.meta.outputs.sif_name }}
+          if-no-files-found: error
+          retention-days: 30
