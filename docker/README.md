@@ -5,10 +5,11 @@ CapScreen uses two images:
 | Image | Registry tag | Contents | Rebuild when |
 | --- | --- | --- | --- |
 | Base | `ghcr.io/hassansaei/capscreen-base:latest` (no version) | OS packages, mamba, fastp, conda envs | `conda/*.yml`, system tools, or `docker/DockerFile.base` change |
-| App (final) | `saei/capscreen:<version>` and optionally `:latest` | CapScreen source + CLI | Python/scripts/package change |
+| App (final) | `ghcr.io/hassansaei/capscreen:<version>` (+ `:latest`); also `saei/capscreen` if Docker Hub secrets are set | CapScreen source + CLI | New GitHub Release (automatic) or code change |
 
 The base image is unversioned (`:latest` only) and published to GitHub Packages (GHCR).
 The final app image carries the CapScreen version tag.
+CI builds it from the published base via `.github/workflows/docker-app.yml`.
 
 Ownership is limited to input/output/reference dirs in the base image and to
 `/opt/capscreen` in the app image. Neither image runs `chown -R /opt`.
@@ -42,10 +43,37 @@ CI publishes the base automatically on changes to `conda/**` or
 `docker/DockerFile.base` via `.github/workflows/docker-base.yml`
 (also runnable with **Actions → Publish CapScreen base image → Run workflow**).
 
-## When to rebuild the final (app) image
+## Automatic app image on release
 
-Rebuild the app image when CapScreen code changes (scripts, package, templates),
-or after a new base was published and you want the app to pick it up.
+Publishing a GitHub Release (including pre-releases such as `2.0.0-alpha.2`)
+triggers **Actions → Publish CapScreen app image**. That workflow:
+
+1. Uses `ghcr.io/hassansaei/capscreen-base:latest` as `BASE_IMAGE`
+2. Builds `docker/DockerFile` for `linux/amd64`
+3. Pushes `ghcr.io/hassansaei/capscreen:<tag>` and `:latest`
+
+Optional Docker Hub publish (`saei/capscreen:<tag>` and `:latest`) runs when
+these repository secrets exist:
+
+- `DOCKERHUB_USERNAME`
+- `DOCKERHUB_TOKEN` (access token, not password)
+
+Add them under **Settings → Secrets and variables → Actions**.
+
+You can also run the workflow manually:
+**Actions → Publish CapScreen app image → Run workflow**
+(optionally pass a version; otherwise it reads `capscreen/version.py`).
+
+Release checklist:
+
+1. Push commits that bump `capscreen/version.py` (post-commit hook for alphas)
+2. Create a GitHub Release whose tag matches that version (e.g. `2.0.0-alpha.2`)
+3. Wait for the app image workflow to finish; pull from GHCR (and Docker Hub if configured)
+
+## When to rebuild the final (app) image locally
+
+Rebuild locally when iterating on CapScreen code before a release,
+or after a new base was published and you want to test against it.
 
 ### Local app build (uses published base)
 

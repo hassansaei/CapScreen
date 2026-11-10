@@ -1,0 +1,96 @@
+name: Publish CapScreen app image
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image version tag (leave empty to read capscreen/version.py)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  DOCKERHUB_IMAGE: saei/capscreen
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve version and tags
+        id: meta
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          if [ "$EVENT_NAME" = "release" ]; then
+            VERSION="${RELEASE_TAG#v}"
+          elif [ -n "$INPUT_VERSION" ]; then
+            VERSION="${INPUT_VERSION#v}"
+          else
+            VERSION=$(python -c "import re; t=open('capscreen/version.py').read(); print(re.search(r\"__version__\\s*=\\s*['\\\"]([^'\\\"]+)['\\\"]\", t).group(1))")
+          fi
+
+          GHCR_IMAGE="${{ env.REGISTRY }}/${OWNER}/capscreen"
+          BASE_IMAGE="${{ env.REGISTRY }}/${OWNER}/capscreen-base:latest"
+          TAGS="${GHCR_IMAGE}:${VERSION},${GHCR_IMAGE}:latest"
+          PUSH_DOCKERHUB=false
+
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+            TAGS="${TAGS},${{ env.DOCKERHUB_IMAGE }}:${VERSION},${{ env.DOCKERHUB_IMAGE }}:latest"
+            PUSH_DOCKERHUB=true
+          fi
+
+          {
+            echo "version=${VERSION}"
+            echo "base_image=${BASE_IMAGE}"
+            echo "tags=${TAGS}"
+            echo "push_dockerhub=${PUSH_DOCKERHUB}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "version=${VERSION}"
+          echo "base=${BASE_IMAGE}"
+          echo "tags=${TAGS}"
+          echo "push_dockerhub=${PUSH_DOCKERHUB}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: steps.meta.outputs.push_dockerhub == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push app image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/DockerFile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            BASE_IMAGE=${{ steps.meta.outputs.base_image }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
