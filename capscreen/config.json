@@ -2,10 +2,28 @@
     "config_path": "/opt/capscreen/capscreen/config.json",
     "threads": 4,
     "log_level": "INFO",
+    "assay_mode": "vp-seq",
     "reference": {
         "genome": "/opt/capscreen/reference/reference_aav2",
         "index_basename": "/opt/capscreen/reference/reference_aav2",
         "library": "/opt/capscreen/reference/library.csv"
+    },
+    "barcode_seq": {
+        "flanking_sequences": {
+            "flank_5p": "GGTCGGTGCATAGTAGTGCTC",
+            "flank_3p": "CAGGGTCACCGTTAGGATTG",
+            "max_mismatches": 2,
+            "primer_n": 1,
+            "max_variable_nt": 15,
+            "description": "Constant flanks around a 15-nt AAV barcode. The barcode is the DNA between flank_5p and flank_3p."
+        },
+        "reference": {
+            "genome": "/opt/capscreen/reference/barcodes",
+            "index_basename": "/opt/capscreen/reference/barcodes",
+            "fasta": "/opt/capscreen/reference/barcodes.fasta",
+            "library": "/opt/capscreen/reference/barcode_library.csv",
+            "description": "Single amplicon FASTA like VP-seq: one sequence with flank_5p + 15 Ns + flank_3p. Build indexes with bowtie2-build barcodes.fasta barcodes (Bowtie2 tolerates Ns in the middle). genome/index_basename is the -x prefix. library CSV columns: ID_WLG,barcode."
+        }
     },
     "fastp": {
         "compression": 6,

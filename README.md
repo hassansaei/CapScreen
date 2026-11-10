@@ -104,7 +104,35 @@ Pull a published app image instead of building:
 docker pull saei/capscreen:latest
 ```
 
-### 2. **Running the Pipeline**
+### 2. **Assay modes (VP-seq vs barcode-seq)**
+
+Choose the analysis path with a mutually exclusive flag (default: `--vp-seq`):
+
+| Flag | QC | Alignment | Counting | Stats |
+| --- | --- | --- | --- | --- |
+| `--vp-seq` | FASTP + PEAR | Bowtie2 to VP/amplicon genome | Translate insert → peptides; match `ID_WLG,peptide` library | Same (`ID_WLG`) |
+| `--barcode-seq` | FASTP + PEAR | Bowtie2 to **barcode FASTA index** | DNA barcode between flanks; match `ID_WLG,barcode` library | Same (`ID_WLG`) |
+
+Barcode-seq uses `barcode_seq` in `config.json` for flanks and reference paths.
+Provide **one** amplicon FASTA like VP-seq (`flank_5p` + **15 Ns** + `flank_3p`);
+Bowtie2 tolerates the Ns. Then build indexes:
+
+```bash
+bowtie2-build reference/barcodes.fasta reference/barcodes
+```
+
+Point `barcode_seq.reference.genome` / `index_basename` at that prefix
+(`barcodes.1.bt2`, …). Library CSV still lists real barcodes as
+`ID_WLG,barcode`. Reference FASTA: `reference/barcodes.fasta`.
+Library example: `reference/barcode_library.csv.example`.
+
+```bash
+capscreen pipeline --barcode-seq \
+  --reference-file /opt/capscreen/reference/barcode_library.csv \
+  ...
+```
+
+### 3. **Running the Pipeline**
 
 #### Single Sample Mode
 
@@ -212,7 +240,7 @@ The `--stat` flag runs statistical analysis after creating the merged counts tab
 
 The *reference_library.csv* is a user-specific file containing information about the variant IDs and peptide sequences of the input AAV library.
 
-### 3. **Pipeline Subcommands**
+### 4. **Pipeline Subcommands**
 
 - `pipeline`: Runs the full pipeline (QC, alignment, and counting). Supports both single sample and batch modes.
 - `align`: Runs only QC and alignment steps.

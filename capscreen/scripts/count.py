@@ -364,6 +364,10 @@ def process_sam_file(sam_file: Path, config: Dict, n_threads: Optional[int] = No
     Process SAM file and extract variable regions using memory-efficient chunked processing.
     
     Uses temporary Parquet files to avoid loading all data into memory at once.
+
+    When config['assay_mode'] is 'barcode-seq', the insert between flanks is kept as
+    DNA (no translation). The output still uses a 'peptide' column so merge/stat
+    stay compatible; for barcode-seq that column holds the barcode DNA sequence.
     
     Args:
         sam_file (Path): Path to SAM file
@@ -376,9 +380,17 @@ def process_sam_file(sam_file: Path, config: Dict, n_threads: Optional[int] = No
             - DataFrame with processed sequences
             - Dictionary with processing statistics
     """
+    assay_mode = str(config.get("assay_mode", "vp-seq")).strip().lower().replace("_", "-")
+    is_barcode = assay_mode == "barcode-seq"
     flank_5p, flank_3p, max_mm, primer_n, max_variable_nt = _flank_params(config)
     flank_counters = _new_flank_counters(max_mm)
     if logger:
+        feature_label = "barcode DNA" if is_barcode else "peptide (translated)"
+        logger.info(
+            "Assay mode: %s; feature: %s",
+            assay_mode,
+            feature_label,
+        )
         logger.info(
             "Variable-region extraction: 5' and 3' flanks allow up to %s mismatches; "
             "primer_n=%s (Illumina R1/R2 N spacer); leftover flanks trimmed above %s nt",
@@ -493,10 +505,16 @@ def process_sam_file(sam_file: Path, config: Dict, n_threads: Optional[int] = No
                     continue
                 _record_flank_info(flank_counters, flank_info, found=True)
                 reads_with_flanks += 1
-                
-                peptide = translate(variable_seq)
-                if peptide is None:
-                    continue
+
+                if is_barcode:
+                    # DNA barcode between flanks; stored in peptide for downstream compatibility
+                    peptide = variable_seq
+                    if not peptide:
+                        continue
+                else:
+                    peptide = translate(variable_seq)
+                    if peptide is None:
+                        continue
                 valid_peptides += 1
                 
                 cigar_stats = parse_cigar(parts[5])
@@ -748,42 +766,62 @@ def _combine_chunks_sequential(chunk_files: List[Path], logger: Optional[logging
     return df
 
 
-def merge_with_reference(df: pd.DataFrame, reference_file: Path) -> Tuple[pd.DataFrame, Dict[str, int]]:
+def merge_with_reference(
+    df: pd.DataFrame,
+    reference_file: Path,
+    assay_mode: str = "vp-seq",
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
     """
     Merge processed reads with reference library.
+
+    VP-seq libraries use columns ID_WLG,peptide.
+    Barcode-seq libraries use ID_WLG,barcode (barcode DNA); barcode is renamed
+    to peptide for a shared merge key with count tables and statistical_analysis.
     
     Args:
         df (pd.DataFrame): DataFrame with processed reads
         reference_file (Path): Path to reference library file
+        assay_mode (str): 'vp-seq' or 'barcode-seq'
         
     Returns:
         Tuple[pd.DataFrame, Dict[str, int]]: 
             - Merged DataFrame
             - Dictionary with merging statistics
     """
-    # Read reference file and keep only essential columns.
-    # Deduplicate by peptide so that a many-to-many merge does not inflate
-    # downstream counts when the reference maps multiple ID_WLG to one peptide.
-    ref_df = pd.read_csv(reference_file)[['peptide', 'ID_WLG']].drop_duplicates(subset=['peptide'], keep='first')
+    mode = str(assay_mode).strip().lower().replace("_", "-")
+    ref_raw = pd.read_csv(reference_file)
+    if mode == "barcode-seq":
+        if "barcode" in ref_raw.columns:
+            ref_raw = ref_raw.rename(columns={"barcode": "peptide"})
+        elif "peptide" not in ref_raw.columns:
+            raise ValueError(
+                "Barcode library CSV must contain columns ID_WLG and barcode "
+                f"(or peptide). Found: {list(ref_raw.columns)}"
+            )
+    elif "peptide" not in ref_raw.columns:
+        raise ValueError(
+            "VP-seq library CSV must contain columns ID_WLG and peptide. "
+            f"Found: {list(ref_raw.columns)}"
+        )
+
+    # Deduplicate by peptide/barcode so a many-to-many merge does not inflate counts.
+    ref_df = ref_raw[['peptide', 'ID_WLG']].drop_duplicates(subset=['peptide'], keep='first')
     
-    # Get unique peptides before merging
     unique_peptides = df['peptide'].nunique()
     
-    # Merge on peptide sequence (now guaranteed one-to-many: one ref row per peptide)
+    # Merge on peptide sequence (barcode DNA when assay_mode is barcode-seq)
     df_merged = pd.merge(df, ref_df, on='peptide', how='left')
     
-    # Calculate statistics
     unique_peptides_in_ref = ref_df['peptide'].nunique()
-    # Get unique peptides that were found in both (peptides that matched reference)
     unique_peptides_found_in_both = df_merged[df_merged['ID_WLG'].notna()]['peptide'].nunique()
-    # Calculate peptides in reference but not in input
     peptides_in_ref_not_in_input = unique_peptides_in_ref - unique_peptides_found_in_both
     peptides_in_ref_not_in_input_pct = (peptides_in_ref_not_in_input / unique_peptides_in_ref * 100) if unique_peptides_in_ref > 0 else 0.0
     
     stats = {
         'unique_peptides_in_ref': unique_peptides_in_ref,
         'peptides_in_ref_not_in_input': peptides_in_ref_not_in_input,
-        'peptides_in_ref_not_in_input_pct': peptides_in_ref_not_in_input_pct
+        'peptides_in_ref_not_in_input_pct': peptides_in_ref_not_in_input_pct,
+        'feature_name': 'barcode' if mode == 'barcode-seq' else 'peptide',
     }
     
     return df_merged, stats
@@ -849,7 +887,9 @@ def main(
             if n_threads is not None:
                 logger.info(f"Using threads from config file: {n_threads}")
         
-        logger.info(f"Starting variant counting for sample: {sample_name}")
+        assay_mode = str(config.get("assay_mode", "vp-seq")).strip().lower().replace("_", "-")
+        feature_label = "barcodes" if assay_mode == "barcode-seq" else "peptides"
+        logger.info(f"Starting variant counting for sample: {sample_name} (assay={assay_mode})")
         logger.info(f"Input SAM file: {sam_file}")
         logger.info(f"Reference library: {reference_file}")
         logger.info(f"Output file: {output_file}")
@@ -865,7 +905,16 @@ def main(
         logger.info(f"Mapped reads: {sam_stats['mapped_reads']:,} ({sam_stats['mapping_rate']:.2%})")
         logger.info(f"Unmapped reads: {sam_stats['unmapped_reads']:,}")
         logger.info(f"Reads with flanking sequences: {sam_stats['reads_with_flanks']:,} ({sam_stats['flank_detection_rate']:.2%})")
-        logger.info(f"Valid peptides after translation: {sam_stats['valid_peptides']:,} ({sam_stats['translation_success_rate']:.2%})")
+        if assay_mode == "barcode-seq":
+            logger.info(
+                f"Valid barcodes extracted: {sam_stats['valid_peptides']:,} "
+                f"({sam_stats['translation_success_rate']:.2%})"
+            )
+        else:
+            logger.info(
+                f"Valid peptides after translation: {sam_stats['valid_peptides']:,} "
+                f"({sam_stats['translation_success_rate']:.2%})"
+            )
         _log_flank_stats(
             logger,
             sam_stats['flank_counters'],
@@ -875,7 +924,7 @@ def main(
         )
         
         logger.info("Step 2/4: Merging reads with reference library...")
-        df_merged, merge_stats = merge_with_reference(df, reference_file)
+        df_merged, merge_stats = merge_with_reference(df, reference_file, assay_mode=assay_mode)
         logger.info("Step 2/4 complete.")
 
         # Ensure all unassigned ID_WLG are labeled as 'Unassigned'
@@ -883,8 +932,12 @@ def main(
         
         # Log merging statistics
         logger.info("\nReference Library Merging Statistics:")
-        logger.info(f"Unique peptides in reference: {merge_stats['unique_peptides_in_ref']:,}")
-        logger.info(f"Peptides in reference but not in input: {merge_stats['peptides_in_ref_not_in_input']:,} ({merge_stats['peptides_in_ref_not_in_input_pct']:.2f}%)")
+        logger.info(f"Unique {feature_label} in reference: {merge_stats['unique_peptides_in_ref']:,}")
+        logger.info(
+            f"{feature_label.capitalize()} in reference but not in input: "
+            f"{merge_stats['peptides_in_ref_not_in_input']:,} "
+            f"({merge_stats['peptides_in_ref_not_in_input_pct']:.2f}%)"
+        )
         
         logger.info("Step 3/4: Calculating counts and abundance metrics...")
         # Use mapped_reads for RPM normalization (not total_reads including unmapped)

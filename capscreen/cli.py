@@ -16,6 +16,7 @@ from capscreen.version import __version__
 from capscreen.scripts import count as count_module
 from capscreen.scripts import generate_report as generate_report_module
 from capscreen.scripts import alignment as alignment_module
+from capscreen.scripts import barcode_seq as barcode_seq_module
 from capscreen.scripts import qc as qc_module
 # stat_module imported conditionally - may use separate conda environment
 try:
@@ -697,12 +698,33 @@ def execute_full_pipeline(
     threads: Optional[int],
     keep_intermediate: bool,
     log_file: Optional[Path],
-    cut_umi: bool = False
+    cut_umi: bool = False,
+    assay_mode: str = "vp-seq",
 ) -> bool:
     """
     Run the complete pipeline (QC, alignment, counting, reporting) for a single sample.
     Skips alignment step if SAM file already exists.
+
+    assay_mode:
+      - vp-seq: align to VP/amplicon genome; translate inserts to peptides
+      - barcode-seq: align to barcode reference; count DNA barcodes/IDs
     """
+    try:
+        assay_mode = barcode_seq_module.normalize_assay_mode(assay_mode)
+        assay_config = barcode_seq_module.resolve_assay_config(config, assay_mode)
+    except ValueError as exc:
+        logger.error("Invalid assay configuration: %s", exc)
+        return False
+
+    flanks = assay_config.get("flanking_sequences") or {}
+    ref = assay_config.get("reference") or {}
+    logger.info("Running CapScreen pipeline in %s mode for sample %s", assay_mode, sample_name)
+    logger.info(
+        "Assay reference genome (Bowtie2 -x): %s; library flanks 5'=%s 3'=%s",
+        ref.get("genome"),
+        flanks.get("flank_5p"),
+        flanks.get("flank_3p"),
+    )
     sample_dir = output_dir / sample_name
     sorted_sam = sample_dir / f"{sample_name}.sorted.sam"
     
@@ -714,16 +736,26 @@ def execute_full_pipeline(
             sorted_sam
         )
     else:
-        # Run QC and alignment steps
-        sorted_sam = alignment_module.run_qc_and_alignment(
-            fastq1,
-            fastq2,
-            output_dir,
-            sample_name,
-            config,
-            threads,
-            cut_umi=cut_umi,
-        )
+        if assay_mode == barcode_seq_module.ASSAY_BARCODE_SEQ:
+            sorted_sam = barcode_seq_module.run_qc_and_alignment(
+                fastq1,
+                fastq2,
+                output_dir,
+                sample_name,
+                assay_config,
+                threads,
+                cut_umi=cut_umi,
+            )
+        else:
+            sorted_sam = alignment_module.run_qc_and_alignment(
+                fastq1,
+                fastq2,
+                output_dir,
+                sample_name,
+                assay_config,
+                threads,
+                cut_umi=cut_umi,
+            )
         if not sorted_sam:
             logger.error(f"QC/Alignment failed for sample {sample_name}.")
             return False
@@ -732,18 +764,29 @@ def execute_full_pipeline(
     
     # Use threads from parameter if provided, otherwise use config value
     # count_module.main will handle config fallback if n_threads is None
-    n_threads = threads if threads is not None else config.get('threads')
+    n_threads = threads if threads is not None else assay_config.get('threads')
     
     try:
-        count_module.main(
-            sorted_sam,
-            reference_file,
-            config,
-            output_file,
-            log_file=log_file,
-            logger=logger,
-            n_threads=n_threads
-        )
+        if assay_mode == barcode_seq_module.ASSAY_BARCODE_SEQ:
+            barcode_seq_module.run_count(
+                sorted_sam,
+                reference_file,
+                assay_config,
+                output_file,
+                log_file=log_file,
+                logger_instance=logger,
+                n_threads=n_threads,
+            )
+        else:
+            count_module.main(
+                sorted_sam,
+                reference_file,
+                assay_config,
+                output_file,
+                log_file=log_file,
+                logger=logger,
+                n_threads=n_threads
+            )
     except Exception as e:
         logger.error(f"Counting failed for sample {sample_name}: {e}")
         return False
@@ -784,7 +827,15 @@ def main():
     pipeline_parser.add_argument("--fastq2", type=Path, required=False, help="Path to second FASTQ file")
     pipeline_parser.add_argument("--sample-info", type=Path, required=False, help="CSV file describing multiple samples to process")
     pipeline_parser.add_argument("--merged-counts-output", type=Path, help="Path to write merged counts table when using --sample-info")
-    pipeline_parser.add_argument("--reference-file", type=Path, required=True, help="Path to reference library file (CSV)")
+    pipeline_parser.add_argument(
+        "--reference-file",
+        type=Path,
+        required=True,
+        help=(
+            "Reference library CSV. VP-seq: columns ID_WLG,peptide. "
+            "Barcode-seq: columns ID_WLG,barcode."
+        ),
+    )
     pipeline_parser.add_argument("--keep_intermediate", action="store_true", help="Keep intermediate FASTQ files (default: remove)")
     pipeline_parser.add_argument(
         "--cut-umi",
@@ -794,6 +845,25 @@ def main():
             "between configured flanking sequences and re-attach the flanks before alignment."
         ),
     )
+    assay_group = pipeline_parser.add_mutually_exclusive_group()
+    assay_group.add_argument(
+        "--vp-seq",
+        dest="assay_mode",
+        action="store_const",
+        const="vp-seq",
+        help="VP-seq path: align to VP/amplicon genome and count peptides.",
+    )
+    assay_group.add_argument(
+        "--barcode-seq",
+        dest="assay_mode",
+        action="store_const",
+        const="barcode-seq",
+        help=(
+            "Barcode-seq path: align to barcode Bowtie2 index and count DNA barcodes/IDs. "
+            "Uses barcode_seq flanks and reference from config.json."
+        ),
+    )
+    pipeline_parser.set_defaults(assay_mode=None)
     pipeline_parser.add_argument(
         "--stat",
         action="store_true",
@@ -812,13 +882,52 @@ def main():
             "between configured flanking sequences and re-attach the flanks before alignment."
         ),
     )
+    align_assay = align_parser.add_mutually_exclusive_group()
+    align_assay.add_argument(
+        "--vp-seq",
+        dest="assay_mode",
+        action="store_const",
+        const="vp-seq",
+        help="VP-seq alignment against the VP/amplicon genome.",
+    )
+    align_assay.add_argument(
+        "--barcode-seq",
+        dest="assay_mode",
+        action="store_const",
+        const="barcode-seq",
+        help="Barcode-seq alignment against the barcode Bowtie2 reference in config.",
+    )
+    align_parser.set_defaults(assay_mode=None)
 
     # count: only counting
     count_parser = subparsers.add_parser("count", parents=[parent_parser], help="Run variant counting only")
     count_parser.add_argument("--sam-file", type=Path, required=True, help="Path to sorted SAM file")
-    count_parser.add_argument("--reference-file", type=Path, required=True, help="Path to reference library file (CSV)")
+    count_parser.add_argument(
+        "--reference-file",
+        type=Path,
+        required=True,
+        help=(
+            "Reference library CSV. VP-seq: ID_WLG,peptide. "
+            "Barcode-seq: ID_WLG,barcode."
+        ),
+    )
     count_parser.add_argument("--output", type=Path, help="Path to output file (CSV)")
-
+    count_assay = count_parser.add_mutually_exclusive_group()
+    count_assay.add_argument(
+        "--vp-seq",
+        dest="assay_mode",
+        action="store_const",
+        const="vp-seq",
+        help="Count peptides (translate inserts).",
+    )
+    count_assay.add_argument(
+        "--barcode-seq",
+        dest="assay_mode",
+        action="store_const",
+        const="barcode-seq",
+        help="Count DNA barcodes (no translation; library columns ID_WLG,barcode).",
+    )
+    count_parser.set_defaults(assay_mode=None)
     # report: HTML report only
     report_parser = subparsers.add_parser("report", parents=[parent_parser], help="Generate HTML report from an existing sample directory")
     report_parser.add_argument("--output", type=Path, help="Output HTML file name (defaults to <sample>_report.html)")
@@ -872,6 +981,19 @@ def main():
                 pipeline_parser.error(f"{missing_str} must be provided when --sample-info is not used.")
 
     json_config = load_config(args.config)
+
+    # CLI flags win; otherwise use config assay_mode (default vp-seq).
+    if getattr(args, "assay_mode", None) is None and args.command in {
+        "pipeline",
+        "align",
+        "count",
+    }:
+        args.assay_mode = json_config.get("assay_mode", "vp-seq")
+    if getattr(args, "assay_mode", None) is not None:
+        try:
+            args.assay_mode = barcode_seq_module.normalize_assay_mode(args.assay_mode)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     # Set up unified log file path
     batch_log_path: Optional[Path] = None
@@ -951,6 +1073,7 @@ def main():
                         keep_intermediate,
                         sample_log_file,
                         cut_umi=getattr(args, "cut_umi", False),
+                        assay_mode=getattr(args, "assay_mode", "vp-seq"),
                     )
                 append_sample_log_to_batch(batch_log_path, sample_log_file, entry.sample_id)
                 if not success:
@@ -1069,18 +1192,38 @@ def main():
                 keep_intermediate,
                 log_file,
                 cut_umi=getattr(args, "cut_umi", False),
+                assay_mode=getattr(args, "assay_mode", "vp-seq"),
             )
             sys.exit(0 if success else 1)
     elif args.command == "align":
-        sorted_sam = alignment_module.run_qc_and_alignment(
-            args.fastq1,
-            args.fastq2,
-            args.output_dir,
-            args.sample_name,
-            json_config,
-            args.threads,
-            cut_umi=getattr(args, "cut_umi", False),
-        )
+        try:
+            assay_mode = barcode_seq_module.normalize_assay_mode(
+                getattr(args, "assay_mode", "vp-seq")
+            )
+            assay_config = barcode_seq_module.resolve_assay_config(json_config, assay_mode)
+        except ValueError as exc:
+            logger.error("Invalid assay configuration: %s", exc)
+            sys.exit(1)
+        if assay_mode == barcode_seq_module.ASSAY_BARCODE_SEQ:
+            sorted_sam = barcode_seq_module.run_qc_and_alignment(
+                args.fastq1,
+                args.fastq2,
+                args.output_dir,
+                args.sample_name,
+                assay_config,
+                args.threads,
+                cut_umi=getattr(args, "cut_umi", False),
+            )
+        else:
+            sorted_sam = alignment_module.run_qc_and_alignment(
+                args.fastq1,
+                args.fastq2,
+                args.output_dir,
+                args.sample_name,
+                assay_config,
+                args.threads,
+                cut_umi=getattr(args, "cut_umi", False),
+            )
         if not sorted_sam:
             logger.error("QC/Alignment failed.")
             sys.exit(1)
@@ -1092,15 +1235,30 @@ def main():
         # Use --threads if provided, otherwise use config value (count_module.main will handle config fallback)
         n_threads = args.threads if args.threads is not None else json_config.get('threads')
         try:
-            count_module.main(
-                args.sam_file,
-                args.reference_file,
-                json_config,
-                output_file,
-                log_file=log_file,
-                logger=logger,
-                n_threads=n_threads
+            assay_mode = barcode_seq_module.normalize_assay_mode(
+                getattr(args, "assay_mode", "vp-seq")
             )
+            assay_config = barcode_seq_module.resolve_assay_config(json_config, assay_mode)
+            if assay_mode == barcode_seq_module.ASSAY_BARCODE_SEQ:
+                barcode_seq_module.run_count(
+                    args.sam_file,
+                    args.reference_file,
+                    assay_config,
+                    output_file,
+                    log_file=log_file,
+                    logger_instance=logger,
+                    n_threads=n_threads,
+                )
+            else:
+                count_module.main(
+                    args.sam_file,
+                    args.reference_file,
+                    assay_config,
+                    output_file,
+                    log_file=log_file,
+                    logger=logger,
+                    n_threads=n_threads
+                )
         except Exception as e:
             logger.error(f"Counting failed: {e}")
             sys.exit(1)
