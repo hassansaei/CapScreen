@@ -66,15 +66,42 @@ The CapScreen pipeline consists of the following steps:
 
 ### 1. **Installation (Docker Recommended)**
 
-Build the Docker image from the project root:
+CapScreen uses two Docker images:
+
+| Image | Tag | Rebuild when |
+| --- | --- | --- |
+| Base (`ghcr.io/hassansaei/capscreen-base`) | `:latest` only (no version) | `conda/*.yml`, system tools, or `docker/DockerFile.base` change |
+| App / final (`saei/capscreen`) | CapScreen version (e.g. `:2.0.0-alpha.1`) and optionally `:latest` | CapScreen Python/scripts/package change |
+
+The base holds OS packages and the two Conda environments (`capscreen`, `capscreen-stat`).
+The final image copies CapScreen source on top of that base. Full rebuild commands live in
+[`docker/README.md`](docker/README.md).
+
+**Rebuild the base** (infrequent; heavy):
 
 ```bash
-docker build -f docker/DockerFile -t capscreen .
+docker build --platform linux/amd64 \
+  -t ghcr.io/hassansaei/capscreen-base:latest \
+  -f docker/DockerFile.base .
+# then: docker push ghcr.io/hassansaei/capscreen-base:latest
 ```
 
-The Docker image includes two Conda environments:
-- `capscreen`: Main pipeline environment (Python 3.7) for QC, alignment, and counting
-- `capscreen-stat`: Statistical analysis environment (Python 3.9+) for DESeq2 and statistical analysis
+**Rebuild the final app image** (usual path after code changes):
+
+```bash
+VERSION=$(python -c "import re; t=open('capscreen/version.py').read(); print(re.search(r\"__version__\\s*=\\s*['\\\"]([^'\\\"]+)['\\\"]\", t).group(1))")
+
+docker build --platform linux/amd64 \
+  -t saei/capscreen:${VERSION} \
+  -t saei/capscreen:latest \
+  -f docker/DockerFile .
+```
+
+Pull a published app image instead of building:
+
+```bash
+docker pull saei/capscreen:latest
+```
 
 ### 2. **Running the Pipeline**
 

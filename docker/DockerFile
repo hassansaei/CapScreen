@@ -1,77 +1,18 @@
-# Use a specific Miniforge3 version for reproducibility
-FROM condaforge/miniforge3:24.11.3-0
+# CapScreen application image.
+# Rebuild when CapScreen scripts/package change; reuse the base image.
+# Tag the final image with CapScreen version, e.g. saei/capscreen:2.0.0-alpha.1
+ARG BASE_IMAGE=ghcr.io/hassansaei/capscreen-base:latest
+FROM ${BASE_IMAGE}
 
-# Set environment variables
-ENV DEBIAN_FRONTEND=noninteractive \
-    CONDA_AUTO_UPDATE_CONDA=FALSE \
-    PATH=/opt/conda/envs/capscreen/bin:/opt/conda/envs/capscreen/bin:/opt/tools:$PATH \
-    DEFAULT_INPUT_DIR=/opt/capscreen/input/ \
-    DEFAULT_OUTPUT_DIR=/opt/capscreen/output/ \
-    DEFAULT_REFERENCE_DIR=/opt/capscreen/reference/
-
-# Update and install necessary system packages in a single RUN command to reduce layers
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        build-essential \
-        git \
-        wget \
-        unzip \
-        zip \
-        curl \
-        samtools \
-        pigz \
-        && rm -rf /var/lib/apt/lists/*
-
-# Install mamba for faster conda package installation
-RUN conda install -y mamba -n base -c conda-forge
-
-# Create tools directory and install fastp
-RUN mkdir -p /opt/tools && \
-    cd /opt/tools && \
-    wget http://opengene.org/fastp/fastp && \
-    chmod a+x ./fastp
-
-# Copy conda environment files
-COPY conda/capscreen.yml /tmp/capscreen.yml
-COPY conda/capscreen-stat.yml /tmp/capscreen-stat.yml
-
-# Create and install conda environments
-# Main environment for pipeline (Python 3.7)
-RUN mamba env create -f /tmp/capscreen.yml && \
-    rm /tmp/capscreen.yml
-
-# Statistical analysis environment (Python 3.9+ for pydeseq2)
-RUN mamba env create -f /tmp/capscreen-stat.yml && \
-    rm /tmp/capscreen-stat.yml && \
-    conda clean -afy 
-
-# Copy capscreen package
-COPY . /opt/capscreen/
-
-# Set up default input, output, and reference directories
-RUN mkdir -p $DEFAULT_INPUT_DIR $DEFAULT_OUTPUT_DIR $DEFAULT_REFERENCE_DIR
-
-# Install capscreen package in main environment
-WORKDIR /opt/capscreen
-RUN /opt/conda/envs/capscreen/bin/pip install -e .
-
-# Install capscreen package in stat environment (needed to import stat module)
-RUN /opt/conda/envs/capscreen-stat/bin/pip install -e .
-
-# Allow dynamic UID and GID as build arguments
 ARG USERNAME=appuser
-ARG USER_UID=1001
-ARG USER_GID=1001
 
-# Create a group and user with the specified UID and GID
-RUN groupadd --gid $USER_GID $USERNAME && \
-    useradd --uid $USER_UID --gid $USER_GID --shell /bin/bash --create-home $USERNAME
+USER root
+COPY . /opt/capscreen/
+WORKDIR /opt/capscreen
 
-# Set ownership of directories and app to appuser
-RUN chown -R $USERNAME:$USERNAME $DEFAULT_INPUT_DIR $DEFAULT_OUTPUT_DIR /opt/capscreen/ /opt
+RUN /opt/conda/envs/capscreen/bin/pip install --no-cache-dir -e . && \
+    /opt/conda/envs/capscreen-stat/bin/pip install --no-cache-dir -e . && \
+    chown -R $USERNAME:$USERNAME /opt/capscreen
 
-# Switch to a non-root user
 USER $USERNAME
-
-# Set the entry point to the CapScreen CLI
 ENTRYPOINT ["capscreen"]

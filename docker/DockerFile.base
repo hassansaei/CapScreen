@@ -1,0 +1,57 @@
+# CapScreen base image: OS tools + conda environments.
+# Rebuild only when conda/*.yml, system packages, or this file change.
+# Publish unversioned as: ghcr.io/<owner>/capscreen-base:latest
+FROM condaforge/miniforge3:24.11.3-0
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CONDA_AUTO_UPDATE_CONDA=FALSE \
+    PATH=/opt/conda/envs/capscreen/bin:/opt/tools:$PATH \
+    DEFAULT_INPUT_DIR=/opt/capscreen/input/ \
+    DEFAULT_OUTPUT_DIR=/opt/capscreen/output/ \
+    DEFAULT_REFERENCE_DIR=/opt/capscreen/reference/
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        git \
+        wget \
+        unzip \
+        zip \
+        curl \
+        samtools \
+        pigz \
+        && rm -rf /var/lib/apt/lists/*
+
+RUN conda install -y mamba -n base -c conda-forge && \
+    conda clean -afy
+
+RUN mkdir -p /opt/tools && \
+    cd /opt/tools && \
+    wget http://opengene.org/fastp/fastp && \
+    chmod a+x ./fastp
+
+COPY conda/capscreen.yml /tmp/capscreen.yml
+COPY conda/capscreen-stat.yml /tmp/capscreen-stat.yml
+
+RUN mamba env create -f /tmp/capscreen.yml && \
+    rm /tmp/capscreen.yml
+
+RUN mamba env create -f /tmp/capscreen-stat.yml && \
+    rm /tmp/capscreen-stat.yml && \
+    conda clean -afy
+
+ARG USERNAME=appuser
+ARG USER_UID=1001
+ARG USER_GID=1001
+
+RUN groupadd --gid $USER_GID $USERNAME && \
+    useradd --uid $USER_UID --gid $USER_GID --shell /bin/bash --create-home $USERNAME && \
+    mkdir -p $DEFAULT_INPUT_DIR $DEFAULT_OUTPUT_DIR $DEFAULT_REFERENCE_DIR && \
+    chown -R $USERNAME:$USERNAME \
+        $DEFAULT_INPUT_DIR \
+        $DEFAULT_OUTPUT_DIR \
+        $DEFAULT_REFERENCE_DIR \
+        /home/$USERNAME
+
+WORKDIR /opt/capscreen
+USER $USERNAME
