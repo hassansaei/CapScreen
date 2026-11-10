@@ -130,13 +130,27 @@ jobs:
           ls -lh "${SIF_NAME}"
 
       - name: Upload SIF to GitHub Release
-        if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SIF_NAME: ${{ steps.meta.outputs.sif_name }}
-          TAG_NAME: ${{ github.event.release.tag_name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
+          if [ "$EVENT_NAME" = "release" ]; then
+            TAG_NAME="$RELEASE_TAG"
+          else
+            # Manual re-runs: attach to v<version> or <version> if that release exists.
+            if gh release view "v${VERSION}" >/dev/null 2>&1; then
+              TAG_NAME="v${VERSION}"
+            elif gh release view "${VERSION}" >/dev/null 2>&1; then
+              TAG_NAME="${VERSION}"
+            else
+              echo "No GitHub Release found for ${VERSION}; skipping release upload."
+              exit 0
+            fi
+          fi
           gh release upload "${TAG_NAME}" "${SIF_NAME}" --clobber
           echo "Uploaded ${SIF_NAME} to release ${TAG_NAME}"
 
