@@ -52,6 +52,13 @@ DEFAULT_PRIMER_N = 1
 DEFAULT_MAX_VARIABLE_NT = 120
 
 
+def normalize_id_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename legacy ID_WLG column to ID when present."""
+    if "ID" not in df.columns and "ID_WLG" in df.columns:
+        return df.rename(columns={"ID_WLG": "ID"})
+    return df
+
+
 def _flank_params(config: Dict) -> Tuple[str, str, int, int, int]:
     """Return flank sequences and matching parameters from config."""
     fs = config['flanking_sequences']
@@ -774,8 +781,8 @@ def merge_with_reference(
     """
     Merge processed reads with reference library.
 
-    VP-seq libraries use columns ID_WLG,peptide.
-    Barcode-seq libraries use ID_WLG,barcode (barcode DNA); barcode is renamed
+    VP-seq libraries use columns ID,peptide.
+    Barcode-seq libraries use ID,barcode (barcode DNA); barcode is renamed
     to peptide for a shared merge key with count tables and statistical_analysis.
     
     Args:
@@ -789,23 +796,28 @@ def merge_with_reference(
             - Dictionary with merging statistics
     """
     mode = str(assay_mode).strip().lower().replace("_", "-")
-    ref_raw = pd.read_csv(reference_file)
+    ref_raw = normalize_id_column(pd.read_csv(reference_file))
+    if "ID" not in ref_raw.columns:
+        raise ValueError(
+            "Library CSV must contain an ID column "
+            f"(legacy ID_WLG is accepted). Found: {list(ref_raw.columns)}"
+        )
     if mode == "barcode-seq":
         if "barcode" in ref_raw.columns:
             ref_raw = ref_raw.rename(columns={"barcode": "peptide"})
         elif "peptide" not in ref_raw.columns:
             raise ValueError(
-                "Barcode library CSV must contain columns ID_WLG and barcode "
+                "Barcode library CSV must contain columns ID and barcode "
                 f"(or peptide). Found: {list(ref_raw.columns)}"
             )
     elif "peptide" not in ref_raw.columns:
         raise ValueError(
-            "VP-seq library CSV must contain columns ID_WLG and peptide. "
+            "VP-seq library CSV must contain columns ID and peptide. "
             f"Found: {list(ref_raw.columns)}"
         )
 
     # Deduplicate by peptide/barcode so a many-to-many merge does not inflate counts.
-    ref_df = ref_raw[['peptide', 'ID_WLG']].drop_duplicates(subset=['peptide'], keep='first')
+    ref_df = ref_raw[['peptide', 'ID']].drop_duplicates(subset=['peptide'], keep='first')
     
     unique_peptides = df['peptide'].nunique()
     
@@ -813,7 +825,7 @@ def merge_with_reference(
     df_merged = pd.merge(df, ref_df, on='peptide', how='left')
     
     unique_peptides_in_ref = ref_df['peptide'].nunique()
-    unique_peptides_found_in_both = df_merged[df_merged['ID_WLG'].notna()]['peptide'].nunique()
+    unique_peptides_found_in_both = df_merged[df_merged['ID'].notna()]['peptide'].nunique()
     peptides_in_ref_not_in_input = unique_peptides_in_ref - unique_peptides_found_in_both
     peptides_in_ref_not_in_input_pct = (peptides_in_ref_not_in_input / unique_peptides_in_ref * 100) if unique_peptides_in_ref > 0 else 0.0
     
@@ -834,11 +846,11 @@ def calculate_counts(df: pd.DataFrame, mapped_reads: int) -> Tuple[pd.DataFrame,
     df['log2_RPM'] = np.log2(df['RPM'] + 1)
 
     # Reorder columns as desired
-    df_out = df[['ID_WLG', 'peptide', 'variable_seq', 'count', 'RPM', 'log2_RPM', 'insertions', 'deletions', 'matches']].copy()
+    df_out = df[['ID', 'peptide', 'variable_seq', 'count', 'RPM', 'log2_RPM', 'insertions', 'deletions', 'matches']].copy()
 
     # Stats
-    assigned = df_out[df_out['ID_WLG'].notna()]['count'].sum()
-    unassigned = df_out[df_out['ID_WLG'].isna()]['count'].sum()
+    assigned = df_out[df_out['ID'].notna()]['count'].sum()
+    unassigned = df_out[df_out['ID'].isna()]['count'].sum()
     stats = {
         'total': len(df_out),
         'assigned': assigned,
@@ -927,8 +939,8 @@ def main(
         df_merged, merge_stats = merge_with_reference(df, reference_file, assay_mode=assay_mode)
         logger.info("Step 2/4 complete.")
 
-        # Ensure all unassigned ID_WLG are labeled as 'Unassigned'
-        df_merged['ID_WLG'] = df_merged['ID_WLG'].fillna('Unassigned')
+        # Ensure all unassigned ID are labeled as 'Unassigned'
+        df_merged['ID'] = df_merged['ID'].fillna('Unassigned')
         
         # Log merging statistics
         logger.info("\nReference Library Merging Statistics:")
@@ -946,8 +958,8 @@ def main(
 
         # Calculate correct assigned/unassigned read counts and percentages
         total_sequences = len(df_final)
-        assigned_sequences = df_final[df_final['ID_WLG'].notna() & (df_final['ID_WLG'] != 'Unassigned')].shape[0]
-        unassigned_sequences = df_final[(df_final['ID_WLG'].isna()) | (df_final['ID_WLG'] == 'Unassigned')].shape[0]
+        assigned_sequences = df_final[df_final['ID'].notna() & (df_final['ID'] != 'Unassigned')].shape[0]
+        unassigned_sequences = df_final[(df_final['ID'].isna()) | (df_final['ID'] == 'Unassigned')].shape[0]
 
         # Log count statistics with correct percentages
         logger.info("\nVariant Count Statistics:")
@@ -964,14 +976,14 @@ def main(
         mapped_reads = sam_stats['mapped_reads']
 
         # Split assigned and unassigned
-        df_assigned = df_final[df_final['ID_WLG'] != 'Unassigned'].copy()
-        df_unassigned = df_final[df_final['ID_WLG'] == 'Unassigned'].copy()
+        df_assigned = df_final[df_final['ID'] != 'Unassigned'].copy()
+        df_unassigned = df_final[df_final['ID'] == 'Unassigned'].copy()
 
-        # Aggregate assigned by (ID_WLG, peptide): sum counts, keep the
+        # Aggregate assigned by (ID, peptide): sum counts, keep the
         # variable_seq from the variant with the highest read count.
         if not df_assigned.empty:
             df_assigned = df_assigned.sort_values('count', ascending=False)
-            df_assigned = df_assigned.groupby(['ID_WLG', 'peptide'], as_index=False).agg({
+            df_assigned = df_assigned.groupby(['ID', 'peptide'], as_index=False).agg({
                 'variable_seq': 'first',
                 'count': 'sum',
                 'insertions': 'first',
@@ -980,7 +992,7 @@ def main(
             })
             df_assigned['RPM'] = df_assigned['count'] / mapped_reads * 1_000_000
             df_assigned['log2_RPM'] = np.log2(df_assigned['RPM'] + 1)
-            df_assigned = df_assigned[['ID_WLG', 'peptide', 'variable_seq', 'count', 'RPM', 'log2_RPM', 'insertions', 'deletions', 'matches']]
+            df_assigned = df_assigned[['ID', 'peptide', 'variable_seq', 'count', 'RPM', 'log2_RPM', 'insertions', 'deletions', 'matches']]
             df_assigned = df_assigned.sort_values('RPM', ascending=False).reset_index(drop=True)
 
         # Write assigned counts (main output)

@@ -494,21 +494,25 @@ def merge_count_tables(
         try:
             with counts_path.open("r", newline='') as count_file:
                 reader = csv.DictReader(count_file)
-                required_cols = {"ID_WLG", "peptide", "count", "RPM"}
-                if not reader.fieldnames or not required_cols.issubset(set(reader.fieldnames)):
+                fieldnames = set(reader.fieldnames or [])
+                # Accept legacy ID_WLG from older CapScreen outputs.
+                if "ID" not in fieldnames and "ID_WLG" in fieldnames:
+                    fieldnames.add("ID")
+                required_cols = {"ID", "peptide", "count", "RPM"}
+                if not required_cols.issubset(fieldnames):
                     logger.error(f"Count file for sample {entry.sample_id} is missing required columns. Skipping.")
                     continue
                 for row in reader:
-                    id_wlg = (row.get("ID_WLG") or "").strip()
-                    if not id_wlg or id_wlg.lower() == "unassigned":
+                    variant_id = (row.get("ID") or row.get("ID_WLG") or "").strip()
+                    if not variant_id or variant_id.lower() == "unassigned":
                         continue
                     peptide = row["peptide"]
                     variable_seq = (row.get("variable_seq") or "").strip()
-                    key = (id_wlg, peptide)
+                    key = (variant_id, peptide)
                     record = merged_records.setdefault(
                         key,
                         {
-                            "ID_WLG": id_wlg,
+                            "ID": variant_id,
                             "peptide": peptide,
                             "variable_seqs": set(),
                             "counts": {},
@@ -521,13 +525,13 @@ def merge_count_tables(
                         record["counts"][entry.sample_id] = record["counts"].get(entry.sample_id, 0) + int(row.get("count", 0) or 0)
                     except ValueError:
                         logger.warning(
-                            f"Invalid count value in {counts_path} for variant {id_wlg}. Treating as 0."
+                            f"Invalid count value in {counts_path} for variant {variant_id}. Treating as 0."
                         )
                     try:
                         record["rpms"][entry.sample_id] = record["rpms"].get(entry.sample_id, 0.0) + float(row.get("RPM", 0) or 0)
                     except ValueError:
                         logger.warning(
-                            f"Invalid RPM value in {counts_path} for variant {id_wlg}. Treating as 0."
+                            f"Invalid RPM value in {counts_path} for variant {variant_id}. Treating as 0."
                         )
         except Exception as exc:
             logger.error(f"Failed to read count file for sample {entry.sample_id}: {exc}")
@@ -541,7 +545,7 @@ def merge_count_tables(
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open("w", newline='') as merged_file:
-            fieldnames = ["ID_WLG", "peptide", "variable_seq"]
+            fieldnames = ["ID", "peptide", "variable_seq"]
             rpm_columns: List[str] = []
             for sample_id in sample_order:
                 fieldnames.append(sample_id)
@@ -552,7 +556,7 @@ def merge_count_tables(
             for key in sorted(merged_records.keys()):
                 record = merged_records[key]
                 row = {
-                    "ID_WLG": record["ID_WLG"],
+                    "ID": record["ID"],
                     "peptide": record["peptide"],
                     "variable_seq": ";".join(sorted(record.get("variable_seqs", set())))
                 }
@@ -832,8 +836,8 @@ def main():
         type=Path,
         required=True,
         help=(
-            "Reference library CSV. VP-seq: columns ID_WLG,peptide. "
-            "Barcode-seq: columns ID_WLG,barcode."
+            "Reference library CSV. VP-seq: columns ID,peptide. "
+            "Barcode-seq: columns ID,barcode."
         ),
     )
     pipeline_parser.add_argument("--keep_intermediate", action="store_true", help="Keep intermediate FASTQ files (default: remove)")
@@ -907,8 +911,8 @@ def main():
         type=Path,
         required=True,
         help=(
-            "Reference library CSV. VP-seq: ID_WLG,peptide. "
-            "Barcode-seq: ID_WLG,barcode."
+            "Reference library CSV. VP-seq: ID,peptide. "
+            "Barcode-seq: ID,barcode."
         ),
     )
     count_parser.add_argument("--output", type=Path, help="Path to output file (CSV)")
@@ -925,7 +929,7 @@ def main():
         dest="assay_mode",
         action="store_const",
         const="barcode-seq",
-        help="Count DNA barcodes (no translation; library columns ID_WLG,barcode).",
+        help="Count DNA barcodes (no translation; library columns ID,barcode).",
     )
     count_parser.set_defaults(assay_mode=None)
     # report: HTML report only

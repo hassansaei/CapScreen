@@ -193,31 +193,33 @@ def read_count_table(count_file: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
     
     # Read the count table
     counts = pd.read_csv(count_file, sep=',')
+    if "ID" not in counts.columns and "ID_WLG" in counts.columns:
+        counts = counts.rename(columns={"ID_WLG": "ID"})
     
     # Filter out unassigned peptides — they are not valid library members and
     # would create duplicate index entries that break downstream analysis.
-    if 'ID_WLG' in counts.columns:
+    if 'ID' in counts.columns:
         n_before = len(counts)
-        counts = counts[~counts['ID_WLG'].str.lower().eq('unassigned')]
+        counts = counts[~counts['ID'].str.lower().eq('unassigned')]
         n_removed = n_before - len(counts)
         if n_removed > 0:
             logger.info(f"Excluded {n_removed:,} unassigned variant(s) from statistical analysis")
     
-    # Set index to ID_WLG
-    if 'ID_WLG' in counts.columns:
-        counts.index = counts['ID_WLG']
+    # Set index to ID
+    if 'ID' in counts.columns:
+        counts.index = counts['ID']
     else:
-        logger.warning("ID_WLG column not found, using first column as index")
+        logger.warning("ID column not found, using first column as index")
         counts.index = counts.iloc[:, 0]
     
     # Identify RPM columns
     rpm_columns = [col for col in counts.columns if col.endswith('_RPM')]
     
     # Create raw counts dataframe (drop RPM columns and metadata columns)
-    raw_counts = counts.drop(columns=['ID_WLG', 'peptide', 'variable_seq'] + rpm_columns, errors='ignore')
+    raw_counts = counts.drop(columns=['ID', 'peptide', 'variable_seq'] + rpm_columns, errors='ignore')
     
     # Create RPM counts dataframe (keep only RPM columns)
-    rpm_counts = counts[['ID_WLG', 'peptide'] + rpm_columns].copy() if rpm_columns else pd.DataFrame()
+    rpm_counts = counts[['ID', 'peptide'] + rpm_columns].copy() if rpm_columns else pd.DataFrame()
     
     # Remove RPM suffix from column names for RPM dataframe
     if not rpm_counts.empty:
@@ -492,14 +494,14 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
     """
     logger.info("Computing RPM-based enrichment analysis...")
     
-    # Refactored: Fixed index/column naming to use ID_WLG as identifier and preserve peptide column
-    # Sourcery-AI suggestion: Keep ID_WLG as index (don't rename to 'peptide') and preserve 'peptide' 
+    # Refactored: Fixed index/column naming to use ID as identifier and preserve peptide column
+    # Sourcery-AI suggestion: Keep ID as index (don't rename to 'peptide') and preserve 'peptide' 
     # column (contains actual sequence) to avoid confusion between identifiers and sequences
-    # Prepare RPM counts: set ID_WLG as index if it's a column, preserve peptide column
+    # Prepare RPM counts: set ID as index if it's a column, preserve peptide column
     df_rpm = rpm_counts.copy()
-    if 'ID_WLG' in df_rpm.columns:
-        df_rpm = df_rpm.set_index('ID_WLG')
-    # Keep ID_WLG as index name (don't rename to 'peptide')
+    if 'ID' in df_rpm.columns:
+        df_rpm = df_rpm.set_index('ID')
+    # Keep ID as index name (don't rename to 'peptide')
     # Preserve 'peptide' column (contains actual sequence) - don't drop it
     
     # Remove AAV2 or control variants
@@ -534,10 +536,10 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
                 continue
             
             mu_r = df_rpm[samples_in_rpm].mean(axis=1)  # μ_{i,s}
-            # Refactored: Changed from "peptide" to "ID_WLG" to use identifier consistently
+            # Refactored: Changed from "peptide" to "ID" to use identifier consistently
             mu.append(
                 pd.DataFrame({
-                    "ID_WLG": mu_r.index,
+                    "ID": mu_r.index,
                     "mu": mu_r.values,
                     "group": group,
                     "bio_rep": rep
@@ -545,7 +547,7 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
             )
     
     mu_df = pd.concat(mu, ignore_index=True)
-    logger.info(f"Computed means for {len(mu_df)} ID_WLG-group-bio_rep combinations")
+    logger.info(f"Computed means for {len(mu_df)} ID-group-bio_rep combinations")
     
     # Step 2: Compute log2 enrichment vs Input
     logger.info("Step 2: Computing log2 enrichment vs Input...")
@@ -563,14 +565,14 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
             logger.warning(f"No input samples found for bio_rep {rep}, skipping")
             continue
         
-        # Refactored: Changed groupby and set_index from "peptide" to "ID_WLG" for identifier consistency
+        # Refactored: Changed groupby and set_index from "peptide" to "ID" for identifier consistency
         # Average across input groups if multiple exist
-        mu_input = mu_input_df.groupby("ID_WLG")["mu"].mean()
+        mu_input = mu_input_df.groupby("ID")["mu"].mean()
         
         for group in non_input_groups:
             mu_g = (
                 mu_r[mu_r["group"] == group]
-                .set_index("ID_WLG")["mu"]
+                .set_index("ID")["mu"]
             )
             
             common = mu_g.index.intersection(mu_input.index)
@@ -578,10 +580,10 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
             if len(common) > 0:
                 e = np.log2((mu_g.loc[common] + LAMBDA) / (mu_input.loc[common] + LAMBDA))
                 
-                # Refactored: Changed from "peptide" to "ID_WLG" for identifier consistency
+                # Refactored: Changed from "peptide" to "ID" for identifier consistency
                 enrich.append(
                     pd.DataFrame({
-                        "ID_WLG": common,
+                        "ID": common,
                         "log2_enrichment": e.values,
                         "group": group,
                         "bio_rep": rep
@@ -593,14 +595,14 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
         return df_rpm
     
     enrich_df = pd.concat(enrich, ignore_index=True)
-    logger.info(f"Computed enrichments for {len(enrich_df)} ID_WLG-group-bio_rep combinations")
+    logger.info(f"Computed enrichments for {len(enrich_df)} ID-group-bio_rep combinations")
     
     # Step 3: Aggregate across experiments
     logger.info("Step 3: Aggregating across experiments...")
-    # Refactored: Changed groupby from "peptide" to "ID_WLG" for identifier consistency
+    # Refactored: Changed groupby from "peptide" to "ID" for identifier consistency
     enrich_summary = (
         enrich_df
-        .groupby(["ID_WLG", "group"])
+        .groupby(["ID", "group"])
         .agg(
             mean_log2_enrichment=("log2_enrichment", "mean"),
             sd_log2_enrichment=("log2_enrichment", "std")
@@ -612,10 +614,10 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
     logger.info("Step 4: Creating summary statistics...")
     df_rpm_mat = df_rpm.copy()
     
-    # Refactored: Changed pivot index from "peptide" to "ID_WLG" for identifier consistency
+    # Refactored: Changed pivot index from "peptide" to "ID" for identifier consistency
     # Pivot mean and sd
-    mean_wide = enrich_summary.pivot(index="ID_WLG", columns="group", values="mean_log2_enrichment")
-    sd_wide = enrich_summary.pivot(index="ID_WLG", columns="group", values="sd_log2_enrichment")
+    mean_wide = enrich_summary.pivot(index="ID", columns="group", values="mean_log2_enrichment")
+    sd_wide = enrich_summary.pivot(index="ID", columns="group", values="sd_log2_enrichment")
     
     # Rename columns
     # Calculate CV (coefficient of variation) with protection against division by zero
@@ -707,25 +709,25 @@ def compute_rpm_enrichment_analysis(rpm_counts: pd.DataFrame, meta: pd.DataFrame
         logger.info(f"Available enrichment columns: {list(mean_wide.columns)}")
         logger.info(f"All groups found in enrichment: {[col.replace('mean_log2Enrich_', '') for col in mean_wide.columns]}")
     
-    # Refactored: Changed merge key from "peptide" to "ID_WLG" for identifier consistency
-    # Reset index to merge (peptide_annot index is ID_WLG)
+    # Refactored: Changed merge key from "peptide" to "ID" for identifier consistency
+    # Reset index to merge (peptide_annot index is ID)
     peptide_annot = peptide_annot.reset_index()
     
-    # Merge into df_rpm (df_rpm_mat index is ID_WLG)
+    # Merge into df_rpm (df_rpm_mat index is ID)
     df_rpm_annot = (
         df_rpm_mat
-        .reset_index()  # Reset to make index a column (ID_WLG) for merging
-        .merge(peptide_annot, on="ID_WLG", how="left")
-        .set_index("ID_WLG")
+        .reset_index()  # Reset to make index a column (ID) for merging
+        .merge(peptide_annot, on="ID", how="left")
+        .set_index("ID")
     )
     
     # Step 5: Add per-replicate enrichments in wide format
     logger.info("Step 5: Adding per-replicate enrichments...")
-    # Refactored: Changed pivot_table index from "peptide" to "ID_WLG" for identifier consistency
+    # Refactored: Changed pivot_table index from "peptide" to "ID" for identifier consistency
     enrich_wide = (
         enrich_df
         .pivot_table(
-            index="ID_WLG",
+            index="ID",
             columns=["group", "bio_rep"],
             values="log2_enrichment"
         )
@@ -845,15 +847,17 @@ def load_merged_counts(count_file: Path) -> pd.DataFrame:
     """Read merged counts with one row per variant. Unassigned rows are removed."""
     logger.info("Reading count table from %s", count_file)
     counts = pd.read_csv(count_file, sep=",")
-    if "ID_WLG" not in counts.columns:
-        raise ValueError("merged counts must contain an ID_WLG column")
+    if "ID" not in counts.columns and "ID_WLG" in counts.columns:
+        counts = counts.rename(columns={"ID_WLG": "ID"})
+    if "ID" not in counts.columns:
+        raise ValueError("merged counts must contain an ID column")
     n_before = len(counts)
-    counts = counts.loc[~counts["ID_WLG"].astype(str).str.lower().eq("unassigned")].copy()
+    counts = counts.loc[~counts["ID"].astype(str).str.lower().eq("unassigned")].copy()
     n_removed = n_before - len(counts)
     if n_removed:
         logger.info("Excluded %d unassigned variant(s)", n_removed)
-    if counts["ID_WLG"].astype(str).duplicated().any():
-        raise ValueError("Duplicate ID_WLG values in the merged count table")
+    if counts["ID"].astype(str).duplicated().any():
+        raise ValueError("Duplicate ID values in the merged count table")
     logger.info("Count table shape: %s", counts.shape)
     return counts
 
@@ -1206,10 +1210,10 @@ def plot_cv_histogram_pdf(df: pd.DataFrame, out_pdf: Path, cv_high_threshold: fl
 
 def plot_aav2_rpm_contamination(df: pd.DataFrame, sample_info: pd.DataFrame, out_pdf: Path, variant_id: str = "AAV2") -> bool:
     """Bar plot of AAV2 RPM by group, with one point per biological replicate."""
-    if "ID_WLG" not in df.columns:
-        logger.warning("Cannot plot AAV2 RPM: ID_WLG column is missing")
+    if "ID" not in df.columns:
+        logger.warning("Cannot plot AAV2 RPM: ID column is missing")
         return False
-    hits = df.index[df["ID_WLG"].astype(str) == variant_id]
+    hits = df.index[df["ID"].astype(str) == variant_id]
     if len(hits) == 0:
         logger.warning("Variant '%s' not found; skipping contamination plot", variant_id)
         return False
@@ -1365,12 +1369,12 @@ def fit_blind_vst(
     sample_ids = [sid for sid in sample_info["sample_id"].astype(str) if sid in counts.columns]
     if len(sample_ids) < 2:
         raise ValueError("Need at least 2 samples with count columns for VST")
-    if "ID_WLG" not in counts.columns:
-        raise ValueError("Count table must contain ID_WLG for VST")
+    if "ID" not in counts.columns:
+        raise ValueError("Count table must contain ID for VST")
     count_mat = _integer_counts(counts[sample_ids])
-    count_mat.index = counts["ID_WLG"].astype(str).to_numpy()
+    count_mat.index = counts["ID"].astype(str).to_numpy()
     if count_mat.index.duplicated().any():
-        raise ValueError("Duplicate ID_WLG values while building the VST dataset")
+        raise ValueError("Duplicate ID values while building the VST dataset")
     count_mat = count_mat.T
     count_mat.index = sample_ids
     design, metadata_cols = build_deseq_design(sample_info.loc[sample_ids], adjust_batch=adjust_batch)
@@ -1385,7 +1389,7 @@ def fit_blind_vst(
     )
     dds.vst(use_design=False)
     vst = pd.DataFrame(dds.layers["vst_counts"], index=dds.obs_names, columns=dds.var_names).T
-    vst.index.name = "ID_WLG"
+    vst.index.name = "ID"
     return vst, metadata
 
 
@@ -1641,8 +1645,8 @@ def run_deseq2_comparisons(
     sample_ids = [sid for sid in sample_info["sample_id"].astype(str) if sid in counts.columns]
     if len(sample_ids) < 2:
         raise ValueError("Need at least 2 samples with count columns for DESeq2")
-    if "ID_WLG" not in counts.columns:
-        raise ValueError("Count table must contain ID_WLG for DESeq2")
+    if "ID" not in counts.columns:
+        raise ValueError("Count table must contain ID for DESeq2")
 
     group_counts = sample_info.loc[sample_ids, "group"].astype(str).value_counts()
     runnable = []
@@ -1670,7 +1674,7 @@ def run_deseq2_comparisons(
         return 0
 
     raw_all = _integer_counts(counts[sample_ids])
-    raw_all.index = counts["ID_WLG"].astype(str)
+    raw_all.index = counts["ID"].astype(str)
     if raw_all.index.duplicated().any():
         raise ValueError("Duplicate variant IDs while preparing the DESeq2 dataset")
     all_variant_ids = raw_all.index
@@ -1972,7 +1976,7 @@ def score_selection(
         bg_cols.extend(_rpm_cols_for_group(sample_info, bg, df))
     inp_cols = _rpm_cols_for_group(sample_info, input_group, df)
 
-    ids = df["ID_WLG"].astype(str).to_numpy()
+    ids = df["ID"].astype(str).to_numpy()
     peptide = (
         df["peptide"].astype(str).to_numpy()
         if "peptide" in df.columns
@@ -1994,7 +1998,7 @@ def score_selection(
 
     out = pd.DataFrame(
         {
-            "ID_WLG": ids,
+            "ID": ids,
             "peptide": peptide,
             "is_control": ~pd.Series(ids).str.startswith("WID-", na=False).to_numpy(),
             "target_RPM_median": tgt_med,
@@ -2107,7 +2111,7 @@ def plot_er_eh_scatter(
         ax.scatter(ctrl["Er"], ctrl["Eh"], s=36, c="0.15", zorder=3)
         for _, row in ctrl.iterrows():
             ax.annotate(
-                str(row["ID_WLG"]),
+                str(row["ID"]),
                 (row["Er"], row["Eh"]),
                 textcoords="offset points",
                 xytext=(4, 4),
@@ -2117,11 +2121,11 @@ def plot_er_eh_scatter(
             )
 
     if top is not None and not top.empty:
-        hl = d.set_index("ID_WLG").loc[top["ID_WLG"]].reset_index()
+        hl = d.set_index("ID").loc[top["ID"]].reset_index()
         cmap = plt.get_cmap("Dark2")
         colors = [cmap(i % 8) for i in range(len(hl))]
         for i, row in hl.iterrows():
-            label = f"{row['ID_WLG']}\n{row.get('peptide', '')}".strip()
+            label = f"{row['ID']}\n{row.get('peptide', '')}".strip()
             ax.scatter(
                 [row["Er"]], [row["Eh"]],
                 s=48, c=[colors[i]], zorder=4, label=label,
@@ -2186,10 +2190,10 @@ def plot_top_variant_rpm_bars(
         return None
 
     id_order = [str(v) for v in ids]
-    sub = df.loc[df["ID_WLG"].astype(str).isin(id_order)].copy()
+    sub = df.loc[df["ID"].astype(str).isin(id_order)].copy()
     if sub.empty:
         return None
-    sub["_ord"] = sub["ID_WLG"].astype(str).map({v: i for i, v in enumerate(id_order)})
+    sub["_ord"] = sub["ID"].astype(str).map({v: i for i, v in enumerate(id_order)})
     sub = sub.sort_values("_ord")
 
     long_rows = []
@@ -2197,10 +2201,10 @@ def plot_top_variant_rpm_bars(
         cols = group_cols[group]
         mat = sub[cols].to_numpy(dtype=float)
         for j, col in enumerate(cols):
-            for i, vid in enumerate(sub["ID_WLG"].astype(str)):
+            for i, vid in enumerate(sub["ID"].astype(str)):
                 long_rows.append(
                     {
-                        "ID_WLG": vid,
+                        "ID": vid,
                         "variant": _variant_display_label(vid),
                         "group": group,
                         "replicate": j + 1,
@@ -2394,7 +2398,7 @@ def run_enrichment_enhancement_arm(
     if bar_groups and not top.empty:
         plot_top_variant_rpm_bars(
             df, sample_info,
-            ids=top["ID_WLG"].astype(str).tolist(),
+            ids=top["ID"].astype(str).tolist(),
             groups=bar_groups,
             out_prefix=out_dir / f"RPM_bars_{tag}_top{len(top)}",
             title=f"Top {len(top)} {target} variants: RPM across groups",
@@ -2427,7 +2431,7 @@ def run_enrichment_enhancement_arm(
         "n_hits_mean": int(len(hits_mean)),
         "n_top_median": int(len(top)),
         "n_top_mean": int(len(top_mean)),
-        "top_variant": top["ID_WLG"].iloc[0] if len(top) else np.nan,
+        "top_variant": top["ID"].iloc[0] if len(top) else np.nan,
         "top_Er_median": float(top["Er"].iloc[0]) if len(top) else np.nan,
         "top_Eh_median": float(top["Eh"].iloc[0]) if len(top) else np.nan,
     }

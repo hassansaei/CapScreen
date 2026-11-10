@@ -22,7 +22,7 @@
             "index_basename": "/opt/capscreen/reference/barcodes",
             "fasta": "/opt/capscreen/reference/barcodes.fasta",
             "library": "/opt/capscreen/reference/barcode_library.csv",
-            "description": "Single amplicon FASTA like VP-seq: one sequence with flank_5p + 15 Ns + flank_3p. Build indexes with bowtie2-build barcodes.fasta barcodes (Bowtie2 tolerates Ns in the middle). genome/index_basename is the -x prefix. library CSV columns: ID_WLG,barcode."
+            "description": "Single amplicon FASTA like VP-seq: one sequence with flank_5p + 15 Ns + flank_3p. Build indexes with bowtie2-build barcodes.fasta barcodes (Bowtie2 tolerates Ns in the middle). genome/index_basename is the -x prefix. library CSV columns: ID,barcode."
         }
     },
     "fastp": {

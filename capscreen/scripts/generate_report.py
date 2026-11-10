@@ -199,7 +199,9 @@ def generate_report(sample_dir, output=None):
     log2rpm_hist_path = None
     if show_count_matrix and counts_csv.exists():
         df = pd.read_csv(counts_csv, sep=None, engine='python')
-        if 'ID_WLG' in df.columns:
+        if 'ID' not in df.columns and 'ID_WLG' in df.columns:
+            df = df.rename(columns={'ID_WLG': 'ID'})
+        if 'ID' in df.columns:
             for col in ['insertions', 'deletions', 'matches', 'Unnamed: 0']:
                 if col in df.columns:
                     df = df.drop(columns=[col])
