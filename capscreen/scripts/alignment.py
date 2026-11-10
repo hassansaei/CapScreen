@@ -103,6 +103,9 @@ def run_pear(
 ) -> Optional[Path]:
     """
     Run PEAR to merge the trimmed FASTQ files.
+
+    PEAR flags are taken from config['pear'] so values in config.json
+    actually control merge behavior (see PEAR v0.9.6 --help).
     """
     pear_config = config['pear']
     prefix = pear_config['output_prefix']
@@ -114,7 +117,12 @@ def run_pear(
         "-f", str(r1_trimmed),
         "-r", str(r2_trimmed),
         "-o", str(pear_base),
-        "-j", str(threads)
+        "-j", str(threads),
+        "-v", str(pear_config.get("min_overlap", 10)),
+        "-n", str(pear_config.get("min_assembly_length", 50)),
+        "-m", str(pear_config.get("max_assembly_length", 1000)),
+        "-q", str(pear_config.get("quality_threshold", 15)),
+        "-p", str(pear_config.get("p_value", 0.01)),
     ]
 
     try:
@@ -302,6 +310,14 @@ def validate_config(config: Dict[str, Any]) -> bool:
     """
     required_sections = ['fastp', 'pear', 'bowtie2', 'samtools', 'reference']
     required_fastp_keys = ['output_prefix', 'compression', 'length_required', 'dup_calc_accuracy']
+    required_pear_keys = [
+        'output_prefix',
+        'min_overlap',
+        'min_assembly_length',
+        'max_assembly_length',
+        'quality_threshold',
+        'p_value',
+    ]
     required_bowtie2_keys = ['output_prefix', 'mode', 'sensitivity', 'np', 'n_ceil']
     required_samtools_keys = ['sort_memory']
     required_reference_keys = ['genome']
@@ -315,6 +331,11 @@ def validate_config(config: Dict[str, Any]) -> bool:
         for key in required_fastp_keys:
             if key not in config['fastp']:
                 logger.error(f"Missing required key in fastp section: {key}")
+                return False
+
+        for key in required_pear_keys:
+            if key not in config['pear']:
+                logger.error(f"Missing required key in pear section: {key}")
                 return False
 
         for key in required_bowtie2_keys:
