@@ -5,6 +5,11 @@
 *.png
 .DS_Store
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
 # Agent tooling and rules
 .agent-style/
 .cursor/
