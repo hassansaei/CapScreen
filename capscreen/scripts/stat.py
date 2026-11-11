@@ -1493,10 +1493,11 @@ def _draw_pca(
     n_variants: int,
     title: str,
     exclude_groups: List[str],
-    ax,
+    fig: plt.Figure,
+    ax: plt.Axes,
     point_size: float = 120,
     fontsize: float = 10,
-):
+) -> None:
     groups = list(dict.fromkeys(frame["group"]))
     markers = ["o", "^", "s", "P", "X", "*", "D", "v", "<", ">", "p", "h"]
     marker_map = {group: markers[i % len(markers)] for i, group in enumerate(groups)}
@@ -1515,15 +1516,19 @@ def _draw_pca(
     ax.set_xlabel(pc1, fontsize=fontsize)
     ax.set_ylabel(pc2, fontsize=fontsize)
     excluded = ", ".join(exclude_groups) if exclude_groups else "none"
-    ax.set_title(title, fontsize=fontsize + 1)
-    ax.text(
-        0.0, 1.02,
-        f"n variants = {n_variants} | excluded groups: {excluded}",
-        transform=ax.transAxes, fontsize=max(fontsize - 2, 6), va="bottom",
-    )
+    subtitle = f"n variants = {n_variants} | excluded groups: {excluded}"
     ax.legend(
         bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0,
         fontsize=max(fontsize - 2, 6),
+    )
+    header_bottom = _figure_header(
+        fig, title, subtitle,
+        title_size=fontsize + 1,
+        subtitle_size=max(fontsize - 2, 6),
+    )
+    fig.subplots_adjust(
+        left=0.12, right=0.72, bottom=0.12,
+        top=max(header_bottom - 0.015, 0.72),
     )
 
 
@@ -1544,7 +1549,7 @@ def plot_vst_pca(
     """
     all_frame, all_pct, n_all = _pca_frame(vst, sample_info, None, exclude_groups)
     top_frame, top_pct, n_top_used = _pca_frame(vst, sample_info, n_top, exclude_groups)
-    fig_w, fig_h = figsize if figsize is not None else (7.5, 6.5)
+    fig_w, fig_h = figsize if figsize is not None else (9.0, 7.0)
     plots = [
         (all_frame, all_pct, n_all, "PCA on VST (all variants with positive variance)", qc_dir / "pca_all_features.png"),
         (top_frame, top_pct, n_top_used, f"PCA on VST (top {n_top} variable variants)", qc_dir / "pca_top500_features.png"),
@@ -1553,12 +1558,11 @@ def plot_vst_pca(
         for frame, pct, n_variants, title, png_path in plots:
             fig, ax = plt.subplots(figsize=(fig_w, fig_h))
             _draw_pca(
-                frame, pct, n_variants, title, exclude_groups, ax,
+                frame, pct, n_variants, title, exclude_groups, fig, ax,
                 point_size=point_size, fontsize=fontsize,
             )
-            fig.tight_layout()
-            fig.savefig(png_path, dpi=300)
-            pdf.savefig(fig)
+            fig.savefig(png_path, dpi=300, bbox_inches="tight")
+            pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
             logger.info("Saved %s", png_path)
     logger.info("Saved two-page VST PCA to %s", qc_dir / "pca_vst.pdf")
