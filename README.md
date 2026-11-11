@@ -313,6 +313,9 @@ The `statistical_analysis` section configures downstream analysis:
   - `padj_threshold`: Adjusted p-value threshold
   - `log2fc_threshold`: Log2 fold change threshold
 
+- `output`: Result table formats:
+  - `write_excel`: When true (default), dual-write DE and Er/Eh summary tables as TSV/CSV plus `.xlsx` companions (requires `openpyxl`)
+
 - `plots`: Plotting configuration:
   - `scatter_highlight_top_n`: Number of top variants to highlight in scatter plots
   - `bar_plot_top_n`: Number of top variants in bar plots

@@ -94,6 +94,9 @@
             "n_top": 20,
             "pseudocount": 1
         },
+        "output": {
+            "write_excel": true
+        },
         "plots": {
             "dpi": {
                 "standard": 300

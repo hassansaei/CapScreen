@@ -104,6 +104,9 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
                 "n_top": 20,
                 "pseudocount": 1,
             },
+            "output": {
+                "write_excel": True,
+            },
             "plots": {
                 "dpi": {
                     "standard": 300
@@ -1628,6 +1631,7 @@ def run_deseq2_comparisons(
     n_cpus: int,
     min_replicates: int = 2,
     adjust_batch: bool = True,
+    write_excel: bool = False,
 ) -> int:
     """
     Fit each contrast pairwise on only the samples in its two groups.
@@ -1733,7 +1737,7 @@ def run_deseq2_comparisons(
                 design,
             )
             out_path = out_dir / de_result_filename(y_group, x_group)
-            res.to_csv(out_path, sep="\t", index=False)
+            write_table(res, out_path, write_excel=write_excel)
             n_sig = int((res["padj"] < 0.05).fillna(False).sum()) if "padj" in res.columns else 0
             logger.info(
                 "Wrote %s (pairwise, design=%s, %d variants, %d with padj < 0.05)",
@@ -1755,6 +1759,49 @@ def _cfg_int(value, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+_EXCEL_TEXT_COLS = frozenset({
+    "ID", "ID_WLG", "peptide", "barcode", "variable_seq",
+    "y_group", "x_group", "comparison", "design", "arm", "tag",
+    "target", "backgrounds", "input_group", "title", "subtitle",
+})
+
+
+def write_table(df: pd.DataFrame, path: Path, *, write_excel: bool = False) -> None:
+    """
+    Write a results table as TSV/CSV and optionally as Excel.
+
+    TSV/CSV remains the canonical machine-readable output. When
+    ``write_excel`` is true, also write ``path.with_suffix('.xlsx')``.
+    ID-like columns are forced to text in Excel to avoid mangling.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.suffix.lower() == ".tsv":
+        df.to_csv(path, sep="\t", index=False)
+    else:
+        df.to_csv(path, index=False)
+
+    if not write_excel:
+        return
+
+    xlsx_path = path.with_suffix(".xlsx")
+    try:
+        out = df.copy()
+        for col in out.columns:
+            if col in _EXCEL_TEXT_COLS or str(col).endswith("_id"):
+                out[col] = out[col].astype(str).where(out[col].notna(), "")
+        out.to_excel(xlsx_path, index=False, engine="openpyxl")
+        logger.info("Wrote Excel companion %s", xlsx_path)
+    except ImportError:
+        logger.warning(
+            "write_excel is enabled but openpyxl is not installed; "
+            "skipped %s (pip/conda install openpyxl in the capscreen-stat env)",
+            xlsx_path,
+        )
+    except Exception as exc:
+        logger.warning("Failed to write Excel companion %s: %s", xlsx_path, exc)
 
 
 def _rpm_cols_for_group(
@@ -2342,6 +2389,7 @@ def run_enrichment_enhancement_arm(
     n_top: int = 20,
     pseudocount: float = 1.0,
     dpi: int = 300,
+    write_excel: bool = False,
 ) -> Dict[str, Any]:
     """Score, call, and plot one enrichment/enhancement arm."""
     backgrounds = [c for c in str(arm["backgrounds"]).split(";") if c]
@@ -2367,13 +2415,15 @@ def run_enrichment_enhancement_arm(
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    scores.sort_values("Er_median", ascending=False).to_csv(
-        out_dir / f"Er_Eh_{tag}_all_variants.csv", index=False
+    write_table(
+        scores.sort_values("Er_median", ascending=False),
+        out_dir / f"Er_Eh_{tag}_all_variants.csv",
+        write_excel=write_excel,
     )
-    hits.to_csv(out_dir / f"Er_Eh_{tag}_hits_median.csv", index=False)
-    hits_mean.to_csv(out_dir / f"Er_Eh_{tag}_hits_mean.csv", index=False)
-    top.to_csv(out_dir / f"Er_Eh_{tag}_top_hits_median.csv", index=False)
-    top_mean.to_csv(out_dir / f"Er_Eh_{tag}_top_hits_mean.csv", index=False)
+    write_table(hits, out_dir / f"Er_Eh_{tag}_hits_median.csv", write_excel=write_excel)
+    write_table(hits_mean, out_dir / f"Er_Eh_{tag}_hits_mean.csv", write_excel=write_excel)
+    write_table(top, out_dir / f"Er_Eh_{tag}_top_hits_median.csv", write_excel=write_excel)
+    write_table(top_mean, out_dir / f"Er_Eh_{tag}_top_hits_mean.csv", write_excel=write_excel)
 
     plot_er_eh_scatter(
         scores, top, "median",
@@ -2448,12 +2498,13 @@ def run_enrichment_enhancement_analysis(
     n_top: int = 20,
     pseudocount: float = 1.0,
     dpi: int = 300,
+    write_excel: bool = False,
 ) -> pd.DataFrame:
     """Run enrichment/enhancement for all Sample_info arms and write a summary table."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     arms = build_enrichment_enhancement_arms(sample_info)
-    arms.to_csv(out_dir / "arms.tsv", sep="\t", index=False)
+    write_table(arms, out_dir / "arms.tsv", write_excel=write_excel)
     summaries = []
     for _, arm in arms.iterrows():
         arm_input = str(arm["input_group"]) if "input_group" in arm.index else ""
@@ -2470,10 +2521,11 @@ def run_enrichment_enhancement_analysis(
                 input_group=arm_input,
                 er_cut=er_cut, eh_cut=eh_cut, min_rpm=min_rpm,
                 n_top=n_top, pseudocount=pseudocount, dpi=dpi,
+                write_excel=write_excel,
             )
         )
     summary = pd.DataFrame(summaries)
-    summary.to_csv(out_dir / "Er_Eh_summary_all_arms.csv", index=False)
+    write_table(summary, out_dir / "Er_Eh_summary_all_arms.csv", write_excel=write_excel)
     return summary
 
 
@@ -2519,6 +2571,7 @@ def run_statistical_analysis(
     analysis_cfg = config.get("analysis", {}) or {}
     de_cfg = config.get("differential_expression", {}) or {}
     ee_cfg = config.get("enrichment_enhancement", {}) or {}
+    output_cfg = config.get("output", {}) or {}
     plot_cfg = config.get("plots", {}) or {}
     n_cpus_val = n_cpus if n_cpus is not None else _cfg_int(analysis_cfg.get("n_cpus"), 8)
     min_count = de_cfg.get("min_count", analysis_cfg.get("low_expression_threshold", 10))
@@ -2527,6 +2580,7 @@ def run_statistical_analysis(
     pseudocount = float(de_cfg.get("log2rpm_pseudocount", 1))
     min_replicates = _cfg_int(de_cfg.get("min_replicates"), 2)
     adjust_batch = bool(de_cfg.get("adjust_batch", True))
+    write_excel = bool(output_cfg.get("write_excel", True))
     pca_top_n = _cfg_int((analysis_cfg.get("pca") or {}).get("top_n_features"), 500)
     ee_er_cut = float(ee_cfg.get("er_cut", 3))
     ee_eh_cut = float(ee_cfg.get("eh_cut", 3))
@@ -2560,6 +2614,9 @@ def run_statistical_analysis(
             "min_rpm": ee_min_rpm,
             "n_top": ee_n_top,
             "pseudocount": ee_pseudo,
+        },
+        "output": {
+            "write_excel": write_excel,
         },
         "plots": {
             "dpi": plot_dpi,
@@ -2701,7 +2758,7 @@ def run_statistical_analysis(
         logger.info("STAT STEP START: %s", step)
         try:
             comparisons = build_enrichment_comparisons(meta)
-            comparisons.to_csv(de_dir / "comparisons.tsv", sep="\t", index=False)
+            write_table(comparisons, de_dir / "comparisons.tsv", write_excel=write_excel)
             n_ok = run_deseq2_comparisons(
                 filtered,
                 meta,
@@ -2710,6 +2767,7 @@ def run_statistical_analysis(
                 n_cpus=n_cpus_val,
                 min_replicates=min_replicates,
                 adjust_batch=adjust_batch,
+                write_excel=write_excel,
             )
             logger.info("STAT STEP OK: %s (%d/%d contrasts)", step, n_ok, len(comparisons))
         except Exception as exc:
@@ -2728,6 +2786,7 @@ def run_statistical_analysis(
                 n_top=ee_n_top,
                 pseudocount=ee_pseudo,
                 dpi=plot_dpi,
+                write_excel=write_excel,
             )
             logger.info(
                 "STAT STEP OK: %s (%d arm(s); summary=%s)",

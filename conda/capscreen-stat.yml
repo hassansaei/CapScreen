@@ -16,4 +16,5 @@ dependencies:
   - pydeseq2
   - mpl-scatter-density
   - jinja2
+  - openpyxl
 
