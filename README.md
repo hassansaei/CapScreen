@@ -1,10 +1,26 @@
-<p align="left">
-  <img src="docs/capscreen-logo.jpg" alt="CapScreen, AAV capsid library screening" width="280">
+<p align="center">
+  <img src="docs/capscreen-logo.jpg" alt="CapScreen, AAV capsid library screening" width="220">
 </p>
 
-# CapScreen
+<h1 align="center">CapScreen</h1>
 
-[![DOI](https://zenodo.org/badge/1004327193.svg)](https://doi.org/10.5281/zenodo.18895265)
+<p align="center">
+  AAV capsid library screening from FASTQ to DESeq2 and Er/Eh analysis.
+</p>
+
+<p align="center">
+  <a href="https://doi.org/10.5281/zenodo.18895265"><img src="https://zenodo.org/badge/1004327193.svg" alt="DOI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="https://github.com/hassansaei/CapScreen/releases"><img src="https://img.shields.io/github/v/release/hassansaei/CapScreen?label=release" alt="Release"></a>
+  <a href="https://hub.docker.com/r/saei/capscreen"><img src="https://img.shields.io/docker/v/saei/capscreen?label=docker&logo=docker" alt="Docker"></a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" alt="Docker">
+  <img src="https://img.shields.io/badge/DESeq2-pyDESeq2-orange" alt="DESeq2">
+  <img src="https://img.shields.io/badge/Apptainer-SIF-green" alt="Apptainer">
+</p>
 
 **CapScreen** is a pipeline designed for high-throughput screening of amplicon sequencing (NGS) results from AAV (Adeno-Associated Virus) library screens targeting specific receptors. The pipeline is suitable for both *binding* and *transduction* screening experiments, providing robust quality control, alignment, variant counting, and statistical analysis functionalities.
 
