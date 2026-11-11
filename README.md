@@ -5,20 +5,20 @@
 <h1 align="center">CapScreen</h1>
 
 <p align="center">
-  AAV capsid library screening from FASTQ to DESeq2 and Er/Eh analysis.
+  AAV capsid library screening from FASTQ to pyDESeq2 and Er/Eh analysis.
 </p>
 
 <p align="center">
   <a href="https://doi.org/10.5281/zenodo.18895265"><img src="https://zenodo.org/badge/1004327193.svg" alt="DOI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
-  <a href="https://github.com/hassansaei/CapScreen/releases"><img src="https://img.shields.io/github/v/release/hassansaei/CapScreen?label=release" alt="Release"></a>
+  <a href="https://github.com/hassansaei/CapScreen/releases"><img src="https://img.shields.io/badge/version-2.2.0-blue.svg" alt="Version 2.2.0"></a>
   <a href="https://hub.docker.com/r/saei/capscreen"><img src="https://img.shields.io/docker/v/saei/capscreen?label=docker&logo=docker" alt="Docker"></a>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/Python-3.9%E2%80%933.11-3776AB?logo=python&logoColor=white" alt="Python 3.9-3.11">
   <img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" alt="Docker">
-  <img src="https://img.shields.io/badge/DESeq2-pyDESeq2-orange" alt="DESeq2">
+  <img src="https://img.shields.io/badge/stats-pyDESeq2-orange" alt="pyDESeq2">
   <img src="https://img.shields.io/badge/Apptainer-SIF-green" alt="Apptainer">
 </p>
 
@@ -40,9 +40,8 @@ The primary aim of CapScreen is to streamline the analysis of amplicon sequencin
 - **Sorting and Indexing**: Employs Samtools for sorting and indexing alignment results.
 - **Variant Extraction and Counting**: Extracts variable regions between user-defined flanking sequences, translates to peptides, and counts variant abundances.
 - **Statistical Analysis**: Comprehensive statistical analysis including:
-  - DESeq2 normalization
-  - RPM-based enrichment analysis
-  - Differential expression analysis
+  - Differential expression with **pyDESeq2** (Python DESeq2; not the R/Bioconductor package)
+  - RPM-based enrichment/enhancement (Er/Eh)
   - Principal Component Analysis (PCA)
   - Correlation analysis
   - Publication-ready plots (scatter plots, bar plots, heatmaps, PCA plots)
@@ -71,8 +70,8 @@ The CapScreen pipeline consists of the following steps:
 6. **Reporting**
    - Outputs a HTML report file, TSV file with variant counts and detailed logs.
 7. **Statistical Analysis (Optional)**
-   - Normalizes counts using DESeq2
-   - Computes RPM-based enrichment
+   - Fits pairwise contrasts with pyDESeq2
+   - Computes RPM-based enrichment/enhancement (Er/Eh)
    - Performs differential expression analysis
    - Generates PCA plots and correlation matrices
    - Creates publication-ready visualizations
@@ -87,7 +86,7 @@ CapScreen uses two Docker images:
 | Image | Tag | Rebuild when |
 | --- | --- | --- |
 | Base (`ghcr.io/hassansaei/capscreen-base`) | `:latest` only (no version) | `conda/*.yml`, system tools, or `docker/DockerFile.base` change |
-| App / final (`ghcr.io/hassansaei/capscreen`, and `saei/capscreen` if Hub secrets are set) | CapScreen version (e.g. `:2.0.0-alpha.2`) and `:latest` | Automatic on GitHub Release; or rebuild locally after code changes |
+| App / final (`ghcr.io/hassansaei/capscreen`, and `saei/capscreen` if Hub secrets are set) | CapScreen version (e.g. `:2.2.0`) and `:latest` | Automatic on GitHub Release; or rebuild locally after code changes |
 
 The base holds OS packages and the two Conda environments (`capscreen`, `capscreen-stat`).
 The final image copies CapScreen source on top of that base. Publishing a GitHub Release
@@ -393,7 +392,7 @@ The `statistical_analysis` section configures downstream analysis:
   - Review statistical outputs in the output directory
 - **Resource Management**: 
   - Adjust `--threads` based on available CPU cores
-  - Statistical analysis uses a separate Python 3.9+ environment (handled automatically in Docker)
+  - Statistical analysis uses a separate Python 3.9–3.11 environment with pyDESeq2 (handled automatically in Docker)
 
 
 ## Citation
