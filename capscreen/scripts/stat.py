@@ -20,10 +20,10 @@ This script performs QC and DESeq2 analysis on CapScreen count data.
 3. DESeq2, written to ``output_dir/deseq2``:
    - Contrasts are taken only from Sample_info ``enrichment_role`` /
      ``enrichment_arm`` (target versus each background on an arm)
+   - Each contrast is fit pairwise on only the samples in those two groups
+     (preferred when groups differ in variability, e.g. low-variance Input)
    - Design is ``~ group``, or ``~ batch_seq + group`` when multiple
      sequencing batches are present and not confounded with group
-   - One DESeq2 fit on all samples shares size factors and dispersions;
-     each requested pair is then tested as a Wald contrast
    - Wald statistics, log2 fold changes, and BH-adjusted p-values
 
 4. Enrichment / enhancement (Lin et al.), written to
@@ -1630,26 +1630,34 @@ def run_deseq2_comparisons(
     adjust_batch: bool = True,
 ) -> int:
     """
-    Fit one DESeq2 model on all samples, then test each contrast.
+    Fit each contrast pairwise on only the samples in its two groups.
 
-    Size factors and dispersions are shared across contrasts. Design comes from
-    :func:`build_deseq_design` on the full sample set (``~group`` or
-    ``~batch_seq + group``). ``bio_rep`` is never in the design.
+    Size factors and dispersions are estimated per contrast from that subset
+    alone, so results do not depend on other groups in the experiment (e.g.
+    low-variance Input). Design comes from :func:`build_deseq_design` on the
+    subset (``~group`` or ``~batch_seq + group``). ``bio_rep`` is never in the
+    design.
 
-    Variants with zero counts in every sample are excluded from the fit but still
-    written in each contrast table with missing statistics. Variants with zero
-    counts in both groups of a contrast likewise keep a row with missing test
-    statistics.
+    Variants with zero counts in both groups of a contrast are kept in the
+    output table with missing test statistics.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    sample_ids = [sid for sid in sample_info["sample_id"].astype(str) if sid in counts.columns]
-    if len(sample_ids) < 2:
+    all_sample_ids = [
+        sid for sid in sample_info["sample_id"].astype(str) if sid in counts.columns
+    ]
+    if len(all_sample_ids) < 2:
         raise ValueError("Need at least 2 samples with count columns for DESeq2")
     if "ID" not in counts.columns:
         raise ValueError("Count table must contain ID for DESeq2")
 
-    group_counts = sample_info.loc[sample_ids, "group"].astype(str).value_counts()
-    runnable = []
+    raw_all = _integer_counts(counts[all_sample_ids])
+    raw_all.index = counts["ID"].astype(str)
+    if raw_all.index.duplicated().any():
+        raise ValueError("Duplicate variant IDs while preparing the DESeq2 dataset")
+    all_variant_ids = raw_all.index
+
+    group_counts = sample_info.loc[all_sample_ids, "group"].astype(str).value_counts()
+    n_ok = 0
     for _, cmp in comparisons.iterrows():
         y_group = str(cmp["y_group"])
         x_group = str(cmp["x_group"])
@@ -1667,60 +1675,53 @@ def run_deseq2_comparisons(
                 n_x,
             )
             continue
-        runnable.append((y_group, x_group, name))
 
-    if not runnable:
-        logger.warning("No DESeq2 contrasts left after replicate filtering")
-        return 0
+        y_samples = _samples_for_group(sample_info, all_sample_ids, y_group)
+        x_samples = _samples_for_group(sample_info, all_sample_ids, x_group)
+        sample_ids = y_samples + x_samples
+        if len(sample_ids) < 2:
+            logger.warning("Skipping %s: fewer than 2 samples after group selection", name)
+            continue
 
-    raw_all = _integer_counts(counts[sample_ids])
-    raw_all.index = counts["ID"].astype(str)
-    if raw_all.index.duplicated().any():
-        raise ValueError("Duplicate variant IDs while preparing the DESeq2 dataset")
-    all_variant_ids = raw_all.index
+        subset_info = sample_info.loc[sample_ids]
+        count_mat = raw_all[sample_ids]
+        keep_genes = count_mat.sum(axis=1) > 0
+        n_drop = int((~keep_genes).sum())
+        if n_drop:
+            logger.info(
+                "%s: omitting %d variant(s) with zero counts in the contrasted "
+                "samples from the fit; they remain in the table with missing statistics",
+                name,
+                n_drop,
+            )
+        count_mat = count_mat.loc[keep_genes]
+        if count_mat.empty:
+            logger.warning("Skipping %s: no expressed variants in the contrasted samples", name)
+            continue
 
-    keep_genes = raw_all.sum(axis=1) > 0
-    n_drop = int((~keep_genes).sum())
-    if n_drop:
+        design, metadata_cols = build_deseq_design(subset_info, adjust_batch=adjust_batch)
+        metadata = _deseq_metadata(subset_info, sample_ids, metadata_cols)
+        design_counts = count_mat.T
+
         logger.info(
-            "Excluding %d all-zero variant(s) from the DESeq2 fit; "
-            "they remain in contrast tables with missing statistics",
-            n_drop,
+            "Fitting pairwise DESeq2 for %s on %d samples x %d variants (design=%s)",
+            name,
+            design_counts.shape[0],
+            design_counts.shape[1],
+            design,
         )
-    count_mat = raw_all.loc[keep_genes]
-    if count_mat.empty:
-        raise ValueError("No expressed variants left for DESeq2")
-
-    design, metadata_cols = build_deseq_design(
-        sample_info.loc[sample_ids], adjust_batch=adjust_batch
-    )
-    metadata = _deseq_metadata(sample_info, sample_ids, metadata_cols)
-    design_counts = count_mat.T
-
-    logger.info(
-        "Fitting one DESeq2 model on %d samples x %d variants (design=%s) for %d contrast(s)",
-        design_counts.shape[0],
-        design_counts.shape[1],
-        design,
-        len(runnable),
-    )
-    dds = DeseqDataSet(
-        counts=design_counts,
-        metadata=metadata,
-        design=design,
-        refit_cooks=True,
-        n_cpus=n_cpus,
-        quiet=True,
-    )
-    dds.deseq2()
-
-    n_ok = 0
-    for y_group, x_group, name in runnable:
         try:
+            dds = DeseqDataSet(
+                counts=design_counts,
+                metadata=metadata,
+                design=design,
+                refit_cooks=True,
+                n_cpus=n_cpus,
+                quiet=True,
+            )
+            dds.deseq2()
             stats = DeseqStats(dds, contrast=["group", y_group, x_group], quiet=True)
             stats.summary()
-            y_samples = _samples_for_group(sample_info, sample_ids, y_group)
-            x_samples = _samples_for_group(sample_info, sample_ids, x_group)
             res = _finalize_contrast_results(
                 stats.results_df,
                 raw_all,
@@ -1735,7 +1736,7 @@ def run_deseq2_comparisons(
             res.to_csv(out_path, sep="\t", index=False)
             n_sig = int((res["padj"] < 0.05).fillna(False).sum()) if "padj" in res.columns else 0
             logger.info(
-                "Wrote %s (design=%s, %d variants, %d with padj < 0.05)",
+                "Wrote %s (pairwise, design=%s, %d variants, %d with padj < 0.05)",
                 out_path,
                 design,
                 len(res),
