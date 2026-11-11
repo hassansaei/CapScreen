@@ -51,7 +51,7 @@ import seaborn as sns
 from itertools import combinations
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import LinearSegmentedColormap
-from matplotlib.ticker import LogFormatterSciNotation
+from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullLocator
 from scipy.stats import pearsonr
 from sklearn.decomposition import PCA
 
@@ -1839,6 +1839,54 @@ def _variant_display_label(variant_id: str) -> str:
     return text
 
 
+def _figure_header(
+    fig: plt.Figure,
+    title: str,
+    subtitle: str,
+    *,
+    left: float = 0.01,
+    top: float = 0.98,
+    title_size: float = 12.0,
+    subtitle_size: float = 8.5,
+) -> float:
+    """
+    Draw title and subtitle above the axes, left-aligned on the figure.
+
+    Returns the approximate figure y where the plot panel may begin.
+    """
+    fig.text(
+        left, top, str(title),
+        fontsize=title_size, fontweight="bold",
+        ha="left", va="top", transform=fig.transFigure,
+    )
+    y = top - 0.045
+    for line in str(subtitle).split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        fig.text(
+            left, y, line,
+            fontsize=subtitle_size, ha="left", va="top",
+            transform=fig.transFigure, color="0.15",
+        )
+        y -= 0.032
+    return max(y - 0.01, 0.55)
+
+
+def _apply_log10_ticks(ax: plt.Axes, *, which: str = "both") -> None:
+    """Major 10^n tick labels; suppress noisy minor labels."""
+    formatter = LogFormatterMathtext(base=10)
+    locator = LogLocator(base=10)
+    if which in ("both", "x"):
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(formatter)
+        ax.xaxis.set_minor_locator(NullLocator())
+    if which in ("both", "y"):
+        ax.yaxis.set_major_locator(LogLocator(base=10))
+        ax.yaxis.set_major_formatter(formatter)
+        ax.yaxis.set_minor_locator(LogLocator(base=10, subs="auto"))
+
+
 def _sample_info_groups_in_order(
     sample_info: pd.DataFrame,
     group_col: str = "group",
@@ -2137,24 +2185,28 @@ def plot_er_eh_scatter(
     hi = float(vals.max()) * 1.6
     lims = (max(lo, 1e-3), hi)
 
-    fig, ax = plt.subplots(figsize=(9.5, 6.5))
+    n_top = 0 if top is None or top.empty else len(top)
+    # Extra width for an outside-right legend; extra height for the header.
+    fig_w = 11.5 if n_top else 8.5
+    fig, ax = plt.subplots(figsize=(fig_w, 7.2))
     ax.scatter(
         bg["Er"], bg["Eh"],
         s=6, c="0.72", alpha=0.35, linewidths=0, zorder=1, rasterized=True,
     )
     ax.plot(lims, lims, ls="--", color="0.45", lw=1, zorder=0)
-    ax.add_patch(
-        plt.Rectangle(
-            (er_cut, eh_cut),
-            lims[1] - er_cut,
-            lims[1] - eh_cut,
-            fill=False,
-            edgecolor="goldenrod",
-            linestyle=":",
-            linewidth=1.2,
-            zorder=2,
+    if er_cut < lims[1] and eh_cut < lims[1]:
+        ax.add_patch(
+            plt.Rectangle(
+                (er_cut, eh_cut),
+                lims[1] - er_cut,
+                lims[1] - eh_cut,
+                fill=False,
+                edgecolor="goldenrod",
+                linestyle="--",
+                linewidth=1.2,
+                zorder=2,
+            )
         )
-    )
     if not ctrl.empty:
         ax.scatter(ctrl["Er"], ctrl["Eh"], s=36, c="0.15", zorder=3)
         for _, row in ctrl.iterrows():
@@ -2162,43 +2214,56 @@ def plot_er_eh_scatter(
                 str(row["ID"]),
                 (row["Er"], row["Eh"]),
                 textcoords="offset points",
-                xytext=(4, 4),
+                xytext=(0, -10),
+                ha="center",
                 fontsize=7,
                 fontweight="bold",
                 color="0.15",
             )
 
-    if top is not None and not top.empty:
+    if n_top:
         hl = d.set_index("ID").loc[top["ID"]].reset_index()
         cmap = plt.get_cmap("Dark2")
         colors = [cmap(i % 8) for i in range(len(hl))]
         for i, row in hl.iterrows():
-            label = f"{row['ID']}\n{row.get('peptide', '')}".strip()
+            peptide = row["peptide"] if "peptide" in hl.columns and pd.notna(row["peptide"]) else ""
+            label = f"{row['ID']}\n{peptide}".strip()
             ax.scatter(
                 [row["Er"]], [row["Eh"]],
                 s=48, c=[colors[i]], zorder=4, label=label,
             )
         ax.legend(
-            title=f"Top {len(hl)} reproducible\nvariants",
-            fontsize=6.5,
-            title_fontsize=7,
+            title=f"Top {len(hl)} reproducible variants",
+            fontsize=6.2,
+            title_fontsize=7.5,
             loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            borderaxespad=0.0,
             frameon=True,
-            borderpad=0.4,
+            fancybox=False,
+            edgecolor="0.75",
+            borderpad=0.5,
+            labelspacing=0.7,
+            handletextpad=0.5,
         )
 
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlim(*lims)
     ax.set_ylim(*lims)
-    ax.set_aspect("equal", adjustable="box")
+    # Square panel anchored under the header (avoids vertical letterboxing).
+    ax.set_box_aspect(1)
+    ax.set_anchor("N")
+    _apply_log10_ticks(ax)
     ax.set_xlabel("Enrichment (Er)")
     ax.set_ylabel("Enhancement (Eh)")
-    ax.set_title(title, fontweight="bold", fontsize=12)
-    ax.text(0.0, 1.02, subtitle, transform=ax.transAxes, fontsize=8.5, va="bottom")
     ax.grid(True, which="major", linestyle="-", alpha=0.25)
     ax.grid(False, which="minor")
-    fig.tight_layout()
+
+    header_bottom = _figure_header(fig, title, subtitle)
+    right = 0.58 if n_top else 0.96
+    fig.subplots_adjust(left=0.10, right=right, bottom=0.08, top=min(header_bottom - 0.01, 0.84))
+
     out_prefix = Path(out_prefix)
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(f"{out_prefix}.png", dpi=dpi, bbox_inches="tight")
@@ -2297,27 +2362,44 @@ def plot_top_variant_rpm_bars(
     width = 0.8 / max(n_groups, 1)
 
     def _draw(log_scale: bool) -> plt.Figure:
-        fig, ax = plt.subplots(figsize=(max(11.0, 0.45 * len(variants) + 4), 5.5))
+        fig_w = max(12.0, 0.55 * len(variants) + 5.0)
+        fig_h = 7.2 if n_groups <= 5 else 7.8
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        baseline = 1.0
         for gi, group in enumerate(present_groups):
             gstat = stats.loc[stats["group"] == group].set_index("variant").reindex(variants)
             med = gstat["median_RPM"].to_numpy(dtype=float)
             ymin = gstat["min_RPM"].to_numpy(dtype=float)
             ymax = gstat["max_RPM"].to_numpy(dtype=float)
             if log_scale:
-                med = np.maximum(med, floor_rpm)
-                ymin = np.maximum(ymin, floor_rpm)
-                ymax = np.maximum(ymax, floor_rpm)
+                med = np.where(np.isfinite(med) & (med > 0), med, floor_rpm)
+                ymin = np.where(np.isfinite(ymin) & (ymin > 0), ymin, floor_rpm)
+                ymax = np.where(np.isfinite(ymax) & (ymax > 0), ymax, floor_rpm)
+                # Draw from RPM=1 so values <1 fall and values >1 rise (log10 space).
+                bottoms = np.where(med >= baseline, baseline, med)
+                heights = np.abs(med - baseline)
+                ax.bar(
+                    x - 0.4 + width / 2 + gi * width,
+                    heights,
+                    bottom=bottoms,
+                    width=width * 0.95,
+                    color=colors.get(group, "0.5"),
+                    edgecolor="0.25", linewidth=0.3,
+                    label=group, zorder=2,
+                    align="center",
+                )
+                xpos = x - 0.4 + width / 2 + gi * width
             else:
                 med = np.nan_to_num(med, nan=0.0)
                 ymin = np.nan_to_num(ymin, nan=0.0)
                 ymax = np.nan_to_num(ymax, nan=0.0)
-            xpos = x - 0.4 + width / 2 + gi * width
-            ax.bar(
-                xpos, med, width=width * 0.95,
-                color=colors.get(group, "0.5"),
-                edgecolor="0.25", linewidth=0.3,
-                label=group, zorder=2,
-            )
+                xpos = x - 0.4 + width / 2 + gi * width
+                ax.bar(
+                    xpos, med, width=width * 0.95,
+                    color=colors.get(group, "0.5"),
+                    edgecolor="0.25", linewidth=0.3,
+                    label=group, zorder=2,
+                )
             yerr_lo = np.maximum(med - ymin, 0.0)
             yerr_hi = np.maximum(ymax - med, 0.0)
             ax.errorbar(
@@ -2329,7 +2411,7 @@ def plot_top_variant_rpm_bars(
             for vi, variant in enumerate(variants):
                 pts = glong.loc[glong["variant"] == variant, "RPM"].to_numpy(dtype=float)
                 if log_scale:
-                    pts = np.maximum(pts, floor_rpm)
+                    pts = np.where(np.isfinite(pts) & (pts > 0), pts, floor_rpm)
                 jitter = (np.random.default_rng(vi + gi * 17).random(len(pts)) - 0.5) * width * 0.35
                 ax.scatter(
                     np.full(len(pts), xpos[vi]) + jitter,
@@ -2341,28 +2423,49 @@ def plot_top_variant_rpm_bars(
         ax.set_xticks(x)
         ax.set_xticklabels(variants, rotation=45, ha="right", fontsize=7.5)
         ax.set_xlabel("")
-        ax.set_title(title, fontweight="bold", fontsize=12)
-        ax.text(0.0, 1.02, subtitle, transform=ax.transAxes, fontsize=8.5, va="bottom")
-        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=min(n_groups, 5), frameon=False)
         ax.grid(False, axis="x")
-        ax.grid(True, axis="y", alpha=0.25)
+        ax.grid(True, axis="y", which="major", alpha=0.25)
+        ax.axhline(0 if not log_scale else baseline, color="0.85", lw=0.6, zorder=1)
+
+        ncol = min(n_groups, 5)
+        ax.legend(
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.18),
+            ncol=ncol,
+            frameon=False,
+            fontsize=8,
+        )
+
         if log_scale:
             ax.set_yscale("log")
-            ax.yaxis.set_major_formatter(LogFormatterSciNotation())
+            _apply_log10_ticks(ax, which="y")
             ax.set_ylabel("RPM (replicate median, log10 scale)")
+            pos = long.loc[long["RPM"] > 0, "RPM"].to_numpy(dtype=float)
+            ymin_plot = max(float(np.nanmin(pos)) / 1.5 if pos.size else floor_rpm, 1e-2)
+            ymax_plot = float(np.nanmax(pos)) * 1.8 if pos.size else 10.0
+            ax.set_ylim(ymin_plot, max(ymax_plot, baseline * 10))
         else:
             ymax_plot = float(np.nanmax(stats["median_RPM"].to_numpy(dtype=float))) * 1.6
             if not np.isfinite(ymax_plot) or ymax_plot <= 0:
                 ymax_plot = 1.0
             ax.set_ylim(0, ymax_plot)
             ax.set_ylabel("RPM (replicate median)")
-            if (long["RPM"] > ymax_plot).any():
-                ax.text(
-                    0.0, -0.28,
-                    "Linear y axis clipped to the median range; some replicate values extend beyond it",
-                    transform=ax.transAxes, fontsize=7.5, color="0.35",
-                )
-        fig.tight_layout()
+
+        header_bottom = _figure_header(fig, title, subtitle)
+        bottom = 0.28 if n_groups <= 5 else 0.32
+        if (not log_scale) and (long["RPM"] > ymax_plot).any():
+            fig.text(
+                0.01, 0.02,
+                "Linear y axis clipped to the median range; some replicate values extend beyond it",
+                fontsize=7.5, color="0.35", ha="left", va="bottom",
+                transform=fig.transFigure,
+            )
+            bottom = max(bottom, 0.30)
+        fig.subplots_adjust(
+            left=0.07, right=0.99,
+            bottom=bottom,
+            top=min(header_bottom - 0.02, 0.80),
+        )
         return fig
 
     out_prefix = Path(out_prefix)
