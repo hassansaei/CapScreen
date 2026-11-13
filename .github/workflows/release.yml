@@ -1,38 +1,111 @@
 name: Release
 
+# When capscreen/version.py is bumped on master/main, publish a GitHub Release
+# (tag v<version>). That release triggers Publish CapScreen app image.
 on:
   push:
     branches:
       - master
       - main
+    paths:
+      - "capscreen/version.py"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Recreate/update the release for the current version.py if the tag already exists"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   release:
-    if: false  # Disabled: re-enable when ready to use automatic releases
     runs-on: ubuntu-latest
-    concurrency: release
     permissions:
-      contents: write # to be able to publish a GitHub release
-      issues: write # to be able to comment on released issues
-      pull-requests: write # to be able to comment on released pull requests
-      id-token: write # to enable use of OIDC for publishing to PyPI
-
+      contents: write
     steps:
-    - uses: actions/checkout@v3
-      with:
-        fetch-depth: 0
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.11"
+      - name: Resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+          VERSION=$(python3 -c "import re; t=open('capscreen/version.py').read(); print(re.search(r\"__version__\\s*=\\s*['\\\"]([^'\\\"]+)['\\\"]\", t).group(1))")
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          case "${VERSION}" in
+            *-alpha*|*-beta*|*-rc*|*-dev*)
+              echo "prerelease=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "prerelease=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+          echo "Resolved CapScreen ${VERSION} -> tag ${TAG}"
 
-    - name: Install build dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install --upgrade setuptools wheel
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          PRERELEASE: ${{ steps.ver.outputs.prerelease }}
+          SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE_INPUT: ${{ github.event.inputs.force || 'false' }}
+        run: |
+          set -euo pipefail
+          FORCE=false
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ] && [ "${FORCE_INPUT}" = "true" ]; then
+            FORCE=true
+          fi
 
-    - name: Python Semantic Release
-      uses: python-semantic-release/python-semantic-release@v10.5.2
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
+          release_exists=false
+          tag_exists=false
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            release_exists=true
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            tag_exists=true
+          fi
+
+          if [ "${release_exists}" = "true" ] && [ "${FORCE}" != "true" ]; then
+            echo "Release ${TAG} already exists; nothing to do."
+            exit 0
+          fi
+
+          if [ "${FORCE}" = "true" ]; then
+            if [ "${release_exists}" = "true" ]; then
+              echo "Force: deleting existing release ${TAG}"
+              gh release delete "${TAG}" --yes --cleanup-tag
+              tag_exists=false
+            elif [ "${tag_exists}" = "true" ]; then
+              echo "Force: deleting existing tag ${TAG}"
+              git push origin ":refs/tags/${TAG}"
+              tag_exists=false
+            fi
+          fi
+
+          NOTES=$(printf '## CapScreen %s\n\nAutomated release from `capscreen/version.py` at %s.\n' "${VERSION}" "${SHA}")
+          PRE_ARGS=()
+          if [ "${PRERELEASE}" = "true" ]; then
+            PRE_ARGS=(--prerelease)
+          fi
+
+          if [ "${tag_exists}" = "true" ]; then
+            echo "Tag ${TAG} exists without a release; creating release from that tag."
+            gh release create "${TAG}" --title "${VERSION}" --notes "${NOTES}" "${PRE_ARGS[@]}"
+          else
+            gh release create "${TAG}" \
+              --target "${SHA}" \
+              --title "${VERSION}" \
+              --notes "${NOTES}" \
+              "${PRE_ARGS[@]}"
+          fi
+          echo "Published release ${TAG}"

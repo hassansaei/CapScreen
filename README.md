@@ -86,7 +86,7 @@ CapScreen uses two Docker images:
 | Image | Tag | Rebuild when |
 | --- | --- | --- |
 | Base (`ghcr.io/hassansaei/capscreen-base`) | `:latest` only (no version) | `conda/*.yml`, system tools, or `docker/DockerFile.base` change |
-| App / final (`ghcr.io/hassansaei/capscreen`, and `saei/capscreen` if Hub secrets are set) | CapScreen version (e.g. `:2.2.1`) and `:latest` | Automatic on GitHub Release; or rebuild locally after code changes |
+| App / final (`ghcr.io/hassansaei/capscreen`, and `saei/capscreen` if Hub secrets are set) | CapScreen version (e.g. `:2.2.1`) and `:latest` | Automatic when `capscreen/version.py` is bumped (Release workflow → GitHub Release → app image); or rebuild locally |
 
 The base holds OS packages and the two Conda environments (`capscreen`, `capscreen-stat`).
 The final image copies CapScreen source on top of that base. Publishing a GitHub Release

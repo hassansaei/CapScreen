@@ -43,9 +43,13 @@ CI publishes the base automatically on changes to `conda/**` or
 `docker/DockerFile.base` via `.github/workflows/docker-base.yml`
 (also runnable with **Actions → Publish CapScreen base image → Run workflow**).
 
-## Automatic app image on release
+## Automatic release and app image
 
-Publishing a GitHub Release (including pre-releases such as `2.0.0-alpha.2`)
+Pushing a bump of `capscreen/version.py` to `master`/`main` runs
+**Actions → Release**, which publishes a GitHub Release tagged `v<version>`
+(prerelease when the version contains `alpha`, `beta`, `rc`, or `dev`).
+
+That GitHub Release (including pre-releases such as `2.0.0-alpha.2`)
 triggers **Actions → Publish CapScreen app image**. That workflow:
 
 1. Uses `ghcr.io/hassansaei/capscreen-base:latest` as `BASE_IMAGE`
@@ -76,10 +80,14 @@ apptainer run capscreen-2.2.1.sif pipeline --vp-seq ...
 
 Release checklist:
 
-1. Push commits that bump `capscreen/version.py` (post-commit hook for alphas)
-2. Create a GitHub Release whose tag matches that version (e.g. `2.0.0-alpha.2`)
-3. Wait for the app image workflow to finish; pull from GHCR (and Docker Hub if configured)
+1. Bump `capscreen/version.py` (and README version badge) and push to `master`
+   (local post-commit hook can advance `-alpha.N` during development)
+2. Wait for **Release** to publish `v<version>`, then for the app image workflow
+3. Pull from GHCR (and Docker Hub if configured)
 4. Download `capscreen-<tag>.sif` from the release assets if you need Singularity/Apptainer
+
+To re-publish the current `version.py` tag, use
+**Actions → Release → Run workflow** with force enabled.
 
 ## When to rebuild the final (app) image locally
 
