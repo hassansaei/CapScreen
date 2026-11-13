@@ -70,8 +70,8 @@ Manual runs still build the `.sif` and upload it as an Actions artifact.
 HPC / Apptainer example (after downloading the release asset):
 
 ```bash
-apptainer run capscreen-2.2.0.sif --version
-apptainer run capscreen-2.2.0.sif pipeline --vp-seq ...
+apptainer run capscreen-2.2.1.sif --version
+apptainer run capscreen-2.2.1.sif pipeline --vp-seq ...
 ```
 
 Release checklist:

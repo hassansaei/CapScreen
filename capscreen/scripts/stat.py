@@ -101,7 +101,7 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
                 "er_cut": 3,
                 "eh_cut": 3,
                 "min_rpm": 5,
-                "n_top": 20,
+                "n_top": 10,
                 "pseudocount": 1,
             },
             "output": {
@@ -1517,19 +1517,18 @@ def _draw_pca(
     ax.set_ylabel(pc2, fontsize=fontsize)
     excluded = ", ".join(exclude_groups) if exclude_groups else "none"
     subtitle = f"n variants = {n_variants} | excluded groups: {excluded}"
-    ax.legend(
-        bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0,
+    # "outside" legend locs require a figure legend (matplotlib >= 3.6).
+    handles, labels = ax.get_legend_handles_labels()
+    if ax.get_legend() is not None:
+        ax.get_legend().remove()
+    fig.legend(
+        handles,
+        labels,
+        loc="outside right upper",
         fontsize=max(fontsize - 2, 6),
+        frameon=True,
     )
-    header_bottom = _figure_header(
-        fig, title, subtitle,
-        title_size=fontsize + 1,
-        subtitle_size=max(fontsize - 2, 6),
-    )
-    fig.subplots_adjust(
-        left=0.12, right=0.72, bottom=0.12,
-        top=max(header_bottom - 0.015, 0.72),
-    )
+    _set_title_subtitle(ax, title, subtitle)
 
 
 def plot_vst_pca(
@@ -1556,13 +1555,13 @@ def plot_vst_pca(
     ]
     with PdfPages(qc_dir / "pca_vst.pdf") as pdf:
         for frame, pct, n_variants, title, png_path in plots:
-            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h), layout="constrained")
             _draw_pca(
                 frame, pct, n_variants, title, exclude_groups, fig, ax,
                 point_size=point_size, fontsize=fontsize,
             )
-            fig.savefig(png_path, dpi=300, bbox_inches="tight")
-            pdf.savefig(fig, bbox_inches="tight")
+            fig.savefig(png_path, dpi=300)
+            pdf.savefig(fig)
             plt.close(fig)
             logger.info("Saved %s", png_path)
     logger.info("Saved two-page VST PCA to %s", qc_dir / "pca_vst.pdf")
@@ -1843,38 +1842,66 @@ def _variant_display_label(variant_id: str) -> str:
     return text
 
 
-def _figure_header(
-    fig: plt.Figure,
-    title: str,
-    subtitle: str,
-    *,
-    left: float = 0.01,
-    top: float = 0.98,
-    title_size: float = 12.0,
-    subtitle_size: float = 8.5,
-) -> float:
-    """
-    Draw title and subtitle above the axes, left-aligned on the figure.
+def _model_key(group: str) -> str:
+    """Leading cohort/model token (OA, OPA, FASMA, …) used to scope RPM bars."""
+    text = str(group)
+    for marker in ("-WT-", "-KO-"):
+        if marker in text:
+            return text.split(marker, 1)[0]
+    if "-" in text:
+        return text.split("-", 1)[0]
+    return text
 
-    Returns the approximate figure y where the plot panel may begin.
+
+def _bar_groups_for_arm(
+    sample_info: pd.DataFrame,
+    target: str,
+    backgrounds: List[str],
+    input_group: str,
+) -> List[str]:
     """
-    fig.text(
-        left, top, str(title),
-        fontsize=title_size, fontweight="bold",
-        ha="left", va="top", transform=fig.transFigure,
-    )
-    y = top - 0.045
-    for line in str(subtitle).split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        fig.text(
-            left, y, line,
-            fontsize=subtitle_size, ha="left", va="top",
-            transform=fig.transFigure, color="0.15",
+    Groups for RPM bars, matching the R arm helpers.
+
+    Keep Input, the arm target/backgrounds, and other Sample_info groups that
+    share the target's model/cohort key (e.g. all ``OPA-*`` for an OPA arm).
+    """
+    ordered = _sample_info_groups_in_order(sample_info)
+    key = _model_key(target)
+    input_names = {str(input_group), "Input"}
+    required = {str(target), *[str(b) for b in backgrounds]}
+    keep = []
+    for group in ordered:
+        g = str(group)
+        if g in input_names or g in required or _model_key(g) == key:
+            keep.append(g)
+    return keep
+
+
+def _set_title_subtitle(ax: plt.Axes, title: str, subtitle: str) -> None:
+    """Match R labs(title, subtitle): bold ~12pt title, ~8.5pt subtitle, left."""
+    title_s = str(title).strip()
+    sub_lines = [ln.strip() for ln in str(subtitle).split("\n") if ln.strip()]
+    # Matplotlib has no native subtitle; pack under one left title. Constrained
+    # layout then reserves a tight band so the legend does not collide with it.
+    if sub_lines:
+        ax.set_title(
+            title_s + "\n" + "\n".join(sub_lines),
+            loc="left",
+            fontsize=10,
+            fontweight="bold",
+            linespacing=1.35,
+            pad=6,
+            color="0.1",
         )
-        y -= 0.032
-    return max(y - 0.01, 0.55)
+    else:
+        ax.set_title(
+            title_s,
+            loc="left",
+            fontsize=12,
+            fontweight="bold",
+            pad=6,
+            color="0.1",
+        )
 
 
 def _apply_log10_ticks(ax: plt.Axes, *, which: str = "both") -> None:
@@ -2125,7 +2152,7 @@ def call_top_er_eh(
     er_cut: float = 3.0,
     eh_cut: float = 3.0,
     min_rpm: float = 5.0,
-    n_top: Optional[int] = 20,
+    n_top: Optional[int] = 10,
 ) -> pd.DataFrame:
     """Call top performers inside the Er/Eh performance box."""
     er_rep_cols = [c for c in scores.columns if re.fullmatch(r"Er_rep\d+", c)]
@@ -2190,9 +2217,8 @@ def plot_er_eh_scatter(
     lims = (max(lo, 1e-3), hi)
 
     n_top = 0 if top is None or top.empty else len(top)
-    # Extra width for an outside-right legend; extra height for the header.
-    fig_w = 11.5 if n_top else 8.5
-    fig, ax = plt.subplots(figsize=(fig_w, 7.2))
+    # Match R enrichment_enhancement.R ggsave(width=9.5, height=6.5).
+    fig, ax = plt.subplots(figsize=(9.5, 6.5), layout="constrained")
     ax.scatter(
         bg["Er"], bg["Eh"],
         s=6, c="0.72", alpha=0.35, linewidths=0, zorder=1, rasterized=True,
@@ -2206,8 +2232,8 @@ def plot_er_eh_scatter(
                 lims[1] - eh_cut,
                 fill=False,
                 edgecolor="goldenrod",
-                linestyle="--",
-                linewidth=1.2,
+                linestyle=":",
+                linewidth=1.0,
                 zorder=2,
             )
         )
@@ -2218,8 +2244,7 @@ def plot_er_eh_scatter(
                 str(row["ID"]),
                 (row["Er"], row["Eh"]),
                 textcoords="offset points",
-                xytext=(0, -10),
-                ha="center",
+                xytext=(4, 4),
                 fontsize=7,
                 fontweight="bold",
                 color="0.15",
@@ -2236,18 +2261,20 @@ def plot_er_eh_scatter(
                 [row["Er"]], [row["Eh"]],
                 s=48, c=[colors[i]], zorder=4, label=label,
             )
-        ax.legend(
-            title=f"Top {len(hl)} reproducible variants",
-            fontsize=6.2,
-            title_fontsize=7.5,
-            loc="upper left",
-            bbox_to_anchor=(1.02, 1.0),
-            borderaxespad=0.0,
+        # R default legend is outside-right; figure legend required for "outside".
+        handles, labels = ax.get_legend_handles_labels()
+        fig.legend(
+            handles,
+            labels,
+            title=f"Top {len(hl)} reproducible\nvariants",
+            fontsize=6.5,
+            title_fontsize=7,
+            loc="outside right upper",
             frameon=True,
             fancybox=False,
             edgecolor="0.75",
-            borderpad=0.5,
-            labelspacing=0.7,
+            borderpad=0.4,
+            labelspacing=0.55,
             handletextpad=0.5,
         )
 
@@ -2255,23 +2282,18 @@ def plot_er_eh_scatter(
     ax.set_yscale("log")
     ax.set_xlim(*lims)
     ax.set_ylim(*lims)
-    # Square panel anchored under the header (avoids vertical letterboxing).
-    ax.set_box_aspect(1)
-    ax.set_anchor("N")
+    ax.set_aspect("equal", adjustable="box")
     _apply_log10_ticks(ax)
     ax.set_xlabel("Enrichment (Er)")
     ax.set_ylabel("Enhancement (Eh)")
     ax.grid(True, which="major", linestyle="-", alpha=0.25)
     ax.grid(False, which="minor")
-
-    header_bottom = _figure_header(fig, title, subtitle)
-    right = 0.58 if n_top else 0.96
-    fig.subplots_adjust(left=0.10, right=right, bottom=0.08, top=min(header_bottom - 0.01, 0.84))
+    _set_title_subtitle(ax, title, subtitle)
 
     out_prefix = Path(out_prefix)
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(f"{out_prefix}.png", dpi=dpi, bbox_inches="tight")
-    fig.savefig(f"{out_prefix}.pdf", bbox_inches="tight")
+    fig.savefig(f"{out_prefix}.png", dpi=dpi)
+    fig.savefig(f"{out_prefix}.pdf")
     plt.close(fig)
 
 
@@ -2366,44 +2388,30 @@ def plot_top_variant_rpm_bars(
     width = 0.8 / max(n_groups, 1)
 
     def _draw(log_scale: bool) -> plt.Figure:
-        fig_w = max(12.0, 0.55 * len(variants) + 5.0)
-        fig_h = 7.2 if n_groups <= 5 else 7.8
-        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-        baseline = 1.0
+        # Match R enrichment_enhancement.R ggsave(width=11, height=5.5).
+        ncol = min(n_groups, 5)
+        fig, ax = plt.subplots(figsize=(11.0, 5.5), layout="constrained")
         for gi, group in enumerate(present_groups):
             gstat = stats.loc[stats["group"] == group].set_index("variant").reindex(variants)
             med = gstat["median_RPM"].to_numpy(dtype=float)
             ymin = gstat["min_RPM"].to_numpy(dtype=float)
             ymax = gstat["max_RPM"].to_numpy(dtype=float)
+            # R uses pmax(value, floor_rpm) on log plots (bars grow from axis floor).
             if log_scale:
-                med = np.where(np.isfinite(med) & (med > 0), med, floor_rpm)
-                ymin = np.where(np.isfinite(ymin) & (ymin > 0), ymin, floor_rpm)
-                ymax = np.where(np.isfinite(ymax) & (ymax > 0), ymax, floor_rpm)
-                # Draw from RPM=1 so values <1 fall and values >1 rise (log10 space).
-                bottoms = np.where(med >= baseline, baseline, med)
-                heights = np.abs(med - baseline)
-                ax.bar(
-                    x - 0.4 + width / 2 + gi * width,
-                    heights,
-                    bottom=bottoms,
-                    width=width * 0.95,
-                    color=colors.get(group, "0.5"),
-                    edgecolor="0.25", linewidth=0.3,
-                    label=group, zorder=2,
-                    align="center",
-                )
-                xpos = x - 0.4 + width / 2 + gi * width
+                med = np.where(np.isfinite(med) & (med > 0), np.maximum(med, floor_rpm), floor_rpm)
+                ymin = np.where(np.isfinite(ymin) & (ymin > 0), np.maximum(ymin, floor_rpm), floor_rpm)
+                ymax = np.where(np.isfinite(ymax) & (ymax > 0), np.maximum(ymax, floor_rpm), floor_rpm)
             else:
                 med = np.nan_to_num(med, nan=0.0)
                 ymin = np.nan_to_num(ymin, nan=0.0)
                 ymax = np.nan_to_num(ymax, nan=0.0)
-                xpos = x - 0.4 + width / 2 + gi * width
-                ax.bar(
-                    xpos, med, width=width * 0.95,
-                    color=colors.get(group, "0.5"),
-                    edgecolor="0.25", linewidth=0.3,
-                    label=group, zorder=2,
-                )
+            xpos = x - 0.4 + width / 2 + gi * width
+            ax.bar(
+                xpos, med, width=width * 0.95,
+                color=colors.get(group, "0.5"),
+                edgecolor="0.25", linewidth=0.3,
+                label=group, zorder=2,
+            )
             yerr_lo = np.maximum(med - ymin, 0.0)
             yerr_hi = np.maximum(ymax - med, 0.0)
             ax.errorbar(
@@ -2415,12 +2423,12 @@ def plot_top_variant_rpm_bars(
             for vi, variant in enumerate(variants):
                 pts = glong.loc[glong["variant"] == variant, "RPM"].to_numpy(dtype=float)
                 if log_scale:
-                    pts = np.where(np.isfinite(pts) & (pts > 0), pts, floor_rpm)
+                    pts = np.where(np.isfinite(pts) & (pts > 0), np.maximum(pts, floor_rpm), floor_rpm)
                 jitter = (np.random.default_rng(vi + gi * 17).random(len(pts)) - 0.5) * width * 0.35
                 ax.scatter(
                     np.full(len(pts), xpos[vi]) + jitter,
                     pts,
-                    s=10, facecolors="white", edgecolors="0.2",
+                    s=12, facecolors="white", edgecolors="0.2",
                     linewidths=0.3, alpha=0.85, zorder=4,
                 )
 
@@ -2429,47 +2437,39 @@ def plot_top_variant_rpm_bars(
         ax.set_xlabel("")
         ax.grid(False, axis="x")
         ax.grid(True, axis="y", which="major", alpha=0.25)
-        ax.axhline(0 if not log_scale else baseline, color="0.85", lw=0.6, zorder=1)
+        ax.grid(False, which="minor")
 
-        ncol = min(n_groups, 5)
-        ax.legend(
-            loc="upper center",
-            bbox_to_anchor=(0.5, -0.18),
-            ncol=ncol,
-            frameon=False,
-            fontsize=8,
-        )
-
+        clip_note = False
         if log_scale:
             ax.set_yscale("log")
             _apply_log10_ticks(ax, which="y")
             ax.set_ylabel("RPM (replicate median, log10 scale)")
-            pos = long.loc[long["RPM"] > 0, "RPM"].to_numpy(dtype=float)
-            ymin_plot = max(float(np.nanmin(pos)) / 1.5 if pos.size else floor_rpm, 1e-2)
-            ymax_plot = float(np.nanmax(pos)) * 1.8 if pos.size else 10.0
-            ax.set_ylim(ymin_plot, max(ymax_plot, baseline * 10))
         else:
             ymax_plot = float(np.nanmax(stats["median_RPM"].to_numpy(dtype=float))) * 1.6
             if not np.isfinite(ymax_plot) or ymax_plot <= 0:
                 ymax_plot = 1.0
             ax.set_ylim(0, ymax_plot)
             ax.set_ylabel("RPM (replicate median)")
+            clip_note = bool((long["RPM"] > ymax_plot).any())
 
-        header_bottom = _figure_header(fig, title, subtitle)
-        bottom = 0.28 if n_groups <= 5 else 0.32
-        if (not log_scale) and (long["RPM"] > ymax_plot).any():
-            fig.text(
-                0.01, 0.02,
-                "Linear y axis clipped to the median range; some replicate values extend beyond it",
-                fontsize=7.5, color="0.35", ha="left", va="bottom",
-                transform=fig.transFigure,
-            )
-            bottom = max(bottom, 0.30)
-        fig.subplots_adjust(
-            left=0.07, right=0.99,
-            bottom=bottom,
-            top=min(header_bottom - 0.02, 0.80),
+        _set_title_subtitle(ax, title, subtitle)
+        # R theme: legend.position = "bottom" (enrichment_enhancement.R).
+        handles, labels = ax.get_legend_handles_labels()
+        fig.legend(
+            handles,
+            labels,
+            loc="outside lower center",
+            ncol=ncol,
+            frameon=False,
+            fontsize=8,
+            columnspacing=1.0,
+            handletextpad=0.4,
         )
+        if clip_note:
+            ax.set_xlabel(
+                "Linear y axis clipped to the median range; some replicate values extend beyond it",
+                fontsize=7.5, color="0.35", labelpad=2,
+            )
         return fig
 
     out_prefix = Path(out_prefix)
@@ -2478,8 +2478,8 @@ def plot_top_variant_rpm_bars(
     long.to_csv(f"{out_prefix}_replicates.csv", index=False)
     for name, is_log in (("linear", False), ("log", True)):
         fig = _draw(is_log)
-        fig.savefig(f"{out_prefix}_{name}.png", dpi=dpi, bbox_inches="tight")
-        fig.savefig(f"{out_prefix}_{name}.pdf", bbox_inches="tight")
+        fig.savefig(f"{out_prefix}_{name}.png", dpi=dpi)
+        fig.savefig(f"{out_prefix}_{name}.pdf")
         plt.close(fig)
     return stats
 
@@ -2493,7 +2493,7 @@ def run_enrichment_enhancement_arm(
     er_cut: float = 3.0,
     eh_cut: float = 3.0,
     min_rpm: float = 5.0,
-    n_top: int = 20,
+    n_top: int = 10,
     pseudocount: float = 1.0,
     dpi: int = 300,
     write_excel: bool = False,
@@ -2505,7 +2505,7 @@ def run_enrichment_enhancement_arm(
     title = str(arm["title"])
     subtitle = str(arm["subtitle"])
     arm_input = str(arm["input_group"]) if "input_group" in arm.index and pd.notna(arm["input_group"]) else input_group
-    bar_groups = _sample_info_groups_in_order(sample_info)
+    bar_groups = _bar_groups_for_arm(sample_info, target, backgrounds, arm_input)
 
     scores = score_selection(
         df, sample_info, target, backgrounds,
@@ -2562,8 +2562,7 @@ def run_enrichment_enhancement_arm(
             title=f"Top {len(top)} {target} variants: RPM across groups",
             subtitle=(
                 f"{subtitle}\nBars are the replicate median, whiskers the replicate "
-                "range, points individual replicates; all Sample_info groups shown; "
-                "variants ordered by Er/Eh rank"
+                "range, points individual replicates; variants ordered by Er/Eh rank"
             ),
             dpi=dpi,
         )
@@ -2602,7 +2601,7 @@ def run_enrichment_enhancement_analysis(
     er_cut: float = 3.0,
     eh_cut: float = 3.0,
     min_rpm: float = 5.0,
-    n_top: int = 20,
+    n_top: int = 10,
     pseudocount: float = 1.0,
     dpi: int = 300,
     write_excel: bool = False,
@@ -2692,7 +2691,7 @@ def run_statistical_analysis(
     ee_er_cut = float(ee_cfg.get("er_cut", 3))
     ee_eh_cut = float(ee_cfg.get("eh_cut", 3))
     ee_min_rpm = float(ee_cfg.get("min_rpm", 5))
-    ee_n_top = _cfg_int(ee_cfg.get("n_top"), 20)
+    ee_n_top = _cfg_int(ee_cfg.get("n_top"), 10)
     ee_pseudo = float(ee_cfg.get("pseudocount", 1))
     plot_dpi = _cfg_int((plot_cfg.get("dpi") or {}).get("standard"), 300)
     pca_point_size = float((plot_cfg.get("pca") or {}).get("point_size", 120))

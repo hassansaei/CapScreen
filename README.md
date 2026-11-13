@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://doi.org/10.5281/zenodo.18895265"><img src="https://zenodo.org/badge/1004327193.svg" alt="DOI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
-  <a href="https://github.com/hassansaei/CapScreen/releases"><img src="https://img.shields.io/badge/version-2.2.0-blue.svg" alt="Version 2.2.0"></a>
+  <a href="https://github.com/hassansaei/CapScreen/releases"><img src="https://img.shields.io/badge/version-2.2.1-blue.svg" alt="Version 2.2.1"></a>
   <a href="https://hub.docker.com/r/saei/capscreen"><img src="https://img.shields.io/docker/v/saei/capscreen?label=docker&logo=docker" alt="Docker"></a>
 </p>
 
@@ -86,7 +86,7 @@ CapScreen uses two Docker images:
 | Image | Tag | Rebuild when |
 | --- | --- | --- |
 | Base (`ghcr.io/hassansaei/capscreen-base`) | `:latest` only (no version) | `conda/*.yml`, system tools, or `docker/DockerFile.base` change |
-| App / final (`ghcr.io/hassansaei/capscreen`, and `saei/capscreen` if Hub secrets are set) | CapScreen version (e.g. `:2.2.0`) and `:latest` | Automatic on GitHub Release; or rebuild locally after code changes |
+| App / final (`ghcr.io/hassansaei/capscreen`, and `saei/capscreen` if Hub secrets are set) | CapScreen version (e.g. `:2.2.1`) and `:latest` | Automatic on GitHub Release; or rebuild locally after code changes |
 
 The base holds OS packages and the two Conda environments (`capscreen`, `capscreen-stat`).
 The final image copies CapScreen source on top of that base. Publishing a GitHub Release

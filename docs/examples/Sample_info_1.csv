@@ -1,0 +1,28 @@
+sample_id,run_mode,path_FASTQ,group,tech_rep,bio_rep,batch_seq,enrichment_role,enrichment_arm
+OA WT N1 NEG,PE,/opt/capscreen/input/O1_MKDL260015182-1A_23LT52LT3_L4_1.fq.gz,OA-WT-NEG,1,1,1,background,OA_WT_POS_vs_NEG
+OA KO N1 NEG,PE,/opt/capscreen/input/O2_MKDL260015183-1A_23LT52LT3_L4_1.fq.gz,OA-KO-NEG,1,1,1,,
+OPA WT N1 NEG,PE,/opt/capscreen/input/O3_MKDL260015184-1A_23LT52LT3_L4_1.fq.gz,OPA-WT-NEG,1,1,1,background,OPA_WT_POS_vs_NEG
+OPA KO N1 NEG,PE,/opt/capscreen/input/O4_MKDL260015185-1A_23LT52LT3_L4_1.fq.gz,OPA-KO-NEG,1,1,1,,
+OA WT N1 POS,PE,/opt/capscreen/input/O5_MKDL260015186-1A_23LT52LT3_L4_1.fq.gz,OA-WT-POS,1,1,1,target,OA_WT_vs_KO_POS;OA_WT_POS_vs_NEG
+OA KO N1 POS,PE,/opt/capscreen/input/O6_MKDL260015187-1A_23LT52LT3_L4_1.fq.gz,OA-KO-POS,1,1,1,background,OA_WT_vs_KO_POS
+OPA WT N1 POS,PE,/opt/capscreen/input/O7_MKDL260015188-1A_23LT52LT3_L4_1.fq.gz,OPA-WT-POS,1,1,1,target,OPA_WT_vs_KO_POS;OPA_WT_POS_vs_NEG
+OPA KO N1 POS,PE,/opt/capscreen/input/O8_MKDL260015189-1A_23LT52LT3_L4_1.fq.gz,OPA-KO-POS,1,1,1,background,OPA_WT_vs_KO_POS
+OA WT N2 NEG,PE,/opt/capscreen/input/O9_MKDL260015190-1A_23LT52LT3_L4_1.fq.gz,OA-WT-NEG,1,2,1,background,OA_WT_POS_vs_NEG
+OA KO N2 NEG,PE,/opt/capscreen/input/O10_MKDL260015191-1A_23LT52LT3_L4_1.fq.gz,OA-KO-NEG,1,2,1,,
+OPA WT N2 NEG,PE,/opt/capscreen/input/O11_MKDL260015192-1A_23LT52LT3_L4_1.fq.gz,OPA-WT-NEG,1,2,1,background,OPA_WT_POS_vs_NEG
+OPA KO N2 NEG,PE,/opt/capscreen/input/O12_MKDL260015193-1A_23LT52LT3_L4_1.fq.gz,OPA-KO-NEG,1,2,1,,
+OA WT N2 POS,PE,/opt/capscreen/input/O13_MKDL260015194-1A_23LT52LT3_L4_1.fq.gz,OA-WT-POS,1,2,1,target,OA_WT_vs_KO_POS;OA_WT_POS_vs_NEG
+OA KO N2 POS,PE,/opt/capscreen/input/O14_MKDL260015195-1A_23LT52LT3_L4_1.fq.gz,OA-KO-POS,1,2,1,background,OA_WT_vs_KO_POS
+OPA WT N2 POS,PE,/opt/capscreen/input/O15_MKDL260015196-1A_23LT52LT3_L4_1.fq.gz,OPA-WT-POS,1,2,1,target,OPA_WT_vs_KO_POS;OPA_WT_POS_vs_NEG
+OPA KO N2 POS,PE,/opt/capscreen/input/O16_MKDL260015197-1A_23LT52LT3_L4_1.fq.gz,OPA-KO-POS,1,2,1,background,OPA_WT_vs_KO_POS
+OA WT N3 NEG,PE,/opt/capscreen/input/O17_MKDL260015198-1A_23LT52LT3_L4_1.fq.gz,OA-WT-NEG,1,3,1,background,OA_WT_POS_vs_NEG
+OA KO N3 NEG,PE,/opt/capscreen/input/O18_MKDL260015199-1A_23LT52LT3_L4_1.fq.gz,OA-KO-NEG,1,3,1,,
+OPA WT N3 NEG,PE,/opt/capscreen/input/O19_MKDL260015200-1A_23LT52LT3_L4_1.fq.gz,OPA-WT-NEG,1,3,1,background,OPA_WT_POS_vs_NEG
+OPA KO N3 NEG,PE,/opt/capscreen/input/O20_MKDL260015201-1A_23LT52LT3_L4_1.fq.gz,OPA-KO-NEG,1,3,1,,
+OA WT N3 POS,PE,/opt/capscreen/input/O21_MKDL260015202-1A_23LT52LT3_L4_1.fq.gz,OA-WT-POS,1,3,1,target,OA_WT_vs_KO_POS;OA_WT_POS_vs_NEG
+OA KO N3 POS,PE,/opt/capscreen/input/O22_MKDL260015203-1A_23LT52LT3_L4_1.fq.gz,OA-KO-POS,1,3,1,background,OA_WT_vs_KO_POS
+OPA WT N3 POS,PE,/opt/capscreen/input/O23_MKDL260015204-1A_23LT52LT3_L4_1.fq.gz,OPA-WT-POS,1,3,1,target,OPA_WT_vs_KO_POS;OPA_WT_POS_vs_NEG
+OPA KO N3 POS,PE,/opt/capscreen/input/O24_MKDL260015205-1A_23LT52LT3_L4_1.fq.gz,OPA-KO-POS,1,3,1,background,OPA_WT_vs_KO_POS
+Input1,PE,/opt/capscreen/input/O25_MKDL260015206-1A_23LT52LT3_L4_1.fq.gz,Input,1,1,1,input,
+Input2,PE,/opt/capscreen/input/O26_MKDL260015207-1A_23LT52LT3_L4_1.fq.gz,Input,1,2,1,input,
+Input3,PE,/opt/capscreen/input/O27_MKDL260015208-1A_23LT52LT3_L4_1.fq.gz,Input,1,3,1,input,

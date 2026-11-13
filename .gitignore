@@ -5,6 +5,10 @@
 *.png
 .DS_Store
 
+# Keep example Sample_info sheets in the repo
+!docs/examples/*.csv
+
+
 # Python bytecode
 __pycache__/
 *.py[cod]
